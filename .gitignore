@@ -1,0 +1,12 @@
+# Editor / OS
+.idea
+.vscode/*.log
+.DS_Store
+*.swp
+*~
+
+# Go build/test artifacts at the workspace root
+*.test
+*.out
+*.prof
+*.coverprofile

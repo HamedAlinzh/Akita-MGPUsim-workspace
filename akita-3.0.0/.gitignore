@@ -1,0 +1,24 @@
+# IDE files
+.idea
+
+# Editor files
+.*.swp
+*.*~
+
+# Coverage report
+*.coverprofile
+
+# Vendor
+vendor
+
+# Test file
+*.test
+debug
+*.out
+
+# Prof file
+*.prof
+
+.DS_Store
+
+.vscode/*.log
