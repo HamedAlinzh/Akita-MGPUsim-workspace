@@ -5,6 +5,9 @@
 *.swp
 *~
 
+# Claude Code harness artifacts
+.claude/
+
 # Go build/test artifacts at the workspace root
 *.test
 *.out
