@@ -33,6 +33,7 @@ type R9NanoGPUBuilder struct {
 	numCUPerShaderArray            int
 	numMemoryBank                  int
 	dramSize                       uint64
+	l1CacheSize                    uint64
 	l2CacheSize                    uint64
 	log2PageSize                   uint64
 	log2CacheLineSize              uint64
@@ -90,6 +91,7 @@ func MakeR9NanoGPUBuilder() R9NanoGPUBuilder {
 		log2CacheLineSize:              6,
 		log2PageSize:                   12,
 		log2MemoryBankInterleavingSize: 12,
+		l1CacheSize:                    16 * mem.KB,
 		l2CacheSize:                    2 * mem.MB,
 		dramSize:                       4 * mem.GB,
 	}
@@ -200,6 +202,12 @@ func (b R9NanoGPUBuilder) WithPerfAnalyzer(
 	a *analysis.PerfAnalyzer,
 ) R9NanoGPUBuilder {
 	b.perfAnalyzer = a
+	return b
+}
+
+// WithL1CacheSize sets the size of each CU's L1 vector (data) cache.
+func (b R9NanoGPUBuilder) WithL1CacheSize(size uint64) R9NanoGPUBuilder {
+	b.l1CacheSize = size
 	return b
 }
 
@@ -488,7 +496,8 @@ func (b *R9NanoGPUBuilder) buildSAs() {
 		withGPUID(b.gpuID).
 		withLog2CachelineSize(b.log2CacheLineSize).
 		withLog2PageSize(b.log2PageSize).
-		withNumCU(b.numCUPerShaderArray)
+		withNumCU(b.numCUPerShaderArray).
+		withL1CacheSize(b.l1CacheSize)
 
 	if b.enableISADebugging {
 		saBuilder = saBuilder.withIsaDebugging()
@@ -567,8 +576,15 @@ func (b *R9NanoGPUBuilder) buildDRAMControllers() {
 }
 
 func (b *R9NanoGPUBuilder) createDramControllerBuilder() dram.Builder {
-	memBankSize := 4 * mem.GB / uint64(b.numMemoryBank)
-	if 4*mem.GB%uint64(b.numMemoryBank) != 0 {
+	// Each GPU is allotted a fixed 4GB window in the flat global address
+	// space (see memAddrOffset in timingplatform.go and HighAddress below),
+	// so a larger DRAM size would alias into the neighboring GPU's window.
+	if b.dramSize > 4*mem.GB {
+		panic("DRAM size cannot exceed the 4GB per-GPU address window")
+	}
+
+	memBankSize := b.dramSize / uint64(b.numMemoryBank)
+	if b.dramSize%uint64(b.numMemoryBank) != 0 {
 		panic("GPU memory size is not a multiple of the number of memory banks")
 	}
 

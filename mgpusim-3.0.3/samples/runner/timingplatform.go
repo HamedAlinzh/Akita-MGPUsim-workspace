@@ -30,6 +30,9 @@ type R9NanoPlatformBuilder struct {
 	numCUPerSA                         int
 	useMagicMemoryCopy                 bool
 	log2PageSize                       uint64
+	l1CacheSize                        uint64
+	l2CacheSize                        uint64
+	dramSize                           uint64
 
 	engine               sim.Engine
 	monitor              *monitoring.Monitor
@@ -50,9 +53,38 @@ func MakeR9NanoBuilder() R9NanoPlatformBuilder {
 		numSAPerGPU:       16,
 		numCUPerSA:        4,
 		log2PageSize:      12,
+		l1CacheSize:       16 * mem.KB,
+		l2CacheSize:       2 * mem.MB,
+		dramSize:          4 * mem.GB,
 		traceVisStartTime: -1,
 		traceVisEndTime:   -1,
 	}
+	return b
+}
+
+// WithL1CacheSize sets the size of each CU's L1 vector (data) cache.
+func (b R9NanoPlatformBuilder) WithL1CacheSize(
+	size uint64,
+) R9NanoPlatformBuilder {
+	b.l1CacheSize = size
+	return b
+}
+
+// WithL2CacheSize sets the total L2 cache size per GPU. The size is split
+// between memory banks.
+func (b R9NanoPlatformBuilder) WithL2CacheSize(
+	size uint64,
+) R9NanoPlatformBuilder {
+	b.l2CacheSize = size
+	return b
+}
+
+// WithDRAMSize sets the size of DRAM per GPU. Must not exceed 4GB, the
+// fixed per-GPU window in the flat global address space.
+func (b R9NanoPlatformBuilder) WithDRAMSize(
+	size uint64,
+) R9NanoPlatformBuilder {
+	b.dramSize = size
 	return b
 }
 
@@ -358,7 +390,10 @@ func (b *R9NanoPlatformBuilder) createGPUBuilder(
 		WithNumMemoryBank(16).
 		WithLog2MemoryBankInterleavingSize(7).
 		WithLog2PageSize(b.log2PageSize).
-		WithGlobalStorage(b.globalStorage)
+		WithGlobalStorage(b.globalStorage).
+		WithL1CacheSize(b.l1CacheSize).
+		WithL2CacheSize(b.l2CacheSize).
+		WithDRAMSize(b.dramSize)
 
 	if b.monitor != nil {
 		gpuBuilder = gpuBuilder.WithMonitor(b.monitor)
@@ -424,7 +459,7 @@ func (b *R9NanoPlatformBuilder) createGPU(
 		gpu.Domain.GetPortByName("CommandProcessor"),
 		driver.DeviceProperties{
 			CUCount:  b.numCUPerSA * b.numSAPerGPU,
-			DRAMSize: 4 * mem.GB,
+			DRAMSize: b.dramSize,
 		},
 	)
 	gpu.CommandProcessor.Driver = gpuDriver.GetPortByName("GPU")
