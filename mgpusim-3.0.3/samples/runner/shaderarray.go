@@ -45,6 +45,7 @@ type shaderArrayBuilder struct {
 	freq              sim.Freq
 	log2CacheLineSize uint64
 	log2PageSize      uint64
+	l1CacheSize       uint64
 
 	isaDebugging bool
 	visTracer    tracing.Tracer
@@ -61,6 +62,7 @@ func makeShaderArrayBuilder() shaderArrayBuilder {
 		freq:              1 * sim.GHz,
 		log2CacheLineSize: 6,
 		log2PageSize:      12,
+		l1CacheSize:       16 * mem.KB,
 	}
 	return b
 }
@@ -96,6 +98,13 @@ func (b shaderArrayBuilder) withLog2PageSize(
 	log2Size uint64,
 ) shaderArrayBuilder {
 	b.log2PageSize = log2Size
+	return b
+}
+
+func (b shaderArrayBuilder) withL1CacheSize(
+	size uint64,
+) shaderArrayBuilder {
+	b.l1CacheSize = size
 	return b
 }
 
@@ -356,7 +365,7 @@ func (b *shaderArrayBuilder) buildL1VCaches(sa *shaderArray) {
 		WithLog2BlockSize(b.log2CacheLineSize).
 		WithWayAssociativity(4).
 		WithNumMSHREntry(16).
-		WithTotalByteSize(16 * mem.KB)
+		WithTotalByteSize(b.l1CacheSize)
 
 	if b.visTracer != nil {
 		builder = builder.WithVisTracer(b.visTracer)

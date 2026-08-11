@@ -134,4 +134,74 @@ var _ = Describe("MCCL", func() {
 		}
 	})
 
+	It("AllReduceNaive Test Buffer Size < Data Size", func() {
+		gpuNum := 4
+		var dataSize uint32 = 1029
+		var bufSize uint32 = 256
+		datas := make([]driver.Ptr, gpuNum)
+		bufs := make([]driver.Ptr, gpuNum)
+		for i := 0; i < gpuNum; i++ {
+			tmp := make([]float32, uint64(dataSize))
+			for j := 0; j < int(dataSize); j++ {
+				tmp[j] = float32(i + 1)
+			}
+			gpuDriver.SelectGPU(context, i+1)
+			data := gpuDriver.AllocateMemory(context, uint64(dataSize*4))
+			gpuDriver.MemCopyH2D(context, data, tmp)
+			buf := gpuDriver.AllocateMemory(context, uint64(bufSize*4))
+			gpuIDs = append(gpuIDs, i+1)
+			datas[i] = data
+			bufs[i] = buf
+		}
+
+		comms = mccl.CommInitAll(gpuNum, gpuDriver, context, gpuIDs)
+		mccl.AllReduceNaive(
+			gpuDriver, comms, datas, int(dataSize), bufs, int(bufSize))
+
+		for i := 0; i < gpuNum; i++ {
+			tmp := make([]float32, uint64(dataSize))
+			gpuDriver.SelectGPU(context, i+1)
+			gpuDriver.MemCopyD2H(context, tmp, datas[i])
+			for j := 0; j < int(dataSize); j++ {
+				Expect(tmp[i]).To(Equal(float32(2.5)))
+			}
+			log.Printf("Passed")
+		}
+	})
+
+	It("AllReduceNaive Test Buffer Size == Data Size", func() {
+		gpuNum := 4
+		var dataSize uint32 = 1029
+		var bufSize uint32 = 1029
+		datas := make([]driver.Ptr, gpuNum)
+		bufs := make([]driver.Ptr, gpuNum)
+		for i := 0; i < gpuNum; i++ {
+			tmp := make([]float32, uint64(dataSize))
+			for j := 0; j < int(dataSize); j++ {
+				tmp[j] = float32(i + 1)
+			}
+			gpuDriver.SelectGPU(context, i+1)
+			data := gpuDriver.AllocateMemory(context, uint64(dataSize*4))
+			gpuDriver.MemCopyH2D(context, data, tmp)
+			buf := gpuDriver.AllocateMemory(context, uint64(bufSize*4))
+			gpuIDs = append(gpuIDs, i+1)
+			datas[i] = data
+			bufs[i] = buf
+		}
+
+		comms = mccl.CommInitAll(gpuNum, gpuDriver, context, gpuIDs)
+		mccl.AllReduceNaive(
+			gpuDriver, comms, datas, int(dataSize), bufs, int(bufSize))
+
+		for i := 0; i < gpuNum; i++ {
+			tmp := make([]float32, uint64(dataSize))
+			gpuDriver.SelectGPU(context, i+1)
+			gpuDriver.MemCopyD2H(context, tmp, datas[i])
+			for j := 0; j < int(dataSize); j++ {
+				Expect(tmp[i]).To(Equal(float32(2.5)))
+			}
+			log.Printf("Passed")
+		}
+	})
+
 })

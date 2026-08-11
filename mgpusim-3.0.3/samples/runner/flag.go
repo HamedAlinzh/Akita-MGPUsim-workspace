@@ -42,9 +42,16 @@ var bufferLevelTracePeriodFlag = flag.Float64("buffer-level-trace-period", 0.0,
 var simdBusyTimeTracerFlag = flag.Bool("report-busy-time", false, "Report SIMD Unit's busy time")
 var reportCPIStackFlag = flag.Bool("report-cpi-stack", false, "Report CPI stack")
 var customPortForAkitaRTM = flag.Int("akitartm-port", 0,
-	`Custom port to host AkitaRTM. A 4-digit or 5-digit port number is required. If 
-this number is not given or a invalid number is given number, a random port 
+	`Custom port to host AkitaRTM. A 4-digit or 5-digit port number is required. If
+this number is not given or a invalid number is given number, a random port
 will be used.`)
+
+var l1CacheSizeFlag = flag.Uint64("l1-cache-size", 16*1024,
+	"The size of each CU's L1 vector (data) cache, in bytes.")
+var l2CacheSizeFlag = flag.Uint64("l2-cache-size", 2*1024*1024,
+	"The total L2 cache size per GPU, in bytes.")
+var dramSizeFlag = flag.Uint64("dram-size", 4*1024*1024*1024,
+	"The DRAM size per GPU, in bytes. Cannot exceed 4GB.")
 
 var analyszerNameFlag = flag.String("analyzer-name", "",
 	"The name of the analyzer to use.")
@@ -121,6 +128,10 @@ func (r *Runner) ParseFlag() *Runner {
 	if *reportCPIStackFlag {
 		r.ReportCPIStack = true
 	}
+
+	r.L1CacheSize = *l1CacheSizeFlag
+	r.L2CacheSize = *l2CacheSizeFlag
+	r.DRAMSize = *dramSizeFlag
 
 	if *reportAll {
 		r.ReportInstCount = true
