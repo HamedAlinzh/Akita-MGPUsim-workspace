@@ -188,7 +188,7 @@ func (b *Benchmark) exec() {
 				MatrixB: gBs[g],
 				MatrixC: partialC[g] + driver.Ptr(cOffset),
 				WidthA:  kSlice,
-				BlockA:  32 * 32 * 4,
+				BlockA:  (4 * tileSize) * (4 * tileSize) * 4,
 			}
 			b.driver.EnqueueLaunchKernel(
 				cmdQs[g],

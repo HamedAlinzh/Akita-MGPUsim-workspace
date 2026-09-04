@@ -13,3 +13,13 @@
 *.out
 *.prof
 *.coverprofile
+gemm_tile_tuning/
+allreducegemm_tuned
+latex-report/*.aux
+latex-report/*.log
+latex-report/*.dvi
+gemm_tile_tuning/
+allreducegemm_tuned
+latex-report/*.aux
+latex-report/*.log
+latex-report/*.dvi
