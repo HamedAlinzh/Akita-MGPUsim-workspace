@@ -1,0 +1,400 @@
+<title>مفاهیم پایهٔ تایل و حافظه در GEMM</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root{
+  --paper:#f2f5f5;
+  --surface:#ffffff;
+  --ink:#15201e;
+  --muted:#5c6f6c;
+  --line:#dae3e1;
+  --line-strong:#c1d0cd;
+  --accent:#00786c;
+  --accent-soft:#e0efec;
+  --warn:#a9541a;
+  --warn-soft:#f6ebe1;
+  --code-bg:#eaf0ef;
+  --diagram-soft:#e8eeed;
+  --shadow:0 1px 2px rgba(21,32,30,.05), 0 10px 28px -20px rgba(21,32,30,.35);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#0e1514;
+    --surface:#151e1d;
+    --ink:#e4ecea;
+    --muted:#8ea29f;
+    --line:#243130;
+    --line-strong:#32433f;
+    --accent:#57c3b3;
+    --accent-soft:#12302b;
+    --warn:#dd9256;
+    --warn-soft:#2b2018;
+    --code-bg:#1a2423;
+    --diagram-soft:#1d2827;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 28px -20px rgba(0,0,0,.8);
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0e1514;
+  --surface:#151e1d;
+  --ink:#e4ecea;
+  --muted:#8ea29f;
+  --line:#243130;
+  --line-strong:#32433f;
+  --accent:#57c3b3;
+  --accent-soft:#12302b;
+  --warn:#dd9256;
+  --warn-soft:#2b2018;
+  --code-bg:#1a2423;
+  --diagram-soft:#1d2827;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 28px -20px rgba(0,0,0,.8);
+}
+
+*{box-sizing:border-box;}
+
+body{
+  direction:rtl;
+  background:var(--paper);
+  color:var(--ink);
+  font-family:'Vazirmatn', Tahoma, 'Segoe UI', sans-serif;
+  font-size:16px;
+  line-height:2.05;
+  margin:0;
+  padding:clamp(1.5rem,4vw,3.5rem) clamp(1rem,4vw,2rem) 5rem;
+}
+
+.wrap{max-width:47rem;margin:0 auto;display:flex;flex-direction:column;gap:3rem;}
+
+.masthead{display:flex;flex-direction:column;gap:.85rem;padding-bottom:1.75rem;border-bottom:2px solid var(--line-strong);}
+.eyebrow{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  direction:ltr;unicode-bidi:isolate;align-self:flex-start;
+  font-size:.7rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--accent);background:var(--accent-soft);border-radius:3px;padding:.3rem .6rem;
+}
+h1{font-size:clamp(1.5rem,4.5vw,2.05rem);font-weight:800;line-height:1.5;margin:0;text-wrap:balance;}
+.standfirst{margin:0;color:var(--muted);font-size:1.02rem;line-height:1.95;}
+
+section{display:flex;flex-direction:column;gap:1rem;}
+h2{font-size:1.2rem;font-weight:700;margin:0;line-height:1.7;padding-bottom:.5rem;border-bottom:1px solid var(--line);text-wrap:balance;}
+h3{margin:0;font-size:1rem;font-weight:700;line-height:1.8;}
+p{margin:0;}
+.lede{font-weight:500;}
+
+code{
+  direction:ltr;unicode-bidi:isolate;
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:.86em;background:var(--code-bg);border-radius:4px;padding:.12em .38em;
+}
+
+/* ---------- definition strip ---------- */
+.defs{display:flex;flex-direction:column;gap:0;background:var(--surface);border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:var(--shadow);}
+.def{display:grid;grid-template-columns:9.5rem 1fr;gap:0 1.1rem;padding:.85rem 1.15rem;border-bottom:1px solid var(--line);align-items:baseline;}
+.def:last-child{border-bottom:none;}
+.def dt{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  direction:ltr;unicode-bidi:isolate;text-align:left;
+  font-size:.82rem;font-weight:700;color:var(--accent);
+}
+.def dd{margin:0;font-size:.94rem;line-height:1.9;}
+@media (max-width:34rem){.def{grid-template-columns:1fr;gap:.2rem;}.def dt{text-align:right;direction:rtl;}}
+
+/* ---------- figures ---------- */
+figure{margin:0;display:flex;flex-direction:column;gap:.75rem;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:1.35rem 1.25rem 1.1rem;box-shadow:var(--shadow);}
+figure svg{display:block;width:100%;max-width:100%;height:auto;color:var(--ink);}
+figcaption{color:var(--muted);font-size:.86rem;line-height:1.9;border-top:1px solid var(--line);padding-top:.75rem;}
+
+.dg-box{fill:var(--diagram-soft);stroke:currentColor;stroke-width:1.5;}
+.dg-grid{stroke:currentColor;stroke-width:1;stroke-opacity:.28;}
+.dg-hi{fill:var(--accent-soft);stroke:var(--accent);stroke-width:2;}
+.dg-line{stroke:currentColor;stroke-width:1.5;fill:none;}
+.dg-dash{stroke:var(--accent);stroke-width:1.25;fill:none;stroke-dasharray:4 4;}
+.dg-accent-fill{fill:var(--accent);}
+.dg-accent-box{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5;}
+.dg-warn-box{fill:var(--warn-soft);stroke:var(--warn);stroke-width:1.5;}
+.dg-cap{stroke:var(--warn);stroke-width:1.75;stroke-dasharray:5 4;fill:none;}
+.dg-t{fill:currentColor;font-family:'JetBrains Mono', ui-monospace, monospace;font-size:12px;}
+.dg-t-sm{fill:var(--muted);font-family:'JetBrains Mono', ui-monospace, monospace;font-size:10.5px;}
+.dg-t-ac{fill:var(--accent);font-family:'JetBrains Mono', ui-monospace, monospace;font-size:12px;font-weight:700;}
+.dg-t-wn{fill:var(--warn);font-family:'JetBrains Mono', ui-monospace, monospace;font-size:12px;font-weight:700;}
+
+/* ---------- tables ---------- */
+.tablewrap{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);}
+table{border-collapse:collapse;width:100%;font-size:.88rem;}
+caption{caption-side:top;text-align:right;padding:.8rem 1rem .1rem;color:var(--muted);font-size:.82rem;line-height:1.8;}
+th,td{padding:.6rem .85rem;text-align:center;border-bottom:1px solid var(--line);white-space:nowrap;}
+thead th{font-weight:700;font-size:.78rem;color:var(--muted);background:var(--code-bg);border-bottom:1px solid var(--line-strong);}
+tbody tr:last-child td{border-bottom:none;}
+th:first-child,td:first-child{text-align:right;}
+.num{font-family:'JetBrains Mono', ui-monospace, monospace;font-variant-numeric:tabular-nums;direction:ltr;unicode-bidi:isolate;}
+tr.bad td{background:var(--warn-soft);}
+tr.bad td:first-child{box-shadow:inset -3px 0 0 var(--warn);}
+
+/* ---------- callouts ---------- */
+.callout{background:var(--accent-soft);border:1px solid color-mix(in srgb, var(--accent) 26%, transparent);border-radius:8px;padding:1.05rem 1.2rem;display:flex;flex-direction:column;gap:.55rem;}
+.callout.warn{background:var(--warn-soft);border-color:color-mix(in srgb, var(--warn) 28%, transparent);}
+.callout .tag{font-family:'JetBrains Mono', ui-monospace, monospace;direction:ltr;unicode-bidi:isolate;align-self:flex-start;font-size:.68rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);}
+.callout.warn .tag{color:var(--warn);}
+
+.calc{
+  direction:ltr;unicode-bidi:isolate;text-align:left;
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:.82rem;line-height:2.1;color:var(--muted);
+  background:var(--surface);border:1px solid var(--line);
+  border-inline-start:3px solid var(--accent);
+  border-radius:5px;padding:.85rem 1rem;overflow-x:auto;
+}
+
+footer{border-top:1px solid var(--line);padding-top:1.25rem;color:var(--muted);font-size:.85rem;line-height:1.9;}
+a{color:var(--accent);}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:3px;}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <span class="eyebrow">GEMM &middot; tiling &amp; memory</span>
+    <h1>تایل، حافظهٔ LDS و occupancy — به زبان ساده</h1>
+    <p class="standfirst">توضیح مفاهیمی که در گزارش و در بحث با استاد راهنما زیاد تکرار شدند: تایل چیست، <code>BlockA</code> دقیقاً چه چیزی را مشخص می‌کند، sweep یعنی چه، و چرا occupancy تعیین می‌کند که <code>tile=32</code> اصلاً قابل اجرا نباشد.</p>
+  </header>
+
+  <section>
+    <h2>اول: سلسله‌مراتب سخت‌افزار</h2>
+    <p>بدون این چهار اصطلاح، بقیهٔ مفاهیم معنا پیدا نمی‌کنند. همه‌شان لایه‌های تو در توی یک GPU هستند:</p>
+    <dl class="defs">
+      <div class="def"><dt>work-item</dt><dd>کوچک‌ترین واحد اجرا — معادل یک «نخ» یا thread. در کرنل ما، هر work-item مسئول محاسبهٔ ۱۶ خانه از ماتریس خروجی است (یک بلوک ۴×۴).</dd></div>
+      <div class="def"><dt>wavefront</dt><dd>۶۴ عدد work-item که سخت‌افزار آن‌ها را <em>هم‌زمان و با یک دستور مشترک</em> اجرا می‌کند. این واحد واقعی زمان‌بندی روی سخت‌افزار AMD است.</dd></div>
+      <div class="def"><dt>workgroup</dt><dd>گروهی از work-itemها که می‌توانند حافظهٔ محلی (LDS) را با هم به اشتراک بگذارند و با هم همگام‌سازی کنند. اندازهٔ آن را ما در کد تعیین می‌کنیم — همان <code>tileSize × tileSize</code>.</dd></div>
+      <div class="def"><dt>CU</dt><dd>Compute Unit، یعنی یک هستهٔ محاسباتی. هر CU شامل ۴ واحد SIMD، یک فایل رجیستر، و ۶۴ کیلوبایت حافظهٔ LDS است. GPU مدل R9 Nano ما ۶۴ عدد CU دارد.</dd></div>
+    </dl>
+    <p>نکتهٔ کلیدی: یک workgroup <strong>حتماً باید کامل روی یک CU جا شود</strong>. نمی‌شود آن را بین دو CU تقسیم کرد. همین قید ساده، بعداً دلیل هنگ کردن <code>tile=32</code> می‌شود.</p>
+  </section>
+
+  <section>
+    <h2>تایل (tile) چیست؟</h2>
+    <p class="lede">تایل یعنی «تکه‌ای از ماتریس خروجی که یک واحد کاری، با هم، رویش کار می‌کند».</p>
+    <p>ضرب ماتریس را نمی‌شود خانه‌به‌خانه حساب کرد و انتظار سرعت داشت، چون هر خانه به یک سطر کامل از A و یک ستون کامل از B نیاز دارد و این یعنی خواندن مکرر از حافظهٔ کند. راه‌حل این است که خروجی را به بلوک‌های مربعی (تایل) تقسیم کنیم و داده‌های لازم برای هر بلوک را <em>یک بار</em> به حافظهٔ سریع بیاوریم.</p>
+    <p>در کد ما دو سطح تایل روی هم سوار شده‌اند:</p>
+
+    <figure>
+      <svg viewBox="0 0 620 405" role="img" aria-label="یک تایل خروجی ۳۲ در ۳۲ که از ۸ در ۸ work-item ساخته شده و هر work-item یک بلوک ۴ در ۴ را حساب می‌کند">
+        <rect class="dg-box" x="50" y="80" width="280" height="280" rx="2"/>
+        <line class="dg-grid" x1="85"  y1="80" x2="85"  y2="360"/>
+        <line class="dg-grid" x1="120" y1="80" x2="120" y2="360"/>
+        <line class="dg-grid" x1="155" y1="80" x2="155" y2="360"/>
+        <line class="dg-grid" x1="190" y1="80" x2="190" y2="360"/>
+        <line class="dg-grid" x1="225" y1="80" x2="225" y2="360"/>
+        <line class="dg-grid" x1="260" y1="80" x2="260" y2="360"/>
+        <line class="dg-grid" x1="295" y1="80" x2="295" y2="360"/>
+        <line class="dg-grid" x1="50" y1="115" x2="330" y2="115"/>
+        <line class="dg-grid" x1="50" y1="150" x2="330" y2="150"/>
+        <line class="dg-grid" x1="50" y1="185" x2="330" y2="185"/>
+        <line class="dg-grid" x1="50" y1="220" x2="330" y2="220"/>
+        <line class="dg-grid" x1="50" y1="255" x2="330" y2="255"/>
+        <line class="dg-grid" x1="50" y1="290" x2="330" y2="290"/>
+        <line class="dg-grid" x1="50" y1="325" x2="330" y2="325"/>
+        <rect class="dg-hi" x="50" y="80" width="35" height="35"/>
+
+        <text class="dg-t" x="190" y="66" text-anchor="middle">32</text>
+        <text class="dg-t" x="40" y="224" text-anchor="end">32</text>
+        <text class="dg-t-sm" x="190" y="384" text-anchor="middle">8 &times; 8 work-items = 1 workgroup</text>
+
+        <line class="dg-dash" x1="85" y1="80"  x2="430" y2="80"/>
+        <line class="dg-dash" x1="85" y1="115" x2="430" y2="220"/>
+
+        <rect class="dg-hi" x="430" y="80" width="140" height="140"/>
+        <line class="dg-grid" x1="465" y1="80" x2="465" y2="220"/>
+        <line class="dg-grid" x1="500" y1="80" x2="500" y2="220"/>
+        <line class="dg-grid" x1="535" y1="80" x2="535" y2="220"/>
+        <line class="dg-grid" x1="430" y1="115" x2="570" y2="115"/>
+        <line class="dg-grid" x1="430" y1="150" x2="570" y2="150"/>
+        <line class="dg-grid" x1="430" y1="185" x2="570" y2="185"/>
+        <text class="dg-t-ac" x="500" y="248" text-anchor="middle">1 work-item</text>
+        <text class="dg-t-sm" x="500" y="266" text-anchor="middle">4 &times; 4 outputs</text>
+      </svg>
+      <figcaption>مربع بزرگ، تایل خروجی است: یک بلوک ۳۲×۳۲ از ماتریس C. این بلوک از ۸×۸ عدد work-item تشکیل شده (یک workgroup)، و هر work-item — مربع بزرگ‌نمایی‌شده در سمت چپ — دقیقاً ۴×۴ خانه از خروجی را حساب می‌کند. عدد ۴×۴ داخل خود کرنل ثابت است (<code>TILEX</code> و <code>TILEY</code>)، ولی عدد ۸×۸ را ما از سمت میزبان تعیین می‌کنیم؛ همان چیزی است که در کد اسمش <code>tileSize</code> است.</figcaption>
+    </figure>
+
+    <div class="callout">
+      <span class="tag">رابطهٔ کلیدی</span>
+      <p>اندازهٔ تایل خروجی = <code>4 × tileSize</code>. پس <code>tileSize=8</code> یعنی تایل ۳۲×۳۲، و <code>tileSize=16</code> یعنی تایل ۶۴×۶۴. تنها چیزی که در sweep عوض می‌شد همین <code>tileSize</code> بود.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>حافظهٔ LDS چیست و چرا اصلاً تایل‌بندی می‌کنیم؟</h2>
+    <p>LDS مخفف <em>Local Data Share</em> است: یک حافظهٔ کوچک و بسیار سریع (۶۴ کیلوبایت) که <strong>داخل خود CU</strong> قرار دارد. برخلاف کش، LDS خودکار نیست — برنامه‌نویس باید صریحاً بگوید چه چیزی داخلش بریزد. به همین دلیل گاهی به آن «کش دستی» می‌گویند.</p>
+    <p>دلیل وجود تایل‌بندی دقیقاً همین است: به‌جای اینکه هر work-item داده‌های لازمش را بارها از DRAM کند بخواند، کل workgroup یک بار تایل موردنیازش را در LDS می‌گذارد و بعد همه از آنجا می‌خوانند.</p>
+
+    <figure>
+      <svg viewBox="0 0 620 360" role="img" aria-label="مقایسهٔ خواندن مستقیم از DRAM با خواندن یک‌بارهٔ داده در LDS و استفادهٔ مکرر از آن">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <polygon points="0,0 10,5 0,10" fill="currentColor"/>
+          </marker>
+          <marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <polygon points="0,0 10,5 0,10" class="dg-accent-fill"/>
+          </marker>
+        </defs>
+
+        <text class="dg-t-sm" x="580" y="24" text-anchor="end">without LDS</text>
+        <rect class="dg-box" x="40" y="52" width="110" height="60" rx="3"/>
+        <text class="dg-t" x="95" y="87" text-anchor="middle">DRAM</text>
+        <rect class="dg-box" x="470" y="34" width="110" height="28" rx="3"/>
+        <rect class="dg-box" x="470" y="68" width="110" height="28" rx="3"/>
+        <rect class="dg-box" x="470" y="102" width="110" height="28" rx="3"/>
+        <text class="dg-t-sm" x="525" y="53" text-anchor="middle">work-item</text>
+        <text class="dg-t-sm" x="525" y="87" text-anchor="middle">work-item</text>
+        <text class="dg-t-sm" x="525" y="121" text-anchor="middle">work-item</text>
+        <line class="dg-line" x1="150" y1="76" x2="464" y2="48" marker-end="url(#ar)"/>
+        <line class="dg-line" x1="150" y1="82" x2="464" y2="82" marker-end="url(#ar)"/>
+        <line class="dg-line" x1="150" y1="88" x2="464" y2="116" marker-end="url(#ar)"/>
+        <text class="dg-t-wn" x="307" y="140" text-anchor="middle">3 slow DRAM reads</text>
+
+        <line class="dg-grid" x1="40" y1="172" x2="580" y2="172"/>
+
+        <text class="dg-t-sm" x="580" y="206" text-anchor="end">with LDS</text>
+        <rect class="dg-box" x="40" y="234" width="110" height="60" rx="3"/>
+        <text class="dg-t" x="95" y="269" text-anchor="middle">DRAM</text>
+        <rect class="dg-accent-box" x="240" y="234" width="110" height="60" rx="3"/>
+        <text class="dg-t-ac" x="295" y="264" text-anchor="middle">LDS</text>
+        <text class="dg-t-sm" x="295" y="282" text-anchor="middle">on-chip</text>
+        <rect class="dg-box" x="470" y="216" width="110" height="28" rx="3"/>
+        <rect class="dg-box" x="470" y="250" width="110" height="28" rx="3"/>
+        <rect class="dg-box" x="470" y="284" width="110" height="28" rx="3"/>
+        <text class="dg-t-sm" x="525" y="235" text-anchor="middle">work-item</text>
+        <text class="dg-t-sm" x="525" y="269" text-anchor="middle">work-item</text>
+        <text class="dg-t-sm" x="525" y="303" text-anchor="middle">work-item</text>
+        <line class="dg-line" x1="150" y1="264" x2="234" y2="264" marker-end="url(#ar)"/>
+        <text class="dg-t-sm" x="192" y="254" text-anchor="middle">1 &times;</text>
+        <line class="dg-dash" x1="350" y1="258" x2="464" y2="230" marker-end="url(#ara)"/>
+        <line class="dg-dash" x1="350" y1="264" x2="464" y2="264" marker-end="url(#ara)"/>
+        <line class="dg-dash" x1="350" y1="270" x2="464" y2="298" marker-end="url(#ara)"/>
+        <text class="dg-t-ac" x="407" y="330" text-anchor="middle">many fast on-chip reads</text>
+      </svg>
+      <figcaption>بالا: بدون LDS، هر work-item جداگانه از DRAM می‌خواند — یعنی چند بار پرداخت هزینهٔ حافظهٔ کند. پایین: تایل یک بار از DRAM به LDS منتقل می‌شود و بعد همهٔ work-itemهای آن workgroup بارها و با سرعت بالا از روی تراشه می‌خوانند. تنها تفاوت واقعی همین جابه‌جا شدن فلش‌هاست، ولی همین تفاوت است که ضرب ماتریس را سریع می‌کند.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2><code>BlockA</code> دقیقاً چه چیزی است؟</h2>
+    <p class="lede">یک عدد ساده: «چند بایت از LDS را برای نگه‌داشتن تایل ماتریس A کنار بگذار».</p>
+    <p>کرنل باید از قبل بداند چقدر فضای LDS لازم دارد، و این مقدار را میزبان (کد Go ما) موقع اجرای کرنل به آن می‌دهد. محاسبه‌اش مستقیم است — تعداد خانه‌های تایل، ضرب در ۴ بایت (هر عدد <code>float32</code> چهار بایت است):</p>
+    <div class="calc">tile edge = 4 &times; tileSize<br>BlockA   = (4 &times; tileSize) &times; (4 &times; tileSize) &times; 4 bytes</div>
+    <p>در کد اصلی من این مقدار به‌صورت ثابت <code>32 * 32 * 4</code> نوشته شده بود، یعنی ۴۰۹۶ بایت. آن عدد کاملاً درست است — ولی <em>فقط</em> وقتی <code>tileSize=8</code> باشد. به محض اینکه sweep بخواهد تایل را عوض کند، این عدد ثابت غلط می‌شود:</p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>مقدار درست <code>BlockA</code> به ازای هر تایل. سطر آخر نشان می‌دهد که چرا عدد ثابت ۴ کیلوبایت خطرناک است.</caption>
+        <thead><tr><th>tileSize</th><th>تایل خروجی</th><th>تعداد خانه</th><th>BlockA درست</th><th>عدد ثابت قدیمی</th></tr></thead>
+        <tbody>
+          <tr><td class="num">4</td><td class="num">16×16</td><td class="num">256</td><td class="num">1 KB</td><td class="num">4 KB</td></tr>
+          <tr><td class="num">8</td><td class="num">32×32</td><td class="num">1024</td><td class="num">4 KB</td><td class="num">4 KB</td></tr>
+          <tr class="bad"><td class="num">16</td><td class="num">64×64</td><td class="num">4096</td><td class="num">16 KB</td><td class="num">4 KB</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout warn">
+      <span class="tag">چرا استاد راهنما نگران بود</span>
+      <p>در حالت <code>tileSize=16</code>، کرنل به ۱۶ کیلوبایت فضا نیاز دارد ولی فقط ۴ کیلوبایت برایش رزرو شده است. یعنی کرنل بیرون از محدودهٔ حافظهٔ خودش می‌نویسد و نتیجه <strong>غلط</strong> در می‌آید — نه فقط کند. به همین دلیل این اصلاح پیش‌نیاز هر sweep معتبری بود، و من آن را دائمی کردم.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>sweep یعنی چه؟</h2>
+    <p>sweep (جاروب کردن) یعنی یک آزمایش را چند بار تکرار کنیم و هر بار <em>فقط یک پارامتر</em> را عوض کنیم، تا اثر خالص همان پارامتر را ببینیم. بقیهٔ شرایط باید کاملاً ثابت بماند، وگرنه نمی‌شود فهمید تغییرِ نتیجه از کجا آمده.</p>
+    <p>در این پروژه سه sweep انجام شده است:</p>
+    <dl class="defs">
+      <div class="def"><dt>scaling</dt><dd>سه اندازهٔ ماتریس × سه تعداد GPU × دو الگوریتم All-Reduce = ۱۸ اجرا. پارامتر متغیر: تعداد GPU و اندازهٔ مسئله.</dd></div>
+      <div class="def"><dt>sensitivity</dt><dd>اندازهٔ کش L1، کش L2 و ظرفیت DRAM، هر بار یکی. پارامتر متغیر: یک مشخصهٔ معماری.</dd></div>
+      <div class="def"><dt>tile</dt><dd>سه مقدار <code>tileSize</code> برابر ۴ و ۸ و ۱۶. پارامتر متغیر: اندازهٔ workgroup.</dd></div>
+    </dl>
+    <p>اسکریپت استاد راهنما دقیقاً همین کار را خودکار می‌کند: مقدار <code>tileSize</code> را در فایل عوض می‌کند، برنامه را دوباره build می‌کند، شبیه‌سازی را اجرا می‌کند، عدد <code>total_time</code> را از <code>metrics.csv</code> بیرون می‌کشد، و در پایان فایل را به حالت اول برمی‌گرداند.</p>
+    <div class="callout warn">
+      <span class="tag">اشکال این sweep</span>
+      <p>یک sweep وقتی معتبر است که واقعاً فقط یک چیز تغییر کند. ولی در کد ما <code>rowBand = 4 * tileSize</code> است، پس با عوض شدن تایل، تعداد دفعات اجرای کرنل هم عوض می‌شود. یعنی هم‌زمان دو چیز تغییر می‌کند و نمی‌شود گفت بهبود سرعت از کدام یک آمده. این همان ایرادی است که در یادداشت به استاد راهنما مطرح کردم.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>occupancy چیست؟</h2>
+    <p class="lede">occupancy یعنی «چند wavefront می‌توانند هم‌زمان روی یک CU ساکن باشند».</p>
+    <p>چرا مهم است؟ چون وقتی یک wavefront منتظر رسیدن داده از حافظه می‌ماند (که صدها سیکل طول می‌کشد)، سخت‌افزار می‌تواند در همان فاصله wavefront دیگری را اجرا کند. هرچه wavefrontهای بیشتری ساکن باشند، این «پنهان کردن تأخیر» بهتر انجام می‌شود. occupancy پایین یعنی CU بیشتر وقت‌ها بی‌کار منتظر حافظه است.</p>
+    <p>سه منبع محدودکننده وجود دارد و <strong>سخت‌گیرانه‌ترینشان</strong> تعیین‌کننده است:</p>
+    <dl class="defs">
+      <div class="def"><dt>registers</dt><dd>هر work-item به تعدادی رجیستر (VGPR) نیاز دارد. کرنل ما ۷۴ عدد لازم دارد.</dd></div>
+      <div class="def"><dt>LDS</dt><dd>هر workgroup مقداری از آن ۶۴ کیلوبایت را می‌گیرد — یعنی همان <code>BlockA</code>.</dd></div>
+      <div class="def"><dt>wavefront slots</dt><dd>تعداد جایگاه‌های زمان‌بندی که خود CU دارد.</dd></div>
+    </dl>
+
+    <p>حالا حساب کنیم که در سخت‌افزار ما محدودیت رجیستر چقدر است:</p>
+    <div class="calc">16384 registers per SIMD &divide; 4 (granularity) &divide; 64 (lanes) = 64 units<br>ceil(74 / 4) = 19 units needed per wavefront<br>floor(64 / 19) = 3 wavefronts per SIMD<br>3 &times; 4 SIMDs = <strong>12 wavefronts per CU</strong></div>
+
+    <figure>
+      <svg viewBox="0 0 620 268" role="img" aria-label="نمودار میله‌ای تعداد wavefront لازم برای هر تایل در مقایسه با ظرفیت ۱۲ wavefront هر CU">
+        <line class="dg-cap" x1="400" y1="46" x2="400" y2="212"/>
+        <text class="dg-t-wn" x="400" y="38" text-anchor="middle">CU capacity = 12</text>
+
+        <rect class="dg-accent-box" x="80" y="62" width="27" height="32" rx="2"/>
+        <text class="dg-t" x="70" y="83" text-anchor="end">tile=8</text>
+        <text class="dg-t-sm" x="117" y="83">1 wavefront</text>
+
+        <rect class="dg-accent-box" x="80" y="110" width="107" height="32" rx="2"/>
+        <text class="dg-t" x="70" y="131" text-anchor="end">tile=16</text>
+        <text class="dg-t-sm" x="197" y="131">4 wavefronts</text>
+
+        <rect class="dg-warn-box" x="80" y="158" width="427" height="32" rx="2"/>
+        <text class="dg-t" x="70" y="179" text-anchor="end">tile=32</text>
+        <text class="dg-t-wn" x="517" y="179">16 &mdash; never fits</text>
+
+        <line class="dg-grid" x1="80" y1="212" x2="580" y2="212"/>
+        <line class="dg-grid" x1="80"  y1="212" x2="80"  y2="218"/>
+        <line class="dg-grid" x1="187" y1="212" x2="187" y2="218"/>
+        <line class="dg-grid" x1="293" y1="212" x2="293" y2="218"/>
+        <line class="dg-grid" x1="400" y1="212" x2="400" y2="218"/>
+        <line class="dg-grid" x1="507" y1="212" x2="507" y2="218"/>
+        <text class="dg-t-sm" x="80"  y="234" text-anchor="middle">0</text>
+        <text class="dg-t-sm" x="187" y="234" text-anchor="middle">4</text>
+        <text class="dg-t-sm" x="293" y="234" text-anchor="middle">8</text>
+        <text class="dg-t-sm" x="400" y="234" text-anchor="middle">12</text>
+        <text class="dg-t-sm" x="507" y="234" text-anchor="middle">16</text>
+        <text class="dg-t-sm" x="330" y="258" text-anchor="middle">wavefronts required per workgroup</text>
+      </svg>
+      <figcaption>هر workgroup باید کامل روی یک CU جا شود. تایل ۸ و ۱۶ راحت جا می‌شوند، ولی <code>tile=32</code> یعنی ۱۰۲۴ عدد work-item، یعنی ۱۶ wavefront — بیشتر از ۱۲ تایی که ظرفیت رجیستر اجازه می‌دهد. چنین workgroupی هرگز جایی برای اجرا پیدا نمی‌کند، و MGPUSim به‌جای اینکه خطا بدهد، بی‌صدا برای همیشه منتظر می‌ماند. این دقیقاً همان هنگ کردنی بود که دیدیم.</figcaption>
+    </figure>
+
+    <p>یک نکتهٔ ظریف دیگر هم در همین جدول پنهان است — اینکه چرا <code>tile=4</code> در نتایج از همه کندتر بود:</p>
+    <div class="tablewrap">
+      <table>
+        <caption>یک wavefront همیشه ۶۴ لِین دارد. اگر workgroup کوچک‌تر از ۶۴ باشد، بقیهٔ لِین‌ها بی‌کار می‌مانند ولی همچنان جا اشغال می‌کنند.</caption>
+        <thead><tr><th>tileSize</th><th>work-item در workgroup</th><th>wavefront</th><th>لِین‌های استفاده‌شده</th></tr></thead>
+        <tbody>
+          <tr class="bad"><td class="num">4</td><td class="num">16</td><td class="num">1</td><td class="num">25%</td></tr>
+          <tr><td class="num">8</td><td class="num">64</td><td class="num">1</td><td class="num">100%</td></tr>
+          <tr><td class="num">16</td><td class="num">256</td><td class="num">4</td><td class="num">100%</td></tr>
+          <tr class="bad"><td class="num">32</td><td class="num">1024</td><td class="num">16</td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>در <code>tileSize=4</code>، هر workgroup فقط ۱۶ work-item دارد در حالی که سخت‌افزار به‌هرحال یک wavefront کامل ۶۴تایی را زمان‌بندی می‌کند. یعنی سه‌چهارم توان محاسباتی از همان ابتدا هدر می‌رود.</p>
+
+    <div class="callout warn">
+      <span class="tag">و مشکل شبیه‌ساز</span>
+      <p>از آن سه منبع محدودکننده، MGPUSim فقط رجیسترها را حساب می‌کند. مقدار LDS را می‌خواند ولی چون برای این کرنل صفر گزارش می‌شود، عملاً هیچ هزینه‌ای بابتش در نظر نمی‌گیرد. یعنی آن ۱۶ کیلوباتی که <code>tile=16</code> می‌گیرد در شبیه‌سازی مجانی است، در حالی که روی سخت‌افزار واقعی occupancy را به ۴ workgroup در هر CU محدود می‌کرد. به همین دلیل نتایج sweep ذاتاً به نفع تایل‌های بزرگ سوگیری دارند.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>همه‌شان چطور به هم وصل می‌شوند</h2>
+    <p>حالا می‌شود زنجیرهٔ کامل استدلال را یک‌جا دید:</p>
+    <p>ما تایل‌بندی می‌کنیم تا بتوانیم داده را در <strong>LDS</strong> نگه داریم و از خواندن مکرر DRAM فرار کنیم. اندازهٔ تایل را <code>tileSize</code> تعیین می‌کند، و مقدار LDS لازم برای آن را <code>BlockA</code> اعلام می‌کند. تایل بزرگ‌تر یعنی استفادهٔ مجدد بهتر از داده، ولی هم‌زمان یعنی رجیستر و LDS بیشتر به ازای هر workgroup — و این یعنی <strong>occupancy</strong> کمتر. پس یک نقطهٔ بهینه در وسط وجود دارد، و پیدا کردن آن نقطه با <strong>sweep</strong> انجام می‌شود.</p>
+    <p>مشکل اینجاست که در وضعیت فعلی، هیچ‌کدام از دو سر این مصالحه درست اندازه‌گیری نمی‌شود: هزینهٔ LDS اصلاً مدل نشده، و تغییر تایل هم‌زمان تعداد اجرای کرنل را عوض می‌کند. به همین دلیل گفتم که رتبه‌بندی فعلی تایل‌ها بیشتر بازتاب سربار launch است تا کارایی واقعی تایل.</p>
+  </section>
+
+  <footer>
+    حامد علی‌نژاد &middot; آزمایشگاه معماری کامپیوتر، دانشگاه صنعتی شریف
+  </footer>
+
+</div>

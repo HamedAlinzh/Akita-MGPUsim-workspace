@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Technical Note: GEMM Tile Tuning in MGPUSim</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+    :root {
+      --bg-main: #f8fafc;
+      --bg-card: #ffffff;
+      --text-main: #0f172a;
+      --text-muted: #475569;
+      --border-color: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --accent: #0284c7;
+      --accent-light: #f0f9ff;
+      --accent-border: #bae6fd;
+      --warning-bg: #fffbebf8;
+      --warning-border: #fef3c7;
+      --warning-text: #b45309;
+      --code-bg: #f1f5f9;
+      --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-main: #0b0f17;
+        --bg-card: #111827;
+        --text-main: #f3f4f6;
+        --text-muted: #9ca3af;
+        --border-color: #1f2937;
+        --border-strong: #374151;
+        --accent: #38bdf8;
+        --accent-light: #0c4a6e;
+        --accent-border: #0284c7;
+        --warning-bg: #2d1800;
+        --warning-border: #78350f;
+        --warning-text: #fde68a;
+        --code-bg: #1e293b;
+        --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      direction: ltr;
+      background: var(--bg-main);
+      color: var(--text-main);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 15px;
+      line-height: 1.75;
+      margin: 0;
+      padding: 2.5rem 1rem 5rem;
+    }
+
+    .wrap {
+      max-width: 48rem;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 2.5rem;
+    }
+
+    /* Header */
+    .masthead {
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+      padding-bottom: 1.75rem;
+      border-bottom: 2px solid var(--border-strong);
+    }
+
+    .eyebrow {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: var(--accent-light);
+      border: 1px solid var(--accent-border);
+      border-radius: 4px;
+      padding: 0.25rem 0.55rem;
+      align-self: flex-start;
+    }
+
+    h1 {
+      font-size: clamp(1.6rem, 4vw, 2.1rem);
+      font-weight: 800;
+      line-height: 1.3;
+      margin: 0;
+      letter-spacing: -0.02em;
+    }
+
+    .standfirst {
+      margin: 0;
+      color: var(--text-muted);
+      font-size: 1.02rem;
+      line-height: 1.7;
+    }
+
+    /* Meta bar */
+    .meta-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.25rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+    }
+
+    .meta-item { display: flex; align-items: center; gap: 0.4rem; }
+
+    /* Sections */
+    section { display: flex; flex-direction: column; gap: 1rem; }
+
+    h2 {
+      font-size: 1.2rem;
+      font-weight: 700;
+      margin: 0;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--border-color);
+      letter-spacing: -0.01em;
+    }
+
+    h3 {
+      font-size: 1.02rem;
+      font-weight: 600;
+      margin: 0;
+    }
+
+    p { margin: 0; }
+    .lede { font-size: 1.02rem; font-weight: 500; }
+
+    /* Lists */
+    ol.issues {
+      margin: 0;
+      padding-left: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    ol.issues li {
+      padding-left: 0.25rem;
+    }
+
+    /* Numbered Cards */
+    .findings {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      counter-reset: finding-counter;
+    }
+
+    .finding {
+      counter-increment: finding-counter;
+      display: grid;
+      grid-template-columns: 2.25rem 1fr;
+      gap: 1rem;
+      align-items: start;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 1.25rem;
+      box-shadow: var(--shadow);
+    }
+
+    .finding::before {
+      content: counter(finding-counter);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9rem;
+      font-weight: 700;
+      color: var(--accent);
+      background: var(--accent-light);
+      border: 1px solid var(--accent-border);
+      border-radius: 50%;
+      width: 2.25rem;
+      height: 2.25rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .finding-body {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      min-width: 0;
+    }
+
+    /* Code & Formulas */
+    code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      background: var(--code-bg);
+      border-radius: 4px;
+      padding: 0.15em 0.4em;
+    }
+
+    .formula {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      line-height: 1.9;
+      color: var(--text-muted);
+      background: var(--code-bg);
+      border-left: 3px solid var(--accent);
+      border-radius: 4px;
+      padding: 0.85rem 1rem;
+      overflow-x: auto;
+    }
+
+    /* Tables */
+    .tablewrap {
+      overflow-x: auto;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.88rem;
+    }
+
+    caption {
+      caption-side: top;
+      text-align: left;
+      padding: 0.75rem 1rem 0.25rem;
+      color: var(--text-muted);
+      font-size: 0.82rem;
+    }
+
+    th, td {
+      padding: 0.65rem 0.9rem;
+      text-align: center;
+      border-bottom: 1px solid var(--border-color);
+      white-space: nowrap;
+    }
+
+    thead th {
+      font-weight: 600;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      background: var(--code-bg);
+      border-bottom: 1px solid var(--border-strong);
+    }
+
+    tbody tr:last-child td { border-bottom: none; }
+    th:first-child, td:first-child { text-align: left; }
+
+    .num {
+      font-family: 'JetBrains Mono', monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    tr.best td {
+      background: var(--accent-light);
+      font-weight: 600;
+    }
+
+    tr.best td:first-child {
+      border-left: 3px solid var(--accent);
+    }
+
+    /* Callout */
+    .callout {
+      background: var(--accent-light);
+      border: 1px solid var(--accent-border);
+      border-radius: 8px;
+      padding: 1.1rem 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .callout .tag {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    footer {
+      border-top: 1px solid var(--border-color);
+      padding-top: 1.5rem;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <span class="eyebrow">MGPUSim &middot; GEMM Tile Tuning Analysis</span>
+    <h1>Technical Note: GEMM Tile Tuning &amp; Simulator Validity</h1>
+    <p class="standfirst">Evaluation of the <code>tune_gemm_tile.py</code> tuning script: Integration bug fixes, experimental validity caveats, and empirical sweep analysis.</p>
+  </header>
+
+  <div class="meta-bar">
+    <div class="meta-item"><strong>Author:</strong> Hamed Alinezhad</div>
+    <div class="meta-item"><strong>Lab:</strong> High Performance Computing Architectures and Networks (HPCAN), Sharif University of Technology</div>
+    <div class="meta-item"><strong>Repository:</strong> <a href="https://github.com/HamedAlinzh/Akita-MGPUsim-workspace.git" target="_blank">Akita-MGPUsim-workspace</a></div>
+  </div>
+
+  <section>
+    <p class="lede">Thank you for the feedback—you are entirely correct that the GEMM tile size was previously untuned.</p>
+    <p>The default <code>8×8</code> workgroup configuration was inherited directly from the original AMD APP SDK sample launch setup, making the <code>32×32</code> output tile an inherited default rather than an optimized design choice. Making tile size a tunable parameter is clearly the correct approach.</p>
+    <p>Your catch regarding <code>BlockA</code> was both accurate and critical. <code>BlockA</code> specifies the Local Data Share (LDS) allocation for the A matrix tile. Hardcoded at <code>32 * 32 * 4</code> bytes, it is valid only for <code>tileSize=8</code>. At <code>tileSize=16</code>, the kernel requires 16 KB rather than 4 KB; sweeping without this correction would produce incorrect numerical results rather than merely suboptimal performance. I have permanently integrated the dynamic allocation formula <code>(4 * tileSize) * (4 * tileSize) * 4</code> into the codebase.</p>
+    <p>All host changes and simulator workspace updates are pushed and accessible in the repository: <a href="https://github.com/HamedAlinzh/Akita-MGPUsim-workspace.git" target="_blank">Akita-MGPUsim-workspace</a>.</p>
+  </section>
+
+  <section>
+    <h2>Script Execution &amp; Integration Issues</h2>
+    <p>Before running the sweep, two execution issues in the script required resolution:</p>
+    <ol class="issues">
+      <li><strong>CLI Flag Mismatch:</strong> The tuning script invokes <code>-num-gpu=2</code>, but the benchmark runner expects a explicit comma-separated list via <code>-gpus=1,2</code>. Consequently, every tile run exited prematurely with code <code>2</code> prior to simulation.</li>
+      <li><strong>Fragile String Matching:</strong> The script's guard check for an existing <code>BlockA</code> patch performs a literal string comparison containing a single space (<code>BlockA: ...</code>). However, <code>gofmt</code> automatically formats struct fields with two spaces to align with the adjacent <code>MatrixA:</code> key. Because the script inserts one space and then runs <code>gofmt -w</code>, its own patch fails the guard check on subsequent runs, limiting execution to unpatched source files.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Experimental Validity &amp; Architectural Findings</h2>
+    <p>To ensure tile rankings reflect true architectural efficiency, three major experimental caveats must be addressed:</p>
+
+    <div class="findings">
+
+      <article class="finding">
+        <div class="finding-body">
+          <h3>1. The Sweep Confounders: Tile Size vs. Launch Count</h3>
+          <p>In the benchmark implementation, <code>rowBand = 4 * tileSize</code>. As a result, changing <code>tileSize</code> simultaneously alters the kernel launch count and the number of active workgroups. For a <code>256³</code> GEMM on 2 GPUs:</p>
+          <div class="tablewrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>tileSize</th>
+                  <th>Output Tile</th>
+                  <th>Launches / GPU</th>
+                  <th>Concurrent WGs</th>
+                  <th>Busy CUs (out of 64)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td class="num">4</td><td class="num">16×16</td><td class="num">16</td><td class="num">16</td><td class="num">25.0%</td></tr>
+                <tr><td class="num">8</td><td class="num">32×32</td><td class="num">8</td><td class="num">8</td><td class="num">12.5%</td></tr>
+                <tr><td class="num">16</td><td class="num">64×64</td><td class="num">4</td><td class="num">4</td><td class="num">6.25%</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>Consequently, any performance ranking measures a tradeoff between launch overhead and Compute Unit (CU) occupancy, rather than pure tiling efficiency. The root cause is a row-offset handling bug in the reused kernel, forcing a launch loop that dispatches one workgroup-row per iteration. Fixing this kernel offset bug to decouple tile size from launch count is a prerequisite for a clean tile study.</p>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-body">
+          <h3>2. Unmodeled LDS Occupancy in MGPUSim</h3>
+          <p>MGPUSim's resource allocation path inspects <code>co.WGGroupSegmentByteSize</code>, which evaluates to <code>0</code> for this kernel. Therefore, the 16 KB LDS allocation requested by <code>tileSize=16</code> incurs zero occupancy cost in simulation. On physical hardware, requiring 16 KB of LDS would cap CU occupancy at 4 workgroups per CU. As it stands, the simulator sweep is systematically biased toward larger tiles.</p>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-body">
+          <h3>3. Register Constraints Cap the Feasible Search Space</h3>
+          <p>A setting of <code>tileSize=32</code> represents 1024 work-items (16 wavefronts). However, given the kernel's demand of 74 VGPRs per work-item, a CU can accommodate at most 12 wavefronts:</p>
+          <div class="formula">
+            16384 registers / SIMD &divide; 4 (granularity) &divide; 64 (lanes) = 64 units<br>
+            ceil(74 / 4) = 19 units needed per wavefront<br>
+            floor(64 / 19) = 3 wavefronts / SIMD &times; 4 SIMDs = 12 wavefronts / CU max
+          </div>
+          <p>Because a 16-wavefront workgroup exceeds the physical CU register capacity, MGPUSim hangs indefinitely waiting for resources rather than reporting an allocation error. Thus, the actual feasible search space is restricted to <code>{4, 8, 16}</code>. The script's 256-workgroup-thread guard incidentally prevents this hang.</p>
+        </div>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>Empirical Sweep Results</h2>
+    <p>Following the flag and execution fixes, the sweep was executed for a <code>256³</code> GEMM workload across 2 GPUs using the Ring All-Reduce algorithm.</p>
+    <div class="tablewrap">
+      <table>
+        <caption>Simulated execution times in microseconds (&mu;s). Non-kernel overhead = <code>total_time − kernel_time</code>.</caption>
+        <thead>
+          <tr>
+            <th>tileSize</th>
+            <th>Output Tile</th>
+            <th>Launches / GPU</th>
+            <th>Total Time (&mu;s)</th>
+            <th>Kernel Time (&mu;s)</th>
+            <th>Non-Kernel Overhead (&mu;s)</th>
+            <th>Relative Speedup</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="num">4</td>
+            <td class="num">16&times;16</td>
+            <td class="num">16</td>
+            <td class="num">1653.2</td>
+            <td class="num">687.4</td>
+            <td class="num">965.8</td>
+            <td class="num">2.327&times;</td>
+          </tr>
+          <tr>
+            <td class="num">8</td>
+            <td class="num">32&times;32</td>
+            <td class="num">8</td>
+            <td class="num">1013.3</td>
+            <td class="num">412.6</td>
+            <td class="num">600.7</td>
+            <td class="num">1.426&times;</td>
+          </tr>
+          <tr class="best">
+            <td class="num">16</td>
+            <td class="num">64&times;64</td>
+            <td class="num">4</td>
+            <td class="num">710.4</td>
+            <td class="num">292.1</td>
+            <td class="num">418.2</td>
+            <td class="num">1.000&times; (Best)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <span class="tag">Key Takeaway</span>
+      <p>The empirical results confirm the confounding effect described above: reducing the launch count by 4x reduces total time, kernel time, and driver overhead proportionally (~2.33x). Because the total work-item count remains identical across all three runs, and <code>tileSize=16</code> leaves 93.75% of CUs idle (utilizing only 4 out of 64 CUs), the speedup reflects launch overhead amortization rather than intrinsic tiling efficiency.</p>
+    </div>
+
+    <p><em>Metric note:</em> <code>kernel_time</code> includes the Push and Reduce kernels associated with All-Reduce because they are dispatched via <code>LaunchKernel</code>. The non-kernel metric captures driver dispatch overhead, host orchestration, and command queue flushing.</p>
+  </section>
+
+  <section>
+    <h2>Summary &amp; Recommended Next Steps</h2>
+    <p>Optimizing end-to-end execution time (GEMM computation coupled with All-Reduce communication) is the correct objective, and the FlashOverlap / TileLink framework aligns well with this model.</p>
+    <p><strong>Proposed Action Items:</strong></p>
+    <ol class="issues">
+      <li>Fix the kernel's row-offset calculation bug to decouple tile dimensions from launch counts.</li>
+      <li>Patch MGPUSim's LDS accounting path so that dynamic LDS allocations properly constrain CU occupancy.</li>
+      <li>Proceed to second-stage tuning (tuning <code>TILEX</code>/<code>TILEY</code> micro-tiles and recompiling HSACO binaries via <code>clang-ocl</code>) only after the simulator accurately enforces LDS allocation costs.</li>
+    </ol>
+  </section>
+
+  <footer>
+    <div>Hamed Alinezhad &middot; Sharif University of Technology</div>
+    <div>Computer Architecture Laboratory (HPCAN)</div>
+  </footer>
+
+</div>
+
+</body>
+</html>

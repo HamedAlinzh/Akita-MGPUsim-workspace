@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GEMM Work-Group Tile Tuning on MGPUSim</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+    :root {
+      --bg-main: #f8fafc;
+      --bg-card: #ffffff;
+      --text-main: #0f172a;
+      --text-muted: #475569;
+      --border-color: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --accent: #0284c7;
+      --accent-light: #f0f9ff;
+      --accent-border: #bae6fd;
+      --warning-bg: #fffbebf8;
+      --warning-border: #fef3c7;
+      --warning-text: #b45309;
+      --code-bg: #f1f5f9;
+      --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-main: #0b0f17;
+        --bg-card: #111827;
+        --text-main: #f3f4f6;
+        --text-muted: #9ca3af;
+        --border-color: #1f2937;
+        --border-strong: #374151;
+        --accent: #38bdf8;
+        --accent-light: #0c4a6e;
+        --accent-border: #0284c7;
+        --warning-bg: #2d1800;
+        --warning-border: #78350f;
+        --warning-text: #fde68a;
+        --code-bg: #1e293b;
+        --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      direction: ltr;
+      background: var(--bg-main);
+      color: var(--text-main);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 15px;
+      line-height: 1.75;
+      margin: 0;
+      padding: 2.5rem 1rem 5rem;
+    }
+
+    .wrap {
+      max-width: 48rem;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 2.5rem;
+    }
+
+    /* Header */
+    .masthead {
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+      padding-bottom: 1.75rem;
+      border-bottom: 2px solid var(--border-strong);
+    }
+
+    .eyebrow {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: var(--accent-light);
+      border: 1px solid var(--accent-border);
+      border-radius: 4px;
+      padding: 0.25rem 0.55rem;
+      align-self: flex-start;
+    }
+
+    h1 {
+      font-size: clamp(1.6rem, 4vw, 2.1rem);
+      font-weight: 800;
+      line-height: 1.3;
+      margin: 0;
+      letter-spacing: -0.02em;
+    }
+
+    .standfirst {
+      margin: 0;
+      color: var(--text-muted);
+      font-size: 1.02rem;
+      line-height: 1.7;
+    }
+
+    /* Meta bar */
+    .meta-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.25rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+    }
+
+    .meta-item { display: flex; align-items: center; gap: 0.4rem; }
+
+    /* Sections */
+    section { display: flex; flex-direction: column; gap: 1rem; }
+
+    h2 {
+      font-size: 1.2rem;
+      font-weight: 700;
+      margin: 0;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--border-color);
+      letter-spacing: -0.01em;
+    }
+
+    h3 {
+      font-size: 1.02rem;
+      font-weight: 600;
+      margin: 0;
+    }
+
+    p { margin: 0; }
+    .lede { font-size: 1.02rem; font-weight: 500; }
+
+    /* Lists */
+    ol.issues {
+      margin: 0;
+      padding-left: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    ol.issues li {
+      padding-left: 0.25rem;
+    }
+
+    /* Numbered Cards */
+    .findings {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      counter-reset: finding-counter;
+    }
+
+    .finding {
+      counter-increment: finding-counter;
+      display: grid;
+      grid-template-columns: 2.25rem 1fr;
+      gap: 1rem;
+      align-items: start;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 1.25rem;
+      box-shadow: var(--shadow);
+    }
+
+    .finding::before {
+      content: counter(finding-counter);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9rem;
+      font-weight: 700;
+      color: var(--accent);
+      background: var(--accent-light);
+      border: 1px solid var(--accent-border);
+      border-radius: 50%;
+      width: 2.25rem;
+      height: 2.25rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .finding-body {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      min-width: 0;
+    }
+
+    /* Code & Formulas */
+    code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      background: var(--code-bg);
+      border-radius: 4px;
+      padding: 0.15em 0.4em;
+    }
+
+    .formula {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      line-height: 1.9;
+      color: var(--text-muted);
+      background: var(--code-bg);
+      border-left: 3px solid var(--accent);
+      border-radius: 4px;
+      padding: 0.85rem 1rem;
+      overflow-x: auto;
+    }
+
+    /* Tables */
+    .tablewrap {
+      overflow-x: auto;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.88rem;
+    }
+
+    caption {
+      caption-side: top;
+      text-align: left;
+      padding: 0.75rem 1rem 0.25rem;
+      color: var(--text-muted);
+      font-size: 0.82rem;
+    }
+
+    th, td {
+      padding: 0.65rem 0.9rem;
+      text-align: center;
+      border-bottom: 1px solid var(--border-color);
+      white-space: nowrap;
+    }
+
+    thead th {
+      font-weight: 600;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      background: var(--code-bg);
+      border-bottom: 1px solid var(--border-strong);
+    }
+
+    tbody tr:last-child td { border-bottom: none; }
+    th:first-child, td:first-child { text-align: left; }
+
+    .num {
+      font-family: 'JetBrains Mono', monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    tr.best td {
+      background: var(--accent-light);
+      font-weight: 600;
+    }
+
+    tr.best td:first-child {
+      border-left: 3px solid var(--accent);
+    }
+
+    /* Callout */
+    .callout {
+      background: var(--accent-light);
+      border: 1px solid var(--accent-border);
+      border-radius: 8px;
+      padding: 1.1rem 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .callout .tag {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    footer {
+      border-top: 1px solid var(--border-color);
+      padding-top: 1.5rem;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <span class="eyebrow">MGPUSim / Akita &middot; Lab Report</span>
+    <h1>GEMM Work-Group Tile Size Tuning</h1>
+    <p class="standfirst">Evaluation of the <code>tune_gemm_tile.py</code> test harness, isolating the impact of work-group dimension scaling, code execution efficiency, and microarchitectural bottlenecks[cite: 1].</p>
+  </header>
+
+  <div class="meta-bar">
+    <div class="meta-item"><strong>Simulator:</strong> MGPUSim v3 / Akita v3[cite: 1]</div>
+    <div class="meta-item"><strong>GPU model:</strong> 2&times; R9 Nano &middot; 64 CU/GPU[cite: 1]</div>
+    <div class="meta-item"><strong>Dimensions:</strong> M=256, K=256, N=256[cite: 1]</div>
+    <div class="meta-item"><strong>Algorithm:</strong> Ring All-Reduce[cite: 1]</div>
+  </div>
+
+  <section id="summary">
+    <h2>The 16&times;16 configuration is 2.3&times; faster than baseline</h2>
+    <p class="lede">Increasing the work-group tile size drastically reduces both kernel execution overhead and end-to-end total time[cite: 1]. Running the tuning script revealed that the 16&times;16 configuration maximizes data reuse within the L1/Vector Data Caches, operating 2.32&times; faster than the 4&times;4 layout[cite: 1].</p>
+    <p>However, analysis of the simulator code reveals that these scaling results are heavily influenced by kernel dispatch overhead and physical register constraints, which limit the upper bound of the tuning space[cite: 1].</p>
+  </section>
+
+  <section id="implementation">
+    <h2>Fixing the tuning harness and LDS allocations</h2>
+    <p>The <code>tune_gemm_tile.py</code> script acts as an automated test harness that patches <code>benchmark.go</code> to sweep through square local work-group dimensions[cite: 1]. Deploying this required correcting a CLI flag mismatch and making the Local Data Share (LDS) allocation dynamically match the tile scale[cite: 1].</p>
+
+    <div class="findings">
+      <article class="finding">
+        <div class="finding-body">
+          <h3>Correction 1 &middot; CLI Flag Mismatch</h3>
+          <p>The Python script originally passed <code>-num-gpu={args.gpus}</code>, but the benchmark runner only accepts an explicit list of GPUs[cite: 1]. This was patched in the command builder array[cite: 1]:</p>
+          <div class="formula" style="white-space: pre;"># tune_gemm_tile.py: runtime execution arguments
+cmd = [
+    binary,
+    "-timing",
+    "--report-all",
+    f"-gpus=1,2", # Explicit comma-separated list fix
+    f"-m={args.m}",
+    f"-k={args.k}",
+    f"-n={args.n}",
+    f"-algorithm={args.algorithm}",
+] + args.extra</div>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-body">
+          <h3>Correction 2 &middot; Dynamic BlockA LDS Allocation</h3>
+          <p>The original Go kernel hardcoded the LDS allocation for the A matrix tile to 4KB (<code>32 * 32 * 4</code> bytes), valid only for <code>tileSize=8</code>[cite: 1]. At <code>tileSize=16</code>, the kernel requires 16KB[cite: 1]. The Python regex seamlessly handles this patch, and the change has been permanently merged into the Go source[cite: 1]:</p>
+          <div class="formula" style="white-space: pre;">// benchmark.go: matrixmultiplication.KernelArgs
+kernArgs := &amp;matrixmultiplication.KernelArgs{
+    MatrixA: gAs[g] + driver.Ptr(aOffset),
+    MatrixB: gBs[g],
+    MatrixC: partialC[g] + driver.Ptr(cOffset),
+    WidthA:  kSlice,
+    BlockA:  (4 * tileSize) * (4 * tileSize) * 4, // Dynamically scaled
+}</div>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <section id="confounder">
+    <h2>The Confounder: Tile Size dictating Launch Count</h2>
+    <p>A critical observation in <code>benchmark.go</code> is that the number of output rows computed per kernel launch is directly tied to the tile size[cite: 1]:</p>
+    <div class="formula" style="white-space: pre;">// benchmark.go: launch dimensions
+const tileSize = 8
+const rowBand = 4 * tileSize // Launch count scales with tileSize</div>
+    <p>Because of a known kernel offset bug in the simulator's Y-dimension logic, the benchmark launches one workgroup-row per kernel call[cite: 1]. This means changing <code>tileSize</code> simultaneously alters the kernel launch count[cite: 1]. For <code>tileSize=4</code>, the driver issues 16 launches; for <code>tileSize=16</code>, it issues just 4[cite: 1]. The sweep results are therefore partially measuring the amortization of Driver dispatch overhead[cite: 1].</p>
+  </section>
+
+  <section id="results">
+    <h2>End-to-end simulated timings</h2>
+    
+    <div class="tablewrap">
+      <table>
+        <caption>Simulated execution time (M=256, K=256, N=256, 2 GPUs, Ring)[cite: 1]</caption>
+        <thead>
+          <tr>
+            <th>Tile Size</th>
+            <th>Work-Group</th>
+            <th>Output Tile</th>
+            <th>Total Time (s)</th>
+            <th>Kernel Time Sum (s)</th>
+            <th>Relative Speedup</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="best">
+            <td class="num">16</td>
+            <td class="num">16&times;16</td>
+            <td class="num">64&times;64</td>
+            <td class="num">0.000710371</td>
+            <td class="num">0.000740127</td>
+            <td class="num">1.000&times; (Best)</td>
+          </tr>
+          <tr>
+            <td class="num">8</td>
+            <td class="num">8&times;8</td>
+            <td class="num">32&times;32</td>
+            <td class="num">0.001013257</td>
+            <td class="num">0.001095364</td>
+            <td class="num">1.426&times;</td>
+          </tr>
+          <tr>
+            <td class="num">4</td>
+            <td class="num">4&times;4</td>
+            <td class="num">16&times;16</td>
+            <td class="num">0.001653205</td>
+            <td class="num">0.001910576</td>
+            <td class="num">2.327&times;</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="insights">
+    <h2>Memory latency bounds and register constraints</h2>
+    
+    <div class="findings">
+      <article class="finding">
+        <div class="finding-body">
+          <h3>Memory Stalls at Small Tiles</h3>
+          <p>The detailed CSV metrics for <code>tileSize=4</code> reveal heavy stalling within the Compute Units (CUs)[cite: 1]. Across GPU 1, the SIMD CPI averages 43.07 and the overall CU CPI averages 36.03[cite: 1]. This exceptionally high cycle-per-instruction rate indicates that the 4&times;4 work-groups are heavily memory-bound, failing to amortize global memory access latencies over their small local memory allocations[cite: 1].</p>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-body">
+          <h3>Register Constraints Cap the Tuning Space</h3>
+          <p>While larger tiles perform better, the tuning script actively prevents arbitrary scaling[cite: 1]:</p>
+          <div class="formula" style="white-space: pre;"># tune_gemm_tile.py: constraints
+if tile * tile > 256:
+    return False, f"{tile}x{tile}={tile*tile} work-items exceeds the conservative 256-thread limit"</div>
+          <p>This guard prevents a silent MGPUSim hang[cite: 1]. A 32&times;32 work-group (1024 items, or 16 wavefronts) would exceed the maximum hardware capacity of 12 wavefronts per CU, a limit dictated by this specific kernel's 74 VGPR usage[cite: 1].</p>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <footer>
+    <div>Prepared by Hamed Ali Nejad &middot; MGPUSim v3.0.3 / Akita v3.0.0[cite: 1]</div>
+    <div>runner defaults except where swept &middot; all timings are simulated seconds[cite: 1]</div>
+  </footer>
+
+</div>
+
+</body>
+</html>
