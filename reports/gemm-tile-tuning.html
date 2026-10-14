@@ -313,32 +313,32 @@
   <header class="masthead">
     <span class="eyebrow">MGPUSim / Akita &middot; Lab Report</span>
     <h1>GEMM Work-Group Tile Size Tuning</h1>
-    <p class="standfirst">Evaluation of the <code>tune_gemm_tile.py</code> test harness, isolating the impact of work-group dimension scaling, code execution efficiency, and microarchitectural bottlenecks[cite: 1].</p>
+    <p class="standfirst">Evaluation of the <a href="https://github.com/HamedAlinzh/Akita-MGPUsim-workspace/blob/All-reduce/scripts/tune_gemm_tile.py" target="_blank"><code>tune_gemm_tile.py</code></a> test harness, isolating the impact of work-group dimension scaling, code execution efficiency, and microarchitectural bottlenecks.</p>
   </header>
 
   <div class="meta-bar">
-    <div class="meta-item"><strong>Simulator:</strong> MGPUSim v3 / Akita v3[cite: 1]</div>
-    <div class="meta-item"><strong>GPU model:</strong> 2&times; R9 Nano &middot; 64 CU/GPU[cite: 1]</div>
-    <div class="meta-item"><strong>Dimensions:</strong> M=256, K=256, N=256[cite: 1]</div>
-    <div class="meta-item"><strong>Algorithm:</strong> Ring All-Reduce[cite: 1]</div>
+    <div class="meta-item"><strong>Simulator:</strong> MGPUSim v3 / Akita v3</div>
+    <div class="meta-item"><strong>GPU model:</strong> 2&times; R9 Nano &middot; 64 CU/GPU</div>
+    <div class="meta-item"><strong>Dimensions:</strong> M=256, K=256, N=256</div>
+    <div class="meta-item"><strong>Algorithm:</strong> Ring All-Reduce</div>
   </div>
 
   <section id="summary">
     <h2>The 16&times;16 configuration is 2.3&times; faster than baseline</h2>
-    <p class="lede">Increasing the work-group tile size drastically reduces both kernel execution overhead and end-to-end total time[cite: 1]. Running the tuning script revealed that the 16&times;16 configuration maximizes data reuse within the L1/Vector Data Caches, operating 2.32&times; faster than the 4&times;4 layout[cite: 1].</p>
-    <p>However, analysis of the simulator code reveals that these scaling results are heavily influenced by kernel dispatch overhead and physical register constraints, which limit the upper bound of the tuning space[cite: 1].</p>
+    <p class="lede">Increasing the work-group tile size drastically reduces both kernel execution overhead and end-to-end total time. Running the tuning script revealed that the 16&times;16 configuration maximizes data reuse within the L1/Vector Data Caches, operating 2.32&times; faster than the 4&times;4 layout.</p>
+    <p>However, analysis of the simulator code reveals that these scaling results are heavily influenced by kernel dispatch overhead and physical register constraints, which limit the upper bound of the tuning space.</p>
   </section>
 
   <section id="implementation">
     <h2>Fixing the tuning harness and LDS allocations</h2>
-    <p>The <code>tune_gemm_tile.py</code> script acts as an automated test harness that patches <code>benchmark.go</code> to sweep through square local work-group dimensions[cite: 1]. Deploying this required correcting a CLI flag mismatch and making the Local Data Share (LDS) allocation dynamically match the tile scale[cite: 1].</p>
+    <p>The <a href="https://github.com/HamedAlinzh/Akita-MGPUsim-workspace/blob/All-reduce/scripts/tune_gemm_tile.py" target="_blank"><code>tune_gemm_tile.py</code></a> script acts as an automated test harness that patches <code>benchmark.go</code> to sweep through square local work-group dimensions. Deploying this required correcting a CLI flag mismatch and making the Local Data Share (LDS) allocation dynamically match the tile scale.</p>
 
     <div class="findings">
       <article class="finding">
         <div class="finding-body">
           <h3>Correction 1 &middot; CLI Flag Mismatch</h3>
-          <p>The Python script originally passed <code>-num-gpu={args.gpus}</code>, but the benchmark runner only accepts an explicit list of GPUs[cite: 1]. This was patched in the command builder array[cite: 1]:</p>
-          <div class="formula" style="white-space: pre;"># tune_gemm_tile.py: runtime execution arguments
+          <p>The Python script originally passed <code>-num-gpu={args.gpus}</code>, but the benchmark runner only accepts an explicit list of GPUs. This was patched in the command builder array:</p>
+          <div class="formula" style="white-space: pre;"># <a href="https://github.com/HamedAlinzh/Akita-MGPUsim-workspace/blob/All-reduce/scripts/tune_gemm_tile.py" target="_blank" style="color: inherit;">tune_gemm_tile.py</a>: runtime execution arguments
 cmd = [
     binary,
     "-timing",
@@ -355,7 +355,7 @@ cmd = [
       <article class="finding">
         <div class="finding-body">
           <h3>Correction 2 &middot; Dynamic BlockA LDS Allocation</h3>
-          <p>The original Go kernel hardcoded the LDS allocation for the A matrix tile to 4KB (<code>32 * 32 * 4</code> bytes), valid only for <code>tileSize=8</code>[cite: 1]. At <code>tileSize=16</code>, the kernel requires 16KB[cite: 1]. The Python regex seamlessly handles this patch, and the change has been permanently merged into the Go source[cite: 1]:</p>
+          <p>The original Go kernel hardcoded the LDS allocation for the A matrix tile to 4KB (<code>32 * 32 * 4</code> bytes), valid only for <code>tileSize=8</code>. At <code>tileSize=16</code>, the kernel requires 16KB. The Python regex seamlessly handles this patch, and the change has been permanently merged into the Go source:</p>
           <div class="formula" style="white-space: pre;">// benchmark.go: matrixmultiplication.KernelArgs
 kernArgs := &amp;matrixmultiplication.KernelArgs{
     MatrixA: gAs[g] + driver.Ptr(aOffset),
@@ -371,58 +371,13 @@ kernArgs := &amp;matrixmultiplication.KernelArgs{
 
   <section id="confounder">
     <h2>The Confounder: Tile Size dictating Launch Count</h2>
-    <p>A critical observation in <code>benchmark.go</code> is that the number of output rows computed per kernel launch is directly tied to the tile size[cite: 1]:</p>
+    <p>A critical observation in <code>benchmark.go</code> is that the number of output rows computed per kernel launch is directly tied to the tile size:</p>
     <div class="formula" style="white-space: pre;">// benchmark.go: launch dimensions
 const tileSize = 8
 const rowBand = 4 * tileSize // Launch count scales with tileSize</div>
-    <p>Because of a known kernel offset bug in the simulator's Y-dimension logic, the benchmark launches one workgroup-row per kernel call[cite: 1]. This means changing <code>tileSize</code> simultaneously alters the kernel launch count[cite: 1]. For <code>tileSize=4</code>, the driver issues 16 launches; for <code>tileSize=16</code>, it issues just 4[cite: 1]. The sweep results are therefore partially measuring the amortization of Driver dispatch overhead[cite: 1].</p>
+    <p>Because of a known kernel offset bug in the simulator's Y-dimension logic, the benchmark launches one workgroup-row per kernel call. This means changing <code>tileSize</code> simultaneously alters the kernel launch count. For <code>tileSize=4</code>, the driver issues 16 launches; for <code>tileSize=16</code>, it issues just 4. The sweep results are therefore partially measuring the amortization of Driver dispatch overhead.</p>
   </section>
 
-  <section id="results">
-    <h2>End-to-end simulated timings</h2>
-    
-    <div class="tablewrap">
-      <table>
-        <caption>Simulated execution time (M=256, K=256, N=256, 2 GPUs, Ring)[cite: 1]</caption>
-        <thead>
-          <tr>
-            <th>Tile Size</th>
-            <th>Work-Group</th>
-            <th>Output Tile</th>
-            <th>Total Time (s)</th>
-            <th>Kernel Time Sum (s)</th>
-            <th>Relative Speedup</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr class="best">
-            <td class="num">16</td>
-            <td class="num">16&times;16</td>
-            <td class="num">64&times;64</td>
-            <td class="num">0.000710371</td>
-            <td class="num">0.000740127</td>
-            <td class="num">1.000&times; (Best)</td>
-          </tr>
-          <tr>
-            <td class="num">8</td>
-            <td class="num">8&times;8</td>
-            <td class="num">32&times;32</td>
-            <td class="num">0.001013257</td>
-            <td class="num">0.001095364</td>
-            <td class="num">1.426&times;</td>
-          </tr>
-          <tr>
-            <td class="num">4</td>
-            <td class="num">4&times;4</td>
-            <td class="num">16&times;16</td>
-            <td class="num">0.001653205</td>
-            <td class="num">0.001910576</td>
-            <td class="num">2.327&times;</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
 
   <section id="insights">
     <h2>Memory latency bounds and register constraints</h2>
@@ -431,26 +386,26 @@ const rowBand = 4 * tileSize // Launch count scales with tileSize</div>
       <article class="finding">
         <div class="finding-body">
           <h3>Memory Stalls at Small Tiles</h3>
-          <p>The detailed CSV metrics for <code>tileSize=4</code> reveal heavy stalling within the Compute Units (CUs)[cite: 1]. Across GPU 1, the SIMD CPI averages 43.07 and the overall CU CPI averages 36.03[cite: 1]. This exceptionally high cycle-per-instruction rate indicates that the 4&times;4 work-groups are heavily memory-bound, failing to amortize global memory access latencies over their small local memory allocations[cite: 1].</p>
+          <p>The detailed CSV metrics for <code>tileSize=4</code> reveal heavy stalling within the Compute Units (CUs). Across GPU 1, the SIMD CPI averages 43.07 and the overall CU CPI averages 36.03. This exceptionally high cycle-per-instruction rate indicates that the 4&times;4 work-groups are heavily memory-bound, failing to amortize global memory access latencies over their small local memory allocations.</p>
         </div>
       </article>
 
       <article class="finding">
         <div class="finding-body">
           <h3>Register Constraints Cap the Tuning Space</h3>
-          <p>While larger tiles perform better, the tuning script actively prevents arbitrary scaling[cite: 1]:</p>
-          <div class="formula" style="white-space: pre;"># tune_gemm_tile.py: constraints
+          <p>While larger tiles perform better, the tuning script actively prevents arbitrary scaling:</p>
+          <div class="formula" style="white-space: pre;"># <a href="https://github.com/HamedAlinzh/Akita-MGPUsim-workspace/blob/All-reduce/scripts/tune_gemm_tile.py" target="_blank" style="color: inherit;">tune_gemm_tile.py</a>: constraints
 if tile * tile > 256:
     return False, f"{tile}x{tile}={tile*tile} work-items exceeds the conservative 256-thread limit"</div>
-          <p>This guard prevents a silent MGPUSim hang[cite: 1]. A 32&times;32 work-group (1024 items, or 16 wavefronts) would exceed the maximum hardware capacity of 12 wavefronts per CU, a limit dictated by this specific kernel's 74 VGPR usage[cite: 1].</p>
+          <p>This guard prevents a silent MGPUSim hang. A 32&times;32 work-group (1024 items, or 16 wavefronts) would exceed the maximum hardware capacity of 12 wavefronts per CU, a limit dictated by this specific kernel's 74 VGPR usage.</p>
         </div>
       </article>
     </div>
   </section>
 
   <footer>
-    <div>Prepared by Hamed Ali Nejad &middot; MGPUSim v3.0.3 / Akita v3.0.0[cite: 1]</div>
-    <div>runner defaults except where swept &middot; all timings are simulated seconds[cite: 1]</div>
+    <div>Prepared by Hamed Ali Nejad &middot; MGPUSim v3.0.3 / Akita v3.0.0</div>
+    <div>runner defaults except where swept &middot; all timings are simulated seconds</div>
   </footer>
 
 </div>

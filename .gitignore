@@ -8,18 +8,13 @@
 # Claude Code harness artifacts
 .claude/
 
-# Go build/test artifacts at the workspace root
+# Go build/test artifacts
 *.test
 *.out
 *.prof
 *.coverprofile
-gemm_tile_tuning/
-allreducegemm_tuned
-latex-report/*.aux
-latex-report/*.log
-latex-report/*.dvi
-gemm_tile_tuning/
-allreducegemm_tuned
-latex-report/*.aux
-latex-report/*.log
-latex-report/*.dvi
+
+# Raw simulation output (metrics.csv, stdout, temp binaries) can grow large,
+# so it stays local. Commit the derived plots in diagrams/ instead.
+results/*
+!results/README.md

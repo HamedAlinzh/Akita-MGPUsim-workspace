@@ -312,7 +312,7 @@
 
   <header class="masthead">
     <span class="eyebrow">MGPUSim &middot; GEMM Tile Tuning Analysis</span>
-    <h1>Technical Note: GEMM Tile Tuning &amp; Simulator Validity</h1>
+    <h1>GEMM Tile Tuning &amp; Simulator Validity</h1>
     <p class="standfirst">Evaluation of the <code>tune_gemm_tile.py</code> tuning script: Integration bug fixes, experimental validity caveats, and empirical sweep analysis.</p>
   </header>
 
@@ -323,9 +323,24 @@
   </div>
 
   <section>
-    <p class="lede">Thank you for the feedback—you are entirely correct that the GEMM tile size was previously untuned.</p>
+    <p class="lede">The GEMM tile size was previously untuned.</p>
     <p>The default <code>8×8</code> workgroup configuration was inherited directly from the original AMD APP SDK sample launch setup, making the <code>32×32</code> output tile an inherited default rather than an optimized design choice. Making tile size a tunable parameter is clearly the correct approach.</p>
-    <p>Your catch regarding <code>BlockA</code> was both accurate and critical. <code>BlockA</code> specifies the Local Data Share (LDS) allocation for the A matrix tile. Hardcoded at <code>32 * 32 * 4</code> bytes, it is valid only for <code>tileSize=8</code>. At <code>tileSize=16</code>, the kernel requires 16 KB rather than 4 KB; sweeping without this correction would produce incorrect numerical results rather than merely suboptimal performance. I have permanently integrated the dynamic allocation formula <code>(4 * tileSize) * (4 * tileSize) * 4</code> into the codebase.</p>
+    <p><code>BlockA</code> specifies the Local Data Share (LDS) allocation for the A matrix tile. The original hardcoded <code>32 * 32 * 4</code> bytes matches <code>tileSize=8</code>; it overallocates LDS for <code>tileSize=4</code> and underallocates it for <code>tileSize=16</code>. At <code>tileSize=16</code>, the kernel requires 16 KB rather than 4 KB; sweeping without this correction would produce incorrect numerical results rather than merely suboptimal performance. I have permanently integrated the dynamic allocation formula <code>(4 * tileSize) * (4 * tileSize) * 4</code> into the codebase.</p>
+    <article class="finding">
+        <div class="finding-body">
+          <h3>Correction 1 &middot; Dynamic BlockA LDS Allocation</h3>
+          <p>The Python regex seamlessly handles this patch, and the change has been permanently merged into the Go source:</p>
+          <div class="formula" style="white-space: pre;">// benchmark.go: matrixmultiplication.KernelArgs
+kernArgs := &amp;matrixmultiplication.KernelArgs{
+    MatrixA: gAs[g] + driver.Ptr(aOffset),
+    MatrixB: gBs[g],
+    MatrixC: partialC[g] + driver.Ptr(cOffset),
+    WidthA:  kSlice,
+    BlockA:  (4 * tileSize) * (4 * tileSize) * 4, // Dynamically scaled
+}</div>
+        </div>
+      </article>
+      
     <p>All host changes and simulator workspace updates are pushed and accessible in the repository: <a href="https://github.com/HamedAlinzh/Akita-MGPUsim-workspace.git" target="_blank">Akita-MGPUsim-workspace</a>.</p>
   </section>
 
@@ -333,20 +348,44 @@
     <h2>Script Execution &amp; Integration Issues</h2>
     <p>Before running the sweep, two execution issues in the script required resolution:</p>
     <ol class="issues">
-      <li><strong>CLI Flag Mismatch:</strong> The tuning script invokes <code>-num-gpu=2</code>, but the benchmark runner expects a explicit comma-separated list via <code>-gpus=1,2</code>. Consequently, every tile run exited prematurely with code <code>2</code> prior to simulation.</li>
-      <li><strong>Fragile String Matching:</strong> The script's guard check for an existing <code>BlockA</code> patch performs a literal string comparison containing a single space (<code>BlockA: ...</code>). However, <code>gofmt</code> automatically formats struct fields with two spaces to align with the adjacent <code>MatrixA:</code> key. Because the script inserts one space and then runs <code>gofmt -w</code>, its own patch fails the guard check on subsequent runs, limiting execution to unpatched source files.</li>
+      <li><strong>CLI Flag Mismatch:</strong> The tuning script invokes <code>-num-gpu=2</code>, but the benchmark runner expects an explicit comma-separated list via <code>-gpus=1,2</code>. Consequently, every tile run exited prematurely with code <code>2</code> prior to simulation.
+        <article class="finding">
+          <div class="finding-body">
+            <h3>Correction 2 &middot; CLI Flag Mismatch</h3>
+            <p>The Python script originally passed <code>-num-gpu={args.gpus}</code>, but the benchmark runner only accepts an explicit list of GPUs. This was patched in the command builder array:</p>
+            <div class="formula" style="white-space: pre;"># <a href="https://github.com/HamedAlinzh/Akita-MGPUsim-workspace/blob/All-reduce/scripts/tune_gemm_tile.py" target="_blank" style="color: inherit;">tune_gemm_tile.py</a>: runtime execution arguments
+cmd = [
+    binary,
+    "-timing",
+    "--report-all",
+    f"-gpus=1,2", # Explicit comma-separated list fix
+    f"-m={args.m}",
+    f"-k={args.k}",
+    f"-n={args.n}",
+    f"-algorithm={args.algorithm}",
+] + args.extra</div>
+          </div>
+        </article>
+      </li>
+      <li><strong>Fragile String Matching (historical):</strong> An earlier version of the script used a brittle literal string comparison for the existing <code>BlockA</code> patch. This issue was subsequently replaced with whitespace-tolerant matching and an explicit already-patched check.</li>
     </ol>
   </section>
 
   <section>
+    <h2>Experimental Setup</h2>
+    <p>The sweep evaluates a <code>256³</code> GEMM workload across 2 GPUs using the Ring All-Reduce algorithm. The candidate tile sizes are <code>{4, 8, 16}</code>, corresponding to <code>16×16</code>, <code>32×32</code>, and <code>64×64</code> output tiles. The reported execution times are simulated measurements from MGPUSim.</p>
+    <p>The tuning script and benchmark source referenced in this report are the reproducibility artifacts for the experiment.</p>
+  </section>
+
+  <section>
     <h2>Experimental Validity &amp; Architectural Findings</h2>
-    <p>To ensure tile rankings reflect true architectural efficiency, three major experimental caveats must be addressed:</p>
+    <p>To ensure tile rankings reflect true architectural efficiency, four major experimental caveats must be addressed:</p>
 
     <div class="findings">
 
       <article class="finding">
         <div class="finding-body">
-          <h3>1. The Sweep Confounders: Tile Size vs. Launch Count</h3>
+          <h3>1. The Sweep Confounders: Tile Size and Launch Count</h3>
           <p>In the benchmark implementation, <code>rowBand = 4 * tileSize</code>. As a result, changing <code>tileSize</code> simultaneously alters the kernel launch count and the number of active workgroups. For a <code>256³</code> GEMM on 2 GPUs:</p>
           <div class="tablewrap">
             <table>
@@ -355,31 +394,36 @@
                   <th>tileSize</th>
                   <th>Output Tile</th>
                   <th>Launches / GPU</th>
-                  <th>Concurrent WGs</th>
-                  <th>Busy CUs (out of 64)</th>
+                  <th>WGs / Launch</th>
+                  <th>Total WGs / GPU</th>
                 </tr>
               </thead>
               <tbody>
-                <tr><td class="num">4</td><td class="num">16×16</td><td class="num">16</td><td class="num">16</td><td class="num">25.0%</td></tr>
-                <tr><td class="num">8</td><td class="num">32×32</td><td class="num">8</td><td class="num">8</td><td class="num">12.5%</td></tr>
-                <tr><td class="num">16</td><td class="num">64×64</td><td class="num">4</td><td class="num">4</td><td class="num">6.25%</td></tr>
+                <tr><td class="num">4</td><td class="num">16×16</td><td class="num">16</td><td class="num">16</td><td class="num">256</td></tr>
+                <tr><td class="num">8</td><td class="num">32×32</td><td class="num">8</td><td class="num">8</td><td class="num">64</td></tr>
+                <tr><td class="num">16</td><td class="num">64×64</td><td class="num">4</td><td class="num">4</td><td class="num">16</td></tr>
               </tbody>
             </table>
           </div>
-          <p>Consequently, any performance ranking measures a tradeoff between launch overhead and Compute Unit (CU) occupancy, rather than pure tiling efficiency. The root cause is a row-offset handling bug in the reused kernel, forcing a launch loop that dispatches one workgroup-row per iteration. Fixing this kernel offset bug to decouple tile size from launch count is a prerequisite for a clean tile study.</p>
+          <p>Consequently, any performance ranking measures a tradeoff among launch overhead, total workgroup count, workgroup size, and resource occupancy, rather than pure tiling efficiency. The root cause is a row-offset handling bug in the reused kernel, forcing a launch loop that dispatches one workgroup-row per iteration. Fixing this kernel offset bug to decouple tile size from launch count is a prerequisite for a clean tile study.</p>
         </div>
       </article>
 
       <article class="finding">
         <div class="finding-body">
           <h3>2. Unmodeled LDS Occupancy in MGPUSim</h3>
-          <p>MGPUSim's resource allocation path inspects <code>co.WGGroupSegmentByteSize</code>, which evaluates to <code>0</code> for this kernel. Therefore, the 16 KB LDS allocation requested by <code>tileSize=16</code> incurs zero occupancy cost in simulation. On physical hardware, requiring 16 KB of LDS would cap CU occupancy at 4 workgroups per CU. As it stands, the simulator sweep is systematically biased toward larger tiles.</p>
+          <p>MGPUSim's resource allocation path inspects <code>co.WGGroupSegmentByteSize</code>, which evaluates to <code>0</code> for this kernel. Therefore, the 16 KB LDS allocation requested by <code>tileSize=16</code> incurs zero occupancy cost in simulation. Assuming a 64-KB LDS capacity, 16 KB per workgroup imposes an LDS-only upper bound of four resident workgroups per CU; register pressure may impose a stricter limit. As it stands, the simulator sweep is systematically biased toward larger tiles.</p>
         </div>
       </article>
-
       <article class="finding">
         <div class="finding-body">
-          <h3>3. Register Constraints Cap the Feasible Search Space</h3>
+          <h3>3. Memory Stalls at Small Tiles</h3>
+          <p>The detailed CSV metrics for <code>tileSize=4</code> reveal heavy stalling within the Compute Units (CUs). Across GPU 1, the SIMD CPI averages 43.07 and the overall CU CPI averages 36.03. This exceptionally high cycle-per-instruction rate indicates substantial execution stalls and is consistent with strong sensitivity to memory latency in the 4&times;4 work-groups.</p>
+        </div>
+      </article>
+      <article class="finding">
+        <div class="finding-body">
+          <h3>4. Register Constraints Cap the Feasible Search Space</h3>
           <p>A setting of <code>tileSize=32</code> represents 1024 work-items (16 wavefronts). However, given the kernel's demand of 74 VGPRs per work-item, a CU can accommodate at most 12 wavefronts:</p>
           <div class="formula">
             16384 registers / SIMD &divide; 4 (granularity) &divide; 64 (lanes) = 64 units<br>
@@ -394,7 +438,7 @@
   </section>
 
   <section>
-    <h2>Empirical Sweep Results</h2>
+    <h2>Simulated Sweep Results</h2>
     <p>Following the flag and execution fixes, the sweep was executed for a <code>256³</code> GEMM workload across 2 GPUs using the Ring All-Reduce algorithm.</p>
     <div class="tablewrap">
       <table>
@@ -407,7 +451,7 @@
             <th>Total Time (&mu;s)</th>
             <th>Kernel Time (&mu;s)</th>
             <th>Non-Kernel Overhead (&mu;s)</th>
-            <th>Relative Speedup</th>
+            <th>Normalized Time (&times; Best)</th>
           </tr>
         </thead>
         <tbody>
@@ -435,8 +479,8 @@
             <td class="num">4</td>
             <td class="num">710.4</td>
             <td class="num">292.1</td>
-            <td class="num">418.2</td>
-            <td class="num">1.000&times; (Best)</td>
+            <td class="num">418.3</td>
+            <td class="num">1.000&times; (Lowest Simulated Time)</td>
           </tr>
         </tbody>
       </table>
@@ -444,21 +488,10 @@
 
     <div class="callout">
       <span class="tag">Key Takeaway</span>
-      <p>The empirical results confirm the confounding effect described above: reducing the launch count by 4x reduces total time, kernel time, and driver overhead proportionally (~2.33x). Because the total work-item count remains identical across all three runs, and <code>tileSize=16</code> leaves 93.75% of CUs idle (utilizing only 4 out of 64 CUs), the speedup reflects launch overhead amortization rather than intrinsic tiling efficiency.</p>
+      <p>The results show that larger tile sizes run faster in the current simulator. Reducing the number of launches from 16 to 4 reduces total time, kernel time, and non-kernel overhead by about 2.33×, 2.35×, and 2.31×, respectively. However, tile size also changes the number and size of workgroups, so this improvement cannot be attributed to launch reduction alone. Therefore, these results show that larger tiles perform better in the current simulator configuration, but they do not yet measure the effect of tile size by itself.</p>
     </div>
 
     <p><em>Metric note:</em> <code>kernel_time</code> includes the Push and Reduce kernels associated with All-Reduce because they are dispatched via <code>LaunchKernel</code>. The non-kernel metric captures driver dispatch overhead, host orchestration, and command queue flushing.</p>
-  </section>
-
-  <section>
-    <h2>Summary &amp; Recommended Next Steps</h2>
-    <p>Optimizing end-to-end execution time (GEMM computation coupled with All-Reduce communication) is the correct objective, and the FlashOverlap / TileLink framework aligns well with this model.</p>
-    <p><strong>Proposed Action Items:</strong></p>
-    <ol class="issues">
-      <li>Fix the kernel's row-offset calculation bug to decouple tile dimensions from launch counts.</li>
-      <li>Patch MGPUSim's LDS accounting path so that dynamic LDS allocations properly constrain CU occupancy.</li>
-      <li>Proceed to second-stage tuning (tuning <code>TILEX</code>/<code>TILEY</code> micro-tiles and recompiling HSACO binaries via <code>clang-ocl</code>) only after the simulator accurately enforces LDS allocation costs.</li>
-    </ol>
   </section>
 
   <footer>

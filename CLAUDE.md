@@ -4,7 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository layout
 
-This is a Go workspace (`go.work`, Go 1.26) containing two modules developed together:
+```
+go.work, go.work.sum   Go workspace wiring the two simulator modules together
+simulator/             Simulator source code (the two Go modules below)
+scripts/               Experiment drivers (e.g. tune_gemm_tile.py)
+results/               Raw simulation output (metrics.csv, stdout); gitignored except README
+diagrams/              Plots/figures derived from results/; tracked in git
+reports/               Standalone HTML write-ups of experiments
+```
+
+Keep this separation: generated data goes in `results/<experiment>/`, never inside
+`simulator/`; derived figures go in `diagrams/`; write-ups go in `reports/`.
+
+The Go workspace (`go.work`, Go 1.26) contains two modules under `simulator/`, developed together:
 
 - `akita-3.0.0` — module `github.com/sarchlab/akita/v3`. A general-purpose discrete-event
   simulation *engine* (analogous to a game engine), not a simulator itself. Provides the core
@@ -14,13 +26,14 @@ This is a Go workspace (`go.work`, Go 1.26) containing two modules developed tog
   Akita that models GPUs running the AMD GCN3 instruction set, including multi-GPU simulation.
 
 `mgpusim` depends on `akita` via the module path `github.com/sarchlab/akita/v3`; the `go.work`
-file wires local `./akita-3.0.0` in place of a tagged release so cross-module changes are picked
+file wires local `./simulator/akita-3.0.0` in place of a tagged release so cross-module changes are picked
 up immediately without touching `go.mod`. Each module also has commented-out `replace` directives
 in its `go.mod` for standalone (non-workspace) development.
 
 ## Common commands
 
-Run from inside the relevant module directory (`akita-3.0.0` or `mgpusim-3.0.3`) unless noted.
+Run from inside the relevant module directory (`simulator/akita-3.0.0` or
+`simulator/mgpusim-3.0.3`) unless noted.
 
 ```bash
 # Build everything in a module

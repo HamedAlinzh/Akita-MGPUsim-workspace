@@ -21,17 +21,17 @@ The script temporarily edits benchmark.go and restores it on exit.
 
 Example
 -------
-From the Akita-MGPUSim-workspace root:
+From anywhere (the workspace root is located relative to this script):
 
-    python3 tune_gemm_tile.py \
+    python3 scripts/tune_gemm_tile.py \
         --tiles 4,8,16 \
         --m 256 --k 256 --n 256 \
         --gpus 2 --algorithm ring
 
 Output:
-    gemm_tile_tuning/results.csv
-    gemm_tile_tuning/tile_*/metrics.csv
-    gemm_tile_tuning/tile_*/stdout.txt
+    results/gemm_tile_tuning/results.csv
+    results/gemm_tile_tuning/tile_*/metrics.csv
+    results/gemm_tile_tuning/tile_*/stdout.txt
 """
 
 from __future__ import annotations
@@ -152,7 +152,11 @@ def patch_source(original: str, tile: int) -> str:
         count=1,
     )
     # It is fine if this was already converted manually.
-    if n == 0 and "BlockA: (4 * tileSize) * (4 * tileSize) * 4," not in patched:
+    already = re.search(
+        r"BlockA:\s*\(4\s*\*\s*tileSize\)\s*\*\s*\(4\s*\*\s*tileSize\)\s*\*\s*4\s*,",
+        patched,
+    )
+    if n == 0 and not already:
         raise RuntimeError(
             "Could not recognize the BlockA local-memory allocation in benchmark.go"
         )
@@ -189,8 +193,8 @@ def main():
     ap.add_argument(
         "--root",
         type=Path,
-        default=Path("."),
-        help="Akita-MGPUSim-workspace root (default: current directory)",
+        default=Path(__file__).resolve().parent.parent,
+        help="Akita-MGPUSim-workspace root (default: parent of scripts/)",
     )
     ap.add_argument("--tiles", default="4,8,16")
     ap.add_argument("--m", type=int, default=256)
@@ -207,16 +211,16 @@ def main():
     args = ap.parse_args()
 
     root = args.root.resolve()
-    mgpu = root / "mgpusim-3.0.3"
+    mgpu = root / "simulator" / "mgpusim-3.0.3"
     bench_go = mgpu / "benchmarks" / "allreducegemm" / "benchmark.go"
     sample = mgpu / "samples" / "allreducegemm"
-    outroot = root / "gemm_tile_tuning"
-    outroot.mkdir(exist_ok=True)
+    outroot = root / "results" / "gemm_tile_tuning"
+    outroot.mkdir(parents=True, exist_ok=True)
 
     if not bench_go.exists() or not sample.exists():
         raise SystemExit(
-            "Expected mgpusim-3.0.3/benchmarks/allreducegemm/benchmark.go "
-            "and mgpusim-3.0.3/samples/allreducegemm"
+            "Expected simulator/mgpusim-3.0.3/benchmarks/allreducegemm/benchmark.go "
+            "and simulator/mgpusim-3.0.3/samples/allreducegemm"
         )
 
     tiles = [int(x.strip()) for x in args.tiles.split(",") if x.strip()]
@@ -254,7 +258,8 @@ def main():
 
             # Rebuilding Go is enough for this first sweep. The HSACO's
             # microtile is still fixed at 4x4; get_local_size() is runtime.
-            build = run(["go", "build", "-o", "allreducegemm_tuned", "."], cwd=sample)
+            binary = outroot / "allreducegemm_tuned"
+            build = run(["go", "build", "-o", binary, "."], cwd=sample)
             if build.stdout:
                 print(build.stdout)
 
@@ -264,7 +269,6 @@ def main():
             run_dir.mkdir(parents=True)
 
             # MGPUSim writes metrics.csv in the process working directory.
-            binary = sample / "allreducegemm_tuned"
             cmd = [
                 binary,
                 "-timing",
