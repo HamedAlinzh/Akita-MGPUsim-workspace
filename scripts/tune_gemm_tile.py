@@ -28,6 +28,10 @@ From anywhere (the workspace root is located relative to this script):
         --m 256 --k 256 --n 256 \
         --gpus 2 --algorithm ring
 
+Add --band-rows R [--overlap] to split M into R-row bands (each its own GEMM
+launch and All-Reduce of R*N floats); --overlap all-reduces band r while band
+r+1 computes, which is what lets the best tile shift with communication.
+
 Output:
     results/gemm_tile_tuning/results.csv
     results/gemm_tile_tuning/tile_*/metrics.csv
@@ -164,7 +168,7 @@ def patch_source(original: str, tile: int) -> str:
     return patched
 
 
-def validate(tile: int, m: int, k: int, n: int, gpus: int):
+def validate(tile: int, m: int, k: int, n: int, gpus: int, band_rows: int):
     out_tile = 4 * tile
 
     if tile * tile > 256:
@@ -185,6 +189,11 @@ def validate(tile: int, m: int, k: int, n: int, gpus: int):
     if bad:
         return False, f"{', '.join(bad)} not divisible by output/K tile {out_tile}"
 
+    if band_rows and (band_rows % out_tile or m % band_rows):
+        return False, (
+            f"band rows {band_rows} must be a multiple of {out_tile} and divide M={m}"
+        )
+
     return True, ""
 
 
@@ -203,6 +212,23 @@ def main():
     ap.add_argument("--gpus", type=int, default=2)
     ap.add_argument("--algorithm", choices=["ring", "naive"], default="ring")
     ap.add_argument(
+        "--band-rows",
+        type=int,
+        default=0,
+        help="Rows per GEMM/All-Reduce band (0 = one band covering all of M)",
+    )
+    ap.add_argument(
+        "--overlap",
+        action="store_true",
+        help="All-reduce band r while band r+1's GEMM runs",
+    )
+    ap.add_argument(
+        "--outdir",
+        type=Path,
+        default=None,
+        help="Output directory (default: <root>/results/gemm_tile_tuning)",
+    )
+    ap.add_argument(
         "--extra",
         nargs=argparse.REMAINDER,
         default=[],
@@ -214,7 +240,7 @@ def main():
     mgpu = root / "simulator" / "mgpusim-3.0.3"
     bench_go = mgpu / "benchmarks" / "allreducegemm" / "benchmark.go"
     sample = mgpu / "samples" / "allreducegemm"
-    outroot = root / "results" / "gemm_tile_tuning"
+    outroot = (args.outdir or root / "results" / "gemm_tile_tuning").resolve()
     outroot.mkdir(parents=True, exist_ok=True)
 
     if not bench_go.exists() or not sample.exists():
@@ -224,12 +250,16 @@ def main():
         )
 
     tiles = [int(x.strip()) for x in args.tiles.split(",") if x.strip()]
+    # The runner numbers GPUs from 1 (0 is the CPU).
+    gpu_ids = ",".join(str(i) for i in range(1, args.gpus + 1))
     original = bench_go.read_text()
     results = []
 
     try:
         for tile in tiles:
-            valid, why = validate(tile, args.m, args.k, args.n, args.gpus)
+            valid, why = validate(
+                tile, args.m, args.k, args.n, args.gpus, args.band_rows
+            )
             if not valid:
                 print(f"\nSKIP tileSize={tile}: {why}")
                 results.append(
@@ -273,11 +303,13 @@ def main():
                 binary,
                 "-timing",
                 "--report-all",
-                f"-gpus=1,2",
+                f"-gpus={gpu_ids}",
                 f"-m={args.m}",
                 f"-k={args.k}",
                 f"-n={args.n}",
                 f"-algorithm={args.algorithm}",
+                f"-band-rows={args.band_rows}",
+                f"-overlap={str(args.overlap).lower()}",
             ] + args.extra
 
             proc = run(cmd, cwd=run_dir, check=False)

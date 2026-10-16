@@ -15,6 +15,11 @@ var nFlag = flag.Uint("n", 128, "Number of columns of matrix B and C.")
 var algorithmFlag = flag.String("algorithm", "ring",
 	`Which All-Reduce algorithm combines the per-GPU partial products:
 "ring" or "naive".`)
+var bandRowsFlag = flag.Uint("band-rows", 0,
+	`Split the M output rows into bands of this many rows, each computed and
+all-reduced separately (0 = one band covering all of M).`)
+var overlapFlag = flag.Bool("overlap", false,
+	"All-reduce band r while band r+1's GEMM runs.")
 
 func main() {
 	flag.Parse()
@@ -25,6 +30,8 @@ func main() {
 	benchmark.M = uint32(*mFlag)
 	benchmark.K = uint32(*kFlag)
 	benchmark.N = uint32(*nFlag)
+	benchmark.BandRows = uint32(*bandRowsFlag)
+	benchmark.Overlap = *overlapFlag
 
 	switch *algorithmFlag {
 	case "ring":

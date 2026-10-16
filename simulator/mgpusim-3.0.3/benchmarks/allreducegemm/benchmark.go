@@ -25,18 +25,12 @@ import (
 var hsacoBytes []byte
 
 // tileSize is the local work-group edge length (8x8) that
-// mmmKernel_local's tiling loop assumes; N and each GPU's K slice must be a
-// multiple of 4*tileSize for the kernel's internal loop counts to come out
-// exact.
+// mmmKernel_local's tiling loop assumes; M, N, and each GPU's K slice must
+// be a multiple of 4*tileSize for the kernel's internal loop counts to come
+// out exact.
 const tileSize = 8
 
-// rowBand is the number of output rows computed per kernel launch: exactly
-// one workgroup-row (4*tileSize), since grids with more than one
-// workgroup-row in Y produce wrong results in this simulator (see exec).
-// M must be a multiple of rowBand.
-const rowBand = 4 * tileSize
-
-// naiveBufElements caps the AllReduce scratch buffer at a fixed chunk size
+// allReduceBufElements caps the AllReduce scratch buffer at a fixed chunk size
 // so memory use does not grow with M*N, matching the convention used by
 // the DNN data-parallel trainer (benchmarks/dnn/gputraining).
 const allReduceBufElements = 65536
@@ -65,7 +59,22 @@ type Benchmark struct {
 	// Algorithm selects Ring (default) or Naive All-Reduce.
 	Algorithm Algorithm
 
+	// BandRows splits the M output rows into bands of this many rows, each
+	// computed by its own GEMM launch and all-reduced on its own, so a
+	// band's All-Reduce message is BandRows*N floats. 0 means one band
+	// covering all of M. Must divide M and be a multiple of 4*tileSize.
+	BandRows uint32
+
+	// Overlap pipelines the bands: band r is all-reduced while band r+1's
+	// GEMM is running. Without it, each band's GEMM finishes and its
+	// All-Reduce completes before the next band starts, which is the
+	// no-overlap control at the same message size.
+	Overlap bool
+
 	kernel *insts.HsaCo
+
+	comms []*mccl.Communicator
+	bufs  []driver.Ptr
 
 	matrixA, matrixB, matrixC *matrix
 
@@ -160,23 +169,10 @@ func (b *Benchmark) exec() {
 		cmdQs[g] = b.driver.CreateCommandQueue(b.context)
 	}
 
-	// mmmKernel_local's HiddenGlobalOffsetY parameter does not work
-	// correctly in this simulator (verified separately: even a single
-	// workgroup-row launch with a nonzero Y offset silently produces
-	// zeros), and a grid with more than one workgroup-row in Y produces
-	// wrong results outright. So instead of one launch covering the full M
-	// rows with a Y offset, every GPU issues one launch per rowBand-row
-	// band, always with a single-workgroup-row grid and a zero offset,
-	// retargeting MatrixA/MatrixC via plain pointer arithmetic instead.
-	//
-	// Bands are issued round-robin across GPUs -- one launch per GPU, then
-	// drain every GPU's queue together, then the next band -- rather than
-	// batching all of one GPU's bands before draining. That keeps genuine
-	// cross-GPU overlap (several GPUs have a launch outstanding at once)
-	// while ensuring no single queue ever accumulates more than one
-	// undrained launch, which avoids a hang observed when GPUs had several
-	// simultaneously-outstanding, undrained launches each.
-	for rowStart := uint32(0); rowStart < b.M; rowStart += rowBand {
+	b.initAllReduce()
+
+	bandRows := b.bandRows()
+	launchBand := func(rowStart uint32) {
 		for g, gpuID := range b.gpus {
 			b.driver.SelectGPU(b.context, gpuID)
 
@@ -193,19 +189,56 @@ func (b *Benchmark) exec() {
 			b.driver.EnqueueLaunchKernel(
 				cmdQs[g],
 				b.kernel,
-				[3]uint32{b.N / 4, rowBand / 4, 1},
+				[3]uint32{b.N / 4, bandRows / 4, 1},
 				[3]uint16{tileSize, tileSize, 1},
 				kernArgs,
 			)
 		}
-
+	}
+	drain := func() {
 		for _, q := range cmdQs {
 			b.driver.DrainCommandQueue(q)
 		}
 	}
 
-	b.allReduce(partialC)
+	// A band may span several workgroup rows. That relies on the patched
+	// kernels.hsaco (see native/patch_gidy.py): upstream mmmKernel_local
+	// indexes A by the local Y id, so every workgroup row past the first
+	// read the wrong rows of A.
+	//
+	// With Overlap, band r's GEMM is left running on every GPU while the
+	// host drives band r-1's All-Reduce on mccl's own command queues; the
+	// CP's multiple dispatchers let the two kernels share the GPU. The
+	// bands write disjoint rows of partialC, and band r-1's GEMM was drained
+	// before its All-Reduce starts. Each GEMM queue still holds at most one
+	// undrained launch at a time.
+	for rowStart := uint32(0); rowStart < b.M; rowStart += bandRows {
+		launchBand(rowStart)
+
+		if !b.Overlap {
+			drain()
+			b.allReduce(partialC, rowStart, bandRows)
+			continue
+		}
+
+		if rowStart > 0 {
+			b.allReduce(partialC, rowStart-bandRows, bandRows)
+		}
+		drain()
+	}
+
+	if b.Overlap {
+		b.allReduce(partialC, b.M-bandRows, bandRows)
+	}
+
 	b.collectResult(partialC[0])
+}
+
+func (b *Benchmark) bandRows() uint32 {
+	if b.BandRows == 0 {
+		return b.M
+	}
+	return b.BandRows
 }
 
 // validateDimensions checks the constraints mmmKernel_local's tiling
@@ -221,8 +254,8 @@ func (b *Benchmark) validateDimensions(numGPU uint32) {
 	kSlice := b.K / numGPU
 	tile := uint32(4 * tileSize)
 
-	if b.M%rowBand != 0 {
-		log.Panicf("M (%d) must be a multiple of %d", b.M, uint32(rowBand))
+	if b.M%tile != 0 {
+		log.Panicf("M (%d) must be a multiple of %d", b.M, tile)
 	}
 
 	if b.N%tile != 0 {
@@ -233,31 +266,57 @@ func (b *Benchmark) validateDimensions(numGPU uint32) {
 		log.Panicf(
 			"K/numGPU (%d) must be a multiple of %d", kSlice, tile)
 	}
+
+	bandRows := b.bandRows()
+	if bandRows%tile != 0 || b.M%bandRows != 0 {
+		log.Panicf(
+			"BandRows (%d) must be a multiple of %d and divide M (%d)",
+			bandRows, tile, b.M)
+	}
 }
 
-// allReduce sums the numGPU partial products in place. mccl's AllReduce
-// computes the mean, not the sum, of its inputs, so the result is scaled
-// back up by numGPU in collectResult.
-func (b *Benchmark) allReduce(partialC []driver.Ptr) {
+// initAllReduce creates the communicators and the per-GPU scratch buffers
+// shared by every band's All-Reduce.
+func (b *Benchmark) initAllReduce() {
 	numGPU := len(b.gpus)
-	comms := mccl.CommInitAll(numGPU, b.driver, b.context, b.gpus)
+	b.comms = mccl.CommInitAll(numGPU, b.driver, b.context, b.gpus)
 
-	dataSize := int(b.M * b.N)
-	bufSize := dataSize
-	if bufSize > allReduceBufElements {
-		bufSize = allReduceBufElements
-	}
-
-	bufs := make([]driver.Ptr, numGPU)
+	b.bufs = make([]driver.Ptr, numGPU)
 	for g, gpuID := range b.gpus {
 		b.driver.SelectGPU(b.context, gpuID)
-		bufs[g] = b.driver.AllocateMemory(b.context, uint64(bufSize*4))
+		b.bufs[g] = b.driver.AllocateMemory(
+			b.context, uint64(b.allReduceBufSize()*4))
+	}
+}
+
+func (b *Benchmark) allReduceBufSize() int {
+	bandSize := int(b.bandRows() * b.N)
+	if bandSize > allReduceBufElements {
+		return allReduceBufElements
+	}
+	return bandSize
+}
+
+// allReduce sums rows [rowStart, rowStart+numRows) of the numGPU partial
+// products in place. mccl's AllReduce computes the mean, not the sum, of
+// its inputs, so the result is scaled back up by numGPU in collectResult.
+func (b *Benchmark) allReduce(
+	partialC []driver.Ptr,
+	rowStart, numRows uint32,
+) {
+	offset := driver.Ptr(uint64(rowStart) * uint64(b.N) * 4)
+	data := make([]driver.Ptr, len(partialC))
+	for g := range partialC {
+		data[g] = partialC[g] + offset
 	}
 
+	dataSize := int(numRows * b.N)
+	bufSize := b.allReduceBufSize()
+
 	if b.Algorithm == AlgorithmNaive {
-		mccl.AllReduceNaive(b.driver, comms, partialC, dataSize, bufs, bufSize)
+		mccl.AllReduceNaive(b.driver, b.comms, data, dataSize, b.bufs, bufSize)
 	} else {
-		mccl.AllReduceRing(b.driver, comms, partialC, dataSize, bufs, bufSize)
+		mccl.AllReduceRing(b.driver, b.comms, data, dataSize, b.bufs, bufSize)
 	}
 }
 

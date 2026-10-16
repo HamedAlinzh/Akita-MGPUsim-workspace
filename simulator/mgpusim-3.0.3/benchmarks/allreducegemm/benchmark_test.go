@@ -9,6 +9,17 @@ import (
 
 func runCase(t *testing.T, numGPU int, algorithm allreducegemm.Algorithm) {
 	t.Helper()
+	runBandedCase(t, numGPU, algorithm, 0, false)
+}
+
+func runBandedCase(
+	t *testing.T,
+	numGPU int,
+	algorithm allreducegemm.Algorithm,
+	bandRows uint32,
+	overlap bool,
+) {
+	t.Helper()
 
 	platform := runner.MakeR9NanoBuilder().WithNumGPU(numGPU).Build()
 	gpuDriver := platform.Driver
@@ -23,6 +34,8 @@ func runCase(t *testing.T, numGPU int, algorithm allreducegemm.Algorithm) {
 	b := allreducegemm.NewBenchmark(gpuDriver)
 	b.Algorithm = algorithm
 	b.M, b.K, b.N = 128, 128, 128
+	b.BandRows = bandRows
+	b.Overlap = overlap
 	b.SelectGPU(gpuIDs)
 	b.EnableVerification()
 
@@ -52,4 +65,20 @@ func TestGEMMNaive2GPU(t *testing.T) {
 
 func TestGEMMNaive4GPU(t *testing.T) {
 	runCase(t, 4, allreducegemm.AlgorithmNaive)
+}
+
+func TestGEMMRing2GPUBanded(t *testing.T) {
+	runBandedCase(t, 2, allreducegemm.AlgorithmRing, 64, false)
+}
+
+func TestGEMMRing2GPUOverlap(t *testing.T) {
+	runBandedCase(t, 2, allreducegemm.AlgorithmRing, 32, true)
+}
+
+func TestGEMMRing4GPUOverlap(t *testing.T) {
+	runBandedCase(t, 4, allreducegemm.AlgorithmRing, 64, true)
+}
+
+func TestGEMMNaive2GPUOverlap(t *testing.T) {
+	runBandedCase(t, 2, allreducegemm.AlgorithmNaive, 32, true)
 }
