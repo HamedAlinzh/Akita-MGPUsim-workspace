@@ -69,7 +69,12 @@ func createCommandQueues(
 	numGPU := len(comms)
 	cmdQs := make([]*driver.CommandQueue, numGPU)
 
+	// A queue is bound to its context's currently selected GPU, and
+	// communicators usually share one context, so each GPU must be selected
+	// before its queue is created. Otherwise every queue -- and every push
+	// and reduce kernel -- lands on whichever GPU was selected last.
 	for i := 0; i < numGPU; i++ {
+		d.SelectGPU(comms[i].Ctx, comms[i].GPUID)
 		cmdQ := d.CreateCommandQueue(comms[i].Ctx)
 		cmdQs[i] = cmdQ
 	}

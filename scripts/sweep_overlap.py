@@ -12,6 +12,9 @@ runs every (GPUs, tile, band rows, overlap) combination as its own process:
       --overlap off   -> band r's All-Reduce finishes before band r+1 starts
       --overlap on    -> band r is all-reduced while band r+1 computes
 
+--chunks adds the All-Reduce scratch-buffer size (elements; 0 = the
+benchmark's default of 65536) as a fourth dimension.
+
 Every run passes -verify. Per run, the summary keeps the Driver's total_time
 and kernel_time from metrics.csv and the benchmark's own phase split
 (window, gemm_wait, allreduce) from stdout.
@@ -30,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -45,14 +49,15 @@ PHASES_RE = re.compile(
 
 FIELDS = [
     "m", "k", "n", "gpus", "tile_size", "output_tile", "band_rows",
-    "num_bands", "overlap", "total_time", "kernel_time", "window",
+    "num_bands", "overlap", "allreduce_chunk", "total_time", "kernel_time", "window",
     "gemm_wait", "allreduce", "verified", "status", "wall_seconds",
 ]
 
 
-def config_name(gpus, tile, band, overlap):
+def config_name(gpus, tile, band, overlap, chunk=0):
     mode = "ov" if overlap else "seq"
-    return f"g{gpus}_t{tile}_b{band}_{mode}"
+    name = f"g{gpus}_t{tile}_b{band}_{mode}"
+    return f"{name}_c{chunk}" if chunk else name
 
 
 def build_binaries(root: Path, tiles, bindir: Path):
@@ -77,7 +82,7 @@ def build_binaries(root: Path, tiles, bindir: Path):
     return binaries
 
 
-def run_one(binary: Path, run_dir: Path, args, gpus, band, overlap):
+def run_one(binary: Path, run_dir: Path, args, gpus, band, overlap, chunk):
     run_dir.mkdir(parents=True, exist_ok=True)
     gpu_ids = ",".join(str(i) for i in range(1, gpus + 1))
     cmd = [
@@ -87,6 +92,7 @@ def run_one(binary: Path, run_dir: Path, args, gpus, band, overlap):
         f"-algorithm={args.algorithm}",
         f"-band-rows={band}",
         f"-overlap={'true' if overlap else 'false'}",
+        f"-allreduce-chunk={chunk}",
     ]
     start = time.time()
     proc = subprocess.run(
@@ -110,6 +116,11 @@ def run_one(binary: Path, run_dir: Path, args, gpus, band, overlap):
 
 
 def main():
+    # A shutdown sends SIGTERM; exiting through SystemExit runs the finally
+    # block in build_binaries, so benchmark.go is never left patched.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(1))
+
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--root", type=Path,
@@ -123,6 +134,9 @@ def main():
     ap.add_argument(
         "--bands", default="0,64,128,256",
         help="Band rows to sweep; 0 = one band (always run without overlap)")
+    ap.add_argument(
+        "--chunks", default="0",
+        help="All-Reduce chunk sizes in elements; 0 = benchmark default (65536)")
     ap.add_argument("--algorithm", choices=["ring", "naive"], default="ring")
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--outdir", type=Path, default=None)
@@ -135,6 +149,7 @@ def main():
 
     ints = lambda s: [int(x) for x in s.split(",") if x.strip()]  # noqa: E731
     gpu_counts, tiles, bands = ints(args.gpus), ints(args.tiles), ints(args.bands)
+    chunks = ints(args.chunks)
 
     done = {}
     if csv_path.exists():
@@ -143,7 +158,8 @@ def main():
                 if row["status"] == "OK" and row["verified"] == "True":
                     key = config_name(
                         int(row["gpus"]), int(row["tile_size"]),
-                        int(row["band_rows"]), row["overlap"] == "True")
+                        int(row["band_rows"]), row["overlap"] == "True",
+                        int(row.get("allreduce_chunk") or 0))
                     done[key] = row
 
     todo = []
@@ -158,16 +174,18 @@ def main():
                 if band and (band % out_tile or args.m % band):
                     continue
                 for overlap in ([False] if band == 0 else [False, True]):
-                    name = config_name(gpus, tile, band, overlap)
-                    if name not in done:
-                        todo.append((gpus, tile, band, overlap))
+                    for chunk in chunks:
+                        name = config_name(gpus, tile, band, overlap, chunk)
+                        if name not in done:
+                            todo.append((gpus, tile, band, overlap, chunk))
 
     print(f"{len(done)} configurations already done, {len(todo)} to run")
     rows = list(done.values())
 
     def write_csv():
         rows.sort(key=lambda r: (int(r["gpus"]), int(r["tile_size"]),
-                                 int(r["band_rows"]), str(r["overlap"])))
+                                 int(r["band_rows"]), str(r["overlap"]),
+                                 int(r.get("allreduce_chunk") or 0)))
         with csv_path.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=FIELDS)
             w.writeheader()
@@ -178,32 +196,32 @@ def main():
         return
 
     binaries = build_binaries(
-        root, sorted({t for _, t, _, _ in todo}), outroot / "bin")
+        root, sorted({t for _, t, _, _, _ in todo}), outroot / "bin")
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
             pool.submit(
                 run_one, binaries[tile],
-                outroot / config_name(gpus, tile, band, overlap),
-                args, gpus, band, overlap,
-            ): (gpus, tile, band, overlap)
-            for gpus, tile, band, overlap in todo
+                outroot / config_name(gpus, tile, band, overlap, chunk),
+                args, gpus, band, overlap, chunk,
+            ): (gpus, tile, band, overlap, chunk)
+            for gpus, tile, band, overlap, chunk in todo
         }
         for finished, fut in enumerate(as_completed(futures), 1):
-            gpus, tile, band, overlap = futures[fut]
+            gpus, tile, band, overlap, chunk = futures[fut]
             res = fut.result()
             row = {
                 "m": args.m, "k": args.k, "n": args.n, "gpus": gpus,
                 "tile_size": tile, "output_tile": f"{4*tile}x{4*tile}",
                 "band_rows": band,
                 "num_bands": args.m // band if band else 1,
-                "overlap": overlap, **res,
+                "overlap": overlap, "allreduce_chunk": chunk, **res,
             }
             rows.append(row)
             write_csv()
             print(
                 f"[{finished}/{len(todo)}] "
-                f"{config_name(gpus, tile, band, overlap)}: "
+                f"{config_name(gpus, tile, band, overlap, chunk)}: "
                 f"total={res['total_time']} verified={res['verified']} "
                 f"{res['status']} ({res['wall_seconds']}s)",
                 flush=True,

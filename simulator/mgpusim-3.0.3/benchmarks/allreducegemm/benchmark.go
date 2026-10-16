@@ -31,10 +31,10 @@ var hsacoBytes []byte
 // out exact.
 const tileSize = 8
 
-// allReduceBufElements caps the AllReduce scratch buffer at a fixed chunk size
-// so memory use does not grow with M*N, matching the convention used by
+// defaultAllReduceChunk caps the AllReduce scratch buffer at a fixed chunk
+// size so memory use does not grow with M*N, matching the convention used by
 // the DNN data-parallel trainer (benchmarks/dnn/gputraining).
-const allReduceBufElements = 65536
+const defaultAllReduceChunk = 65536
 
 // Algorithm selects which All-Reduce implementation combines the per-GPU
 // partial products.
@@ -71,6 +71,11 @@ type Benchmark struct {
 	// All-Reduce completes before the next band starts, which is the
 	// no-overlap control at the same message size.
 	Overlap bool
+
+	// AllReduceChunk is the All-Reduce scratch buffer size in elements; a
+	// band larger than this is all-reduced in several chunks, each a full
+	// round of ring steps. 0 means defaultAllReduceChunk.
+	AllReduceChunk uint32
 
 	kernel *insts.HsaCo
 
@@ -314,9 +319,14 @@ func (b *Benchmark) initAllReduce() {
 }
 
 func (b *Benchmark) allReduceBufSize() int {
+	chunk := int(b.AllReduceChunk)
+	if chunk == 0 {
+		chunk = defaultAllReduceChunk
+	}
+
 	bandSize := int(b.bandRows() * b.N)
-	if bandSize > allReduceBufElements {
-		return allReduceBufElements
+	if bandSize > chunk {
+		return chunk
 	}
 	return bandSize
 }

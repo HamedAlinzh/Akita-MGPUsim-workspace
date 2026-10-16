@@ -15,11 +15,7 @@ func BroadcastRing(
 ) {
 	numGPU := len(comms)
 
-	cmdQs := make([]*driver.CommandQueue, numGPU)
-	for i := 0; i < numGPU; i++ {
-		cmdQ := d.CreateCommandQueue(comms[i].Ctx)
-		cmdQs[i] = cmdQ
-	}
+	cmdQs := createCommandQueues(d, comms)
 
 	chunkSize := int(4 * mem.KB)
 	chunkNum := (dataSize-1)/chunkSize + 1
