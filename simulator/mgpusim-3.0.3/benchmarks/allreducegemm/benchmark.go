@@ -14,6 +14,7 @@ import (
 	"math"
 	"math/rand"
 
+	"github.com/sarchlab/akita/v3/sim"
 	"github.com/sarchlab/mgpusim/v3/benchmarks/amdappsdk/matrixmultiplication"
 	"github.com/sarchlab/mgpusim/v3/benchmarks/mccl"
 	"github.com/sarchlab/mgpusim/v3/driver"
@@ -212,24 +213,47 @@ func (b *Benchmark) exec() {
 	// bands write disjoint rows of partialC, and band r-1's GEMM was drained
 	// before its All-Reduce starts. Each GEMM queue still holds at most one
 	// undrained launch at a time.
+	//
+	// The phase timers split the simulated time between the first launch
+	// and the last All-Reduce into time the host spends waiting for GEMM
+	// drains and time it spends inside All-Reduce calls. Without overlap
+	// these are the GEMM and All-Reduce times; with overlap, the drain wait
+	// is the GEMM time the All-Reduce did not hide.
+	var gemmWait, allReduceTime sim.VTimeInSec
+	timed := func(acc *sim.VTimeInSec, f func()) {
+		start := b.driver.Engine.CurrentTime()
+		f()
+		*acc += b.driver.Engine.CurrentTime() - start
+	}
+	reduceBand := func(rowStart uint32) {
+		timed(&allReduceTime, func() {
+			b.allReduce(partialC, rowStart, bandRows)
+		})
+	}
+
+	windowStart := b.driver.Engine.CurrentTime()
 	for rowStart := uint32(0); rowStart < b.M; rowStart += bandRows {
 		launchBand(rowStart)
 
 		if !b.Overlap {
-			drain()
-			b.allReduce(partialC, rowStart, bandRows)
+			timed(&gemmWait, drain)
+			reduceBand(rowStart)
 			continue
 		}
 
 		if rowStart > 0 {
-			b.allReduce(partialC, rowStart-bandRows, bandRows)
+			reduceBand(rowStart - bandRows)
 		}
-		drain()
+		timed(&gemmWait, drain)
 	}
 
 	if b.Overlap {
-		b.allReduce(partialC, b.M-bandRows, bandRows)
+		reduceBand(b.M - bandRows)
 	}
+	window := b.driver.Engine.CurrentTime() - windowStart
+
+	log.Printf("allreducegemm phases: window=%.9f gemm_wait=%.9f "+
+		"allreduce=%.9f", window, gemmWait, allReduceTime)
 
 	b.collectResult(partialC[0])
 }

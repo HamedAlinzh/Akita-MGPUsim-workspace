@@ -309,6 +309,8 @@
 <body>
 
 <div class="wrap">
+<aside class="outdated-banner" role="note" style="background:var(--warning-bg);border:1px solid var(--warning-text);border-left:4px solid var(--warning-text);border-radius:6px;padding:0.9rem 1.1rem;margin:0 0 1.5rem;color:var(--text-main);font-size:0.9rem;line-height:1.6;"><strong>Outdated (2026-10-16).</strong> The measurements in this report were taken before commit <code>3be1037</code>, with a benchmark that issued one GEMM launch per 32-row band (one workgroup row per launch). That workaround existed because the reused AMD APP SDK kernel indexes A by the <em>local</em> Y id (<code>lIdY</code>) instead of the global one: a kernel bug, not a simulator bug. With the kernel patched, one launch covers all of M. Here, tile size also set the launch count (16 / 8 / 4 launches per GPU), so the tile ranking below measures launch overhead as much as tiling. The script also ran 2 GPUs regardless of <code>--gpus</code>. Kept for the record; see the rewritten reports in <code>reports/</code> for current numbers.</aside>
+
 
   <header class="masthead">
     <span class="eyebrow">MGPUSim &middot; GEMM Tile Tuning Analysis</span>

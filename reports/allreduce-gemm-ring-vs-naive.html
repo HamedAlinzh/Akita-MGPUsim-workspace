@@ -383,6 +383,8 @@
 </style>
 </head>
 <body>
+<aside class="outdated-banner" role="note" style="background:var(--status-bg);border:1px solid var(--status);border-left:4px solid var(--status);border-radius:6px;padding:0.9rem 1.1rem;margin:1.5rem auto;max-width:52rem;color:var(--ink);font-size:0.9rem;line-height:1.6;"><strong>Outdated (2026-10-16).</strong> The measurements in this report were taken before commit <code>3be1037</code>, with a benchmark that issued one GEMM launch per 32-row band (one workgroup row per launch). That workaround existed because the reused AMD APP SDK kernel indexes A by the <em>local</em> Y id (<code>lIdY</code>) instead of the global one: a kernel bug, not a simulator bug. With the kernel patched, one launch covers all of M. The GEMM-phase times, scaling efficiency and compute/communication split below include that per-band launch overhead, and Bug 1 in §6 is the kernel bug above, not a broken offset parameter. Kept for the record; see the rewritten reports in <code>reports/</code> for current numbers.</aside>
+
 <div class="masthead">
   <p class="kicker">MGPUSim / Akita &middot; Lab Report</p>
   <h1>All-Reduce GEMM: Ring vs. Naive Under GPU and Memory Scaling</h1>
