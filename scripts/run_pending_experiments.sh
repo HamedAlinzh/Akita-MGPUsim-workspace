@@ -8,17 +8,18 @@
 #           256x256x1024 (2 GPUs)
 #           -> results/overlap_sweep_k4096/, results/overlap_sweep_k1024/
 #
-# Start it detached, so it survives Claude Code or the terminal closing:
-#   setsid nohup scripts/run_pending_experiments.sh \
-#       > results/pending_experiments.log 2>&1 < /dev/null &
+# Start it as its own systemd user service, so it keeps running when VS Code,
+# Claude Code or the terminal close (it stops on shutdown; rerun to resume):
+#   systemd-run --user --unit=gemm-experiments --collect -E PATH="$PATH" \
+#       --working-directory="$PWD" bash -c \
+#       'scripts/run_pending_experiments.sh >> results/pending_experiments.log 2>&1'
 #
 # Check on it:
+#   systemctl --user status gemm-experiments
 #   tail -f results/pending_experiments.log
-#   ps -eo etime,args | grep -E 'allreducegemm_t|allreducebench' | grep -v grep
 #
 # Stop it (finished runs are kept; rerun the start command to resume):
-#   pkill -f run_pending_experiments.sh; pkill -f sweep_overlap.py
-#   pkill -f allreducegemm_t; pkill -f allreducebench
+#   systemctl --user stop gemm-experiments
 #
 # JOBS (default 3) is the number of sweep simulations run at once in lane 2.
 

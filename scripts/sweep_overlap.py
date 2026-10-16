@@ -36,6 +36,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -46,6 +47,23 @@ from tune_gemm_tile import metric_value, patch_source  # noqa: E402
 
 PHASES_RE = re.compile(
     r"phases: window=(\S+) gemm_wait=(\S+) allreduce=(\S+)")
+
+# Simulations in flight, so a SIGTERM can stop them; once STOPPING is set,
+# queued configurations are skipped instead of started.
+RUNNING: set[subprocess.Popen] = set()
+RUNNING_LOCK = threading.Lock()
+STOPPING = threading.Event()
+
+
+def stop(*_):
+    STOPPING.set()
+    with RUNNING_LOCK:
+        for proc in RUNNING:
+            proc.kill()
+    # Exiting through SystemExit runs the finally block in build_binaries,
+    # so benchmark.go is never left patched.
+    sys.exit(1)
+
 
 FIELDS = [
     "m", "k", "n", "gpus", "tile_size", "output_tile", "band_rows",
@@ -94,32 +112,40 @@ def run_one(binary: Path, run_dir: Path, args, gpus, band, overlap, chunk):
         f"-overlap={'true' if overlap else 'false'}",
         f"-allreduce-chunk={chunk}",
     ]
+    with RUNNING_LOCK:
+        if STOPPING.is_set():
+            return None
+        proc = subprocess.Popen(
+            cmd, cwd=run_dir, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        RUNNING.add(proc)
     start = time.time()
-    proc = subprocess.run(
-        cmd, cwd=run_dir, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output, _ = proc.communicate()
     wall = time.time() - start
-    (run_dir / "stdout.txt").write_text(" ".join(cmd) + "\n" + proc.stdout)
+    with RUNNING_LOCK:
+        RUNNING.discard(proc)
+    if STOPPING.is_set():
+        return None
+    (run_dir / "stdout.txt").write_text(" ".join(cmd) + "\n" + output)
 
     metrics = run_dir / "metrics.csv"
-    phases = PHASES_RE.search(proc.stdout)
+    phases = PHASES_RE.search(output)
     return {
         "total_time": metric_value(metrics, "total_time"),
         "kernel_time": metric_value(metrics, "kernel_time"),
         "window": float(phases.group(1)) if phases else None,
         "gemm_wait": float(phases.group(2)) if phases else None,
         "allreduce": float(phases.group(3)) if phases else None,
-        "verified": "Passed!" in proc.stdout,
+        "verified": "Passed!" in output,
         "status": "OK" if proc.returncode == 0 else f"FAIL({proc.returncode})",
         "wall_seconds": round(wall, 1),
     }
 
 
 def main():
-    # A shutdown sends SIGTERM; exiting through SystemExit runs the finally
-    # block in build_binaries, so benchmark.go is never left patched.
+    # A shutdown or `kill` sends SIGTERM: stop running simulations and exit.
     for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda *_: sys.exit(1))
+        signal.signal(sig, stop)
 
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -210,6 +236,8 @@ def main():
         for finished, fut in enumerate(as_completed(futures), 1):
             gpus, tile, band, overlap, chunk = futures[fut]
             res = fut.result()
+            if res is None:
+                continue
             row = {
                 "m": args.m, "k": args.k, "n": args.n, "gpus": gpus,
                 "tile_size": tile, "output_tile": f"{4*tile}x{4*tile}",
