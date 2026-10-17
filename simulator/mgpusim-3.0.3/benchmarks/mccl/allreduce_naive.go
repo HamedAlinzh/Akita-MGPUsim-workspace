@@ -32,7 +32,7 @@ func AllReduceNaive(
 
 	numGPU := len(comms)
 	bigSteps := (dataSize-1)/sizePerBuf + 1
-	numThread := 1024
+	numThread := collectiveThreads()
 
 	for j := 0; j < bigSteps; j++ {
 		dataOffset := j * sizePerBuf

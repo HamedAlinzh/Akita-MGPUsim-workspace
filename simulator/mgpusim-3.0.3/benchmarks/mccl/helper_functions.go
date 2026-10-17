@@ -4,6 +4,7 @@ package mccl
 import (
 	// For embedded HsaCo files.
 	_ "embed"
+	"log"
 
 	"github.com/sarchlab/mgpusim/v3/insts"
 	"github.com/sarchlab/mgpusim/v3/kernels"
@@ -19,6 +20,21 @@ var reduceHsaCoFile []byte
 
 var coPush *insts.HsaCo
 var coReduce *insts.HsaCo
+
+// CollectiveThreads is the number of threads every push, reduce and
+// broadcast kernel is launched with, in work-groups of 64. The kernels are
+// grid-stride loops, so any positive multiple of 64 gives the same result;
+// more threads spread the work over more CUs. The default of 1024 (16
+// work-groups) matches results from before this was configurable.
+var CollectiveThreads = 1024
+
+func collectiveThreads() int {
+	if CollectiveThreads <= 0 || CollectiveThreads%64 != 0 {
+		log.Panicf("mccl.CollectiveThreads must be a positive multiple of "+
+			"64, got %d", CollectiveThreads)
+	}
+	return CollectiveThreads
+}
 
 func init() {
 	coPush = loadKernel(broadcastHsaCoFile, "pushData")

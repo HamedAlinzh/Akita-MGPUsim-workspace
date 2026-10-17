@@ -41,7 +41,7 @@ func BroadcastRing(
 			dst += driver.Ptr(4 * (srcChunkNum * chunkSize))
 			sizeToPush := min(chunkSize, dataSize-srcChunkNum*chunkSize)
 
-			numThread := 1024
+			numThread := collectiveThreads()
 			d.SelectGPU(comms[i].Ctx, comms[i].GPUID)
 			kernelArgs := &pushKernelArgs{
 				Src:       src,

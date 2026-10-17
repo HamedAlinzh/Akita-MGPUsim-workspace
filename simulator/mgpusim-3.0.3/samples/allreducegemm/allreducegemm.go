@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"github.com/sarchlab/mgpusim/v3/benchmarks/allreducegemm"
+	"github.com/sarchlab/mgpusim/v3/benchmarks/mccl"
 	"github.com/sarchlab/mgpusim/v3/samples/runner"
 )
 
@@ -22,6 +23,8 @@ var overlapFlag = flag.Bool("overlap", false,
 	"All-reduce band r while band r+1's GEMM runs.")
 var allReduceChunkFlag = flag.Uint("allreduce-chunk", 0,
 	"All-Reduce scratch buffer size in elements (0 = 65536).")
+var collectiveThreadsFlag = flag.Int("collective-threads", 1024,
+	"Threads per All-Reduce push/reduce kernel, a multiple of 64.")
 var perBandScratchFlag = flag.Bool("per-band-scratch", false,
 	"Give every band its own All-Reduce scratch buffers.")
 
@@ -38,6 +41,7 @@ func main() {
 	benchmark.Overlap = *overlapFlag
 	benchmark.AllReduceChunk = uint32(*allReduceChunkFlag)
 	benchmark.PerBandScratch = *perBandScratchFlag
+	mccl.CollectiveThreads = *collectiveThreadsFlag
 
 	switch *algorithmFlag {
 	case "ring":

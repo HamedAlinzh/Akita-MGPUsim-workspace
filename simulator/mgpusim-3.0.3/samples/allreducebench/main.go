@@ -30,6 +30,8 @@ var sizesFlag = flag.String("sizes", "1024,16384,65536,262144,1048576",
 var chunksFlag = flag.String("chunks", "65536,262144,1048576",
 	"All-Reduce chunk (scratch buffer) sizes, in float32 elements.")
 var outFlag = flag.String("out", "allreducebench.csv", "Output CSV path.")
+var collectiveThreadsFlag = flag.Int("collective-threads", 1024,
+	"Threads per All-Reduce push/reduce kernel, a multiple of 64.")
 
 // category accumulates the union busy time of the tasks classified into it,
 // plus how many tasks there were and how many payload bytes they carried.
@@ -180,6 +182,7 @@ func parseInts(s string) []int {
 func main() {
 	flag.Parse()
 	numGPU := *numGPUFlag
+	mccl.CollectiveThreads = *collectiveThreadsFlag
 	sizes := parseInts(*sizesFlag)
 	chunks := parseInts(*chunksFlag)
 

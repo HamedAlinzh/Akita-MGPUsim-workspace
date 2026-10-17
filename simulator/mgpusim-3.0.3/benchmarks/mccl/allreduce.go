@@ -14,7 +14,7 @@ func AllReduceRing(
 	numGPU := len(comms)
 	cmdQs := createCommandQueues(d, comms)
 	bigSteps := (dataSize-1)/sizePerBuf + 1
-	numThread := 1024
+	numThread := collectiveThreads()
 
 	for j := 0; j < bigSteps; j++ {
 		dataOffset := j * sizePerBuf
