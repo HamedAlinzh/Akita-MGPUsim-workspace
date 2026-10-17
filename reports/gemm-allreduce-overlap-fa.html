@@ -1,0 +1,729 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>مطالعهٔ Overlap در GEMM و All-Reduce</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+  /* Layout: one 48rem right-to-left reading column, same tokens as the English report;
+     charts, code and numbers stay left-to-right inside their own panels. */
+  :root {
+    --bg-main: #f8fafc;
+    --bg-card: #ffffff;
+    --text-main: #0f172a;
+    --text-muted: #475569;
+    --border-color: #e2e8f0;
+    --border-strong: #cbd5e1;
+    --accent: #0284c7;
+    --accent-light: #f0f9ff;
+    --accent-border: #bae6fd;
+    --warning-bg: #fffbeb;
+    --warning-border: #f59e0b;
+    --warning-text: #92400e;
+    --code-bg: #f1f5f9;
+    --shadow: 0 1px 3px 0 rgb(15 23 42 / 0.08), 0 1px 2px -1px rgb(15 23 42 / 0.08);
+    --tile-4: #2a78d6;
+    --tile-8: #eb6834;
+    --tile-16: #1baf7a;
+    --mark-ar: #a7b0bc;
+    --mark-setup: #6250d6;
+    --mark-kern: #8d99a8;
+    --mark-other: #d3d9e0;
+    --grid: #e7ecf1;
+    --axis: #94a3b8;
+    --fail: #b42318;
+    --font-body: 'Vazirmatn', Tahoma, 'Segoe UI', sans-serif;
+    --font-latin: 'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg-main: #0b0f17; --bg-card: #111827; --text-main: #f3f4f6; --text-muted: #9ca3af;
+      --border-color: #1f2937; --border-strong: #374151; --accent: #38bdf8;
+      --accent-light: #0c2a3f; --accent-border: #0369a1;
+      --warning-bg: #2d1c05; --warning-border: #b45309; --warning-text: #fde68a;
+      --code-bg: #1e293b; --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5);
+      --tile-4: #3987e5; --tile-8: #d95926; --tile-16: #199e70;
+      --mark-ar: #4b5563; --mark-setup: #9085e9; --mark-kern: #64748b; --mark-other: #334155;
+      --grid: #1f2937; --axis: #4b5563; --fail: #f97066;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg-main: #0b0f17; --bg-card: #111827; --text-main: #f3f4f6; --text-muted: #9ca3af;
+    --border-color: #1f2937; --border-strong: #374151; --accent: #38bdf8;
+    --accent-light: #0c2a3f; --accent-border: #0369a1;
+    --warning-bg: #2d1c05; --warning-border: #b45309; --warning-text: #fde68a;
+    --code-bg: #1e293b; --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5);
+    --tile-4: #3987e5; --tile-8: #d95926; --tile-16: #199e70;
+    --mark-ar: #4b5563; --mark-setup: #9085e9; --mark-kern: #64748b; --mark-other: #334155;
+    --grid: #1f2937; --axis: #4b5563; --fail: #f97066;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    direction: rtl;
+    background: var(--bg-main);
+    color: var(--text-main);
+    font-family: var(--font-body);
+    font-size: 15.5px;
+    line-height: 1.95;
+    margin: 0;
+    padding-block: 2.5rem 5rem;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  .wrap { max-width: 48rem; margin: 0 auto; display: flex; flex-direction: column; gap: 2.75rem; }
+  .wrap > * { min-width: 0; }
+
+  .masthead { display: flex; flex-direction: column; gap: 0.85rem; padding-bottom: 1.75rem; border-bottom: 2px solid var(--border-strong); }
+  .eyebrow {
+    direction: ltr; unicode-bidi: isolate;
+    font-family: var(--font-mono); font-size: 0.72rem; font-weight: 600; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--accent); background: var(--accent-light);
+    border: 1px solid var(--accent-border); border-radius: 4px; padding: 0.25rem 0.55rem; align-self: flex-start;
+  }
+  h1 { font-size: clamp(1.6rem, 4vw, 2.1rem); font-weight: 800; line-height: 1.45; margin: 0; text-wrap: balance; }
+  .standfirst { margin: 0; color: var(--text-muted); font-size: 1.02rem; max-width: 42rem; }
+
+  .meta-bar {
+    display: flex; flex-wrap: wrap; gap: 0.4rem 1.25rem; font-size: 0.86rem; color: var(--text-muted);
+    background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 0.75rem 1rem;
+  }
+  .meta-bar strong { color: var(--text-main); font-weight: 600; }
+
+  section { display: flex; flex-direction: column; gap: 1rem; }
+  h2 { font-size: 1.22rem; font-weight: 700; margin: 0; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border-color); text-wrap: balance; }
+  h3 { font-size: 1.04rem; font-weight: 700; margin: 0.5rem 0 0; text-wrap: balance; }
+  p { margin: 0; max-width: 46rem; }
+  .lede { font-size: 1.04rem; font-weight: 500; }
+  ul, ol { margin: 0; padding-right: 1.25rem; padding-left: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+
+  /* Latin terms and numbers inside Persian text keep their own direction */
+  .en, var { font-family: var(--font-latin); font-style: normal; unicode-bidi: isolate; }
+  code { direction: ltr; unicode-bidi: isolate; display: inline-block; max-width: 100%; line-height: 1.5; font-family: var(--font-mono); font-size: 0.82em; background: var(--code-bg); border-radius: 4px; padding: 0.12em 0.38em; overflow-wrap: anywhere; }
+  .n { font-family: var(--font-latin); font-variant-numeric: tabular-nums; unicode-bidi: isolate; direction: ltr; display: inline-block; }
+  pre.cmd {
+    direction: ltr; text-align: left;
+    font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.75; color: var(--text-main);
+    background: var(--code-bg); border-right: 3px solid var(--accent); border-radius: 4px;
+    padding: 0.85rem 1rem; margin: 0; overflow-x: auto;
+  }
+
+  .callout { background: var(--accent-light); border: 1px solid var(--accent-border); border-radius: 8px; padding: 1.1rem 1.25rem; display: flex; flex-direction: column; gap: 0.6rem; }
+  .callout.warn { background: var(--warning-bg); border-color: var(--warning-border); }
+  .tag { font-size: 0.8rem; font-weight: 800; color: var(--accent); }
+  .callout.warn .tag { color: var(--warning-text); }
+  .findings { counter-reset: f; list-style: none; padding: 0; gap: 0.75rem; }
+  .findings li { counter-increment: f; display: grid; grid-template-columns: 1.6rem 1fr; gap: 0.5rem; }
+  .findings li::before { content: counter(f, persian); font-weight: 800; color: var(--accent); }
+  .findings li > div { min-width: 0; }
+
+  figure { margin: 0; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; box-shadow: var(--shadow); padding: 1rem 1rem 0.75rem; display: flex; flex-direction: column; gap: 0.6rem; min-width: 0; }
+  figcaption { font-size: 0.88rem; color: var(--text-muted); }
+  figcaption strong { color: var(--text-main); font-weight: 700; }
+  .chart-scroll { overflow-x: auto; direction: ltr; }
+  .chart-scroll svg { display: block; width: 100%; min-width: 560px; height: auto; }
+  .legend { display: flex; flex-wrap: wrap; gap: 0.35rem 1.1rem; font-size: 0.82rem; color: var(--text-muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+  .viz text { font-family: var(--font-latin); font-size: 12px; fill: var(--text-main); }
+  .viz text.muted { fill: var(--text-muted); }
+  .viz .grid { stroke: var(--grid); stroke-width: 1; }
+  .viz .axis { stroke: var(--axis); stroke-width: 1; }
+  .viz .s1, .legend .s1 { fill: var(--tile-4); background: var(--tile-4); }
+  .viz .s2, .legend .s2 { fill: var(--tile-8); background: var(--tile-8); }
+  .viz .s3, .legend .s3 { fill: var(--tile-16); background: var(--tile-16); }
+  .viz .ar, .legend .ar { fill: var(--mark-ar); background: var(--mark-ar); }
+  .viz .bd-setup, .legend .bd-setup { fill: var(--mark-setup); background: var(--mark-setup); }
+  .viz .bd-kern, .legend .bd-kern { fill: var(--mark-kern); background: var(--mark-kern); }
+  .viz .bd-other, .legend .bd-other { fill: var(--mark-other); background: var(--mark-other); }
+  .viz .lift { filter: brightness(1.12); }
+  .viz .hitbox { fill: transparent; cursor: default; }
+  .viz .hitbox:focus { outline: none; }
+  .viz .hitbox:focus-visible { stroke: var(--accent); stroke-width: 1.5; }
+  .viz .fail-mark { fill: var(--fail); font-weight: 700; font-size: 14px; }
+  .viz-tip {
+    position: absolute; z-index: 20; pointer-events: none; opacity: 0; transition: opacity 0.08s;
+    direction: ltr; text-align: left; font-family: var(--font-latin);
+    background: var(--bg-card); color: var(--text-main); border: 1px solid var(--border-strong);
+    border-radius: 6px; box-shadow: var(--shadow); padding: 0.45rem 0.65rem; font-size: 0.8rem; line-height: 1.5; max-width: 22rem;
+  }
+  .viz-tip strong { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .viz-tip .sub { color: var(--text-muted); }
+  .viz-tip .sub strong { color: var(--text-main); font-weight: 500; }
+
+  .tablewrap { overflow-x: auto; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+  caption { caption-side: top; text-align: right; padding: 0.75rem 1rem 0.35rem; color: var(--text-muted); font-size: 0.84rem; }
+  th, td { padding: 0.55rem 0.8rem; text-align: center; border-bottom: 1px solid var(--border-color); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: right; }
+  td.wrap-cell { white-space: normal; min-width: 14rem; text-align: right; }
+  thead th { font-weight: 700; font-size: 0.8rem; color: var(--text-muted); background: var(--code-bg); border-bottom: 1px solid var(--border-strong); }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 0.82rem; direction: ltr; unicode-bidi: isolate; }
+
+  details { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; }
+  details > summary { cursor: pointer; padding: 0.75rem 1rem; font-weight: 700; font-size: 0.94rem; }
+  details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+  details[open] > summary { border-bottom: 1px solid var(--border-color); }
+  details .tablewrap { border: none; box-shadow: none; border-radius: 0 0 8px 8px; }
+
+  footer { border-top: 1px solid var(--border-color); padding-top: 1.5rem; color: var(--text-muted); font-size: 0.86rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  @media (prefers-reduced-motion: reduce) { .viz-tip { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="masthead">
+    <span class="eyebrow">MGPUSim &middot; K-split GEMM + Ring All-Reduce</span>
+    <h1>مطالعهٔ Overlap در GEMM و All-Reduce</h1>
+    <p class="standfirst">زمانِ Ring All-Reduce در MGPUSim صرف چه می‌شود، آیا overlap کردنِ آن با GEMM می‌ارزد، و آیا overlap بهترین tile را عوض می‌کند. این گزارش جایگزین دو گزارشِ tile tuning و نتیجه‌گیری‌های زمانیِ گزارشِ Ring-vs-Naive است؛ اندازه‌گیری‌های آن گزارش‌ها پیش از اصلاح‌های بخش ۱ انجام شده بود. <a href="gemm-allreduce-overlap.html">نسخهٔ انگلیسی</a></p>
+  </header>
+
+  <div class="meta-bar">
+    <span><strong>نویسنده</strong> حامد علی‌نژاد</span>
+    <span><strong>آزمایشگاه</strong> HPCAN، دانشگاه صنعتی شریف</span>
+    <span><strong>کد</strong> branch <code>All-reduce</code> @ <code>f6a1df2</code></span>
+    <span><strong>پلتفرم</strong> <span class="en">MGPUSim v3.0.3 / Akita v3.0.0</span>، <span class="en">R9 Nano</span> (۶۴ CU)، <span class="en">PCIe 4.0 ×16</span></span>
+    <span><strong>تاریخ</strong> ۲۵ مهر ۱۴۰۵</span>
+  </div>
+
+  <section>
+    <div class="callout">
+      <span class="tag">خلاصه</span>
+      <ol class="findings">
+        <li><div><strong>کندیِ All-Reduce از سربارِ هر kernel launch و kernelهای کند است، نه از link.</strong> پیش از هر kernel launch، <span class="n">22.75</span>&nbsp;µs صرفِ host-to-device copyهای مدل‌شده می‌شود. یک All-Reduce یک‌مگابایتی روی ۲ GPU، <span class="n">51%</span> از <span class="n">1,068</span>&nbsp;µs زمانش را همین‌جا می‌گذراند و link فقط <span class="n">6%</span> از زمان ترافیک دارد.</div></li>
+        <li><div><strong>بزرگ‌تر کردنِ chunk ارزان‌ترین بهبود است.</strong> بردنِ chunk از 64K به 256K عنصر، All-Reduce یک‌مگابایتی روی ۲ GPU را <span class="n">1.95×</span> و All-Reduce چهارمگابایتی روی ۴ GPU را <span class="n">2.6×</span> سریع‌تر می‌کند، چون هر chunk یک دورِ کامل kernel launch دارد.</div></li>
+        <li><div><strong>Ring All-Reduce در mccl همهٔ kernelهایش را روی یک GPU اجرا می‌کرد.</strong> بعد از اصلاح، ترافیکِ link دقیقاً برابرِ حجمِ نظریِ ring است و All-Reduce روی ۴ GPU بین <span class="n">1.10×</span> تا <span class="n">1.65×</span> سریع‌تر شده است.</div></li>
+        <li><div><strong>Overlap کار می‌کند، اما هنوز یک launch بدونِ band سریع‌ترین است.</strong> Overlap کردنِ All-Reduce مربوط به band <var>r</var> با GEMM مربوط به band <var>r</var>+1، زمانِ window را نسبت به اجرای پشت‌سرهمِ همان bandها <span class="n">10–34%</span> کم می‌کند؛ اما هر band اضافه یعنی یک All-Reduce کاملِ اضافه، و در این shapeها هزینه‌اش از چیزی که overlap پنهان می‌کند بیشتر است.</div></li>
+        <li><div><strong>بهترین tile تابعِ اندازهٔ band است، نه overlap.</strong> با یک band، work-groupهای 16×16 بهترین‌اند؛ با bandهای ۱۲۸ یا ۶۴ سطری، 4×4 برنده است، چه با overlap چه بدونِ آن. اختلاف‌ها بین <span class="n">1%</span> تا <span class="n">14%</span> است.</div></li>
+        <li><div><strong>مسئلهٔ باز:</strong> دو اجرای overlap روی ۴ GPU نتیجهٔ غلط دادند (بخش ۴). تا این مشکل حل نشود، نتایجِ overlap روی ۴ GPU قابل اعتماد نیستند.</div></li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="changes">
+    <h2>۱. از گزارش‌های قبلی چه تغییر کرده</h2>
+    <p>سه باگ روی همهٔ اندازه‌گیری‌های قبلی اثر گذاشته بود. هر سه در branch <code>All-reduce</code> اصلاح شده‌اند و گزارش‌های قدیمی حالا یادداشتِ «outdated» دارند.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>مشکل</th><th>اثر روی نتایجِ قبلی</th><th>اصلاح</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="wrap-cell">kernelِ <code>mmmKernel_local</code> (برگرفته از AMD APP SDK) ماتریس A را با Y idِ <em>local</em> (<code>lIdY</code>) اندیس‌گذاری می‌کرد، پس هر ردیفِ work-group بعد از اولی، سطرهای اشتباهِ A را می‌خواند.</td>
+            <td class="wrap-cell">benchmark در هر kernel فقط یک ردیفِ work-group اجرا می‌کرد، پس tile size تعدادِ launchها را هم تعیین می‌کرد (۱۶ / ۸ / ۴ launch برای هر GPU در 256³). رتبه‌بندیِ قبلیِ tileها به همان اندازه که tiling را می‌سنجید، سربارِ launch را هم می‌سنجید.</td>
+            <td class="wrap-cell">patch باینریِ پنج‌دستوری روی kernelِ موجود (<code>benchmarks/allreducegemm/native/patch_gidy.py</code>)؛ حالا یک launch کلِ M را پوشش می‌دهد. commit <code>3be1037</code>.</td>
+          </tr>
+          <tr>
+            <td class="wrap-cell"><code>tune_gemm_tile.py</code> بدونِ توجه به <code>--gpus</code> همیشه <code>-gpus=1,2</code> می‌فرستاد.</td>
+            <td class="wrap-cell">همهٔ sweepهای tile روی ۲ GPU اجرا شده بودند.</td>
+            <td class="wrap-cell">لیستِ GPUها از <code>--gpus</code> ساخته می‌شود. commit <code>3be1037</code>.</td>
+          </tr>
+          <tr>
+            <td class="wrap-cell">mccl، command queueِ هر communicator را بدونِ select کردنِ GPUِ آن می‌ساخت، در حالی که هر queue به GPUِ انتخاب‌شدهٔ فعلیِ context متصل می‌شود.</td>
+            <td class="wrap-cell">همهٔ kernelهای push و reduce در Ring All-Reduce (و Ring Broadcast) روی آخرین GPUِ انتخاب‌شده اجرا می‌شدند و حافظهٔ GPUهای دیگر را از طریقِ RDMA می‌خواندند و می‌نوشتند. نتیجه‌ها درست بود، برای همین هیچ testی آن را نگرفت.</td>
+            <td class="wrap-cell">select کردنِ هر GPU پیش از ساختنِ queueِ آن (<code>benchmarks/mccl/allreduce.go</code>). commit <code>141ff40</code>. زمان‌بندیِ DNN trainerهایی که از mccl استفاده می‌کنند هم تغییر می‌کند.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>ابزارهای جدیدی که در ادامه استفاده شده‌اند: benchmark حالا یک <strong>phase split</strong> از زمانِ شبیه‌سازی‌شده بینِ اولین GEMM launch و پایانِ آخرین All-Reduce (که اینجا <em>window</em> نامیده می‌شود) گزارش می‌کند: زمانی که host منتظرِ تمام شدنِ GEMM است، و زمانی که داخلِ فراخوانی‌های All-Reduce می‌گذرد. <code>samples/allreducebench</code> فقط Ring All-Reduce را اجرا می‌کند و ردیابی می‌کند زمانِ هر فراخوانی کجا صرف می‌شود. <code>scripts/sweep_overlap.py</code> گریدهای tile × band × overlap را اجرا می‌کند، و نتیجهٔ همهٔ اجراهای این گزارش با یک CPU reference چک (verify) شده است.</p>
+  </section>
+
+  <section id="allreduce">
+    <h2>۲. زمانِ All-Reduce کجا می‌رود</h2>
+    <p class="lede">link بیشترِ وقت بیکار است. هزینهٔ Ring All-Reduce یک قیمتِ ثابت به ازای هر kernel launch است، به‌علاوهٔ kernelهایی که داده را خیلی کندتر از سرعتِ link جابه‌جا می‌کنند.</p>
+    <p><code>allreducebench</code> برای هر اندازهٔ پیام و هر اندازهٔ chunk یک All-Reduce روی دادهٔ تازه اجرا می‌کند و سه چیز را ردیابی می‌کند: host-to-device copyهای driver، هر kernelِ push یا reduce که روی یک GPU در حال اجراست، و درخواست‌های remote که به RDMA engineِ هر GPU می‌رسند (همراه با تعداد بایت‌ها). «Other» باقی‌ماندهٔ زمان است.</p>
+
+    <figure>
+      <figcaption><strong>Ring All-Reduce روی ۴ GPU، با mccl اصلاح‌شده.</strong> زمانِ شبیه‌سازی‌شدهٔ یک All-Reduce، بر حسبِ اندازهٔ پیام و اندازهٔ chunk (تعداد عنصرِ float32).</figcaption>
+      <div class="legend">
+        <span><i class="bd-setup"></i>Setup copyها پیش از هر launch</span>
+        <span><i class="bd-kern"></i>اجرای kernelهای push/reduce</span>
+        <span><i class="bd-other"></i>Other</span>
+      </div>
+      <div class="chart-scroll" data-chart="breakdown" data-set="after" data-gpus="4"></div>
+    </figure>
+
+    <h3>یک هزینهٔ ثابت به ازای هر launch</h3>
+    <p>برای هر chunk، ring به تعدادِ <span class="n">3(G−1)</span> گام اجرا می‌شود و در هر گام روی هر GPU یک kernel launch دارد: ۶ launch روی ۲ GPU و ۳۶ launch روی ۴ GPU. پیش از هر launch، driver سه host-to-device copy در صف می‌گذارد (code object، kernel arguments و dispatch packet) و هر کدام را با یک latency ثابتِ ۱۴٬۵۰۰ سیکلِ driver مدل می‌کند (<code>WithH2DCycles(14500)</code> در <code>samples/runner/timingplatform.go</code>). در اندازه‌گیری، این می‌شود <span class="n">22.75</span>&nbsp;µs برای هر launch؛ یعنی setup copyها برای هر chunk روی ۲ GPU <span class="n">136.5</span>&nbsp;µs و روی ۴ GPU <span class="n">410</span>&nbsp;µs طول می‌کشند، مستقل از اندازهٔ پیام.</p>
+    <p>یک runtimeِ واقعی code object را فقط یک بار بارگذاری می‌کند و kernel argumentها را از طریقِ mapped memory می‌نویسد. پس این هزینه از مدلِ driver در شبیه‌ساز می‌آید، نه از سخت‌افزاری که مدل می‌شود. نتیجه‌هایی که به آن وابسته‌اند، مثلاً اینکه چند band به‌صرفه است، ممکن است روی GPUِ واقعی صدق نکنند.</p>
+
+    <h3>سرعتِ جابه‌جاییِ داده را kernelها تعیین می‌کنند، نه link</h3>
+    <p>وقتی chunkها بزرگ باشند، زمانِ kernel غالب است. یک All-Reduce چهارمگابایتی روی ۴ GPU با chunkهای 1M، در <span class="n">3,682</span>&nbsp;µs حدودِ <span class="n">24</span>&nbsp;MB را از روی linkها جابه‌جا می‌کند: در مجموع حدودِ <span class="n">6.8</span>&nbsp;GB/s، در حالی که هر کدام از چهار link از نوعِ <span class="en">PCIe 4.0 ×16</span> ظرفیتِ <span class="n">34.4</span>&nbsp;GB/s دارد. ترافیکِ remote فقط در <span class="n">1,362</span>&nbsp;µs از <span class="n">3,267</span>&nbsp;µs اجرای kernelها در جریان است. kernelهای push و reduce تعدادِ ثابتِ ۱٬۰۲۴ thread دارند (۱۶ work-groupِ ۶۴تایی) و هر thread در هر دورِ حلقه فقط یک عنصرِ ۴ بایتی جابه‌جا می‌کند، پس latency-bound هستند.</p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>اندازهٔ chunk در برابرِ زمانِ کلِ All-Reduce (µs)، با mccl اصلاح‌شده. با دو برابر شدنِ تعدادِ chunkها، تعدادِ launchها هم دو برابر می‌شود.</caption>
+        <thead><tr><th>GPUها</th><th>پیام</th><th>chunk 64K</th><th>chunk 256K</th><th>chunk 1M</th><th>بهترین در برابرِ 64K</th></tr></thead>
+        <tbody>
+          <tr><td class="num">2</td><td class="num">1 MB</td><td class="num">1,068</td><td class="num">549</td><td class="num">—</td><td class="num">1.95×</td></tr>
+          <tr><td class="num">2</td><td class="num">4 MB</td><td class="num">4,270</td><td class="num">1,774</td><td class="num">1,847</td><td class="num">2.41×</td></tr>
+          <tr><td class="num">4</td><td class="num">1 MB</td><td class="num">2,475</td><td class="num">1,210</td><td class="num">—</td><td class="num">2.05×</td></tr>
+          <tr><td class="num">4</td><td class="num">4 MB</td><td class="num">9,976</td><td class="num">3,900</td><td class="num">3,682</td><td class="num">2.71×</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>benchmarkِ GEMM این را با <code>-allreduce-chunk</code> در اختیار می‌گذارد (پیش‌فرض ۶۵٬۵۳۶ عنصر). هیچ‌کدام از sweepهای بخش ۳ به آن وابسته نیستند: یک ماتریسِ 256×256 دقیقاً یک chunkِ 64K عنصری است.</p>
+
+    <h3>اثرِ اصلاحِ mccl</h3>
+    <p>پیش از اصلاح، kernelها روی یک GPU اجرا می‌شدند و بیشترِ ترافیکِ link را remote readها تشکیل می‌دادند. بعد از اصلاح، remote readها صفر می‌شوند و remote writeها دقیقاً برابرِ <span class="n">2(G−1)·S</span> هستند: ۲ مگابایت برای پیامِ ۱ مگابایتی روی ۲ GPU، و ۶ مگابایت روی ۴ GPU. روی ۴ GPU، این اصلاح All-Reduce را <span class="n">1.10×</span> تا <span class="n">1.65×</span> سریع‌تر می‌کند. روی ۲ GPU برای پیام‌های کوچک تغییری ندارد و برای پیام‌های بزرگ تا <span class="n">15%</span> کندتر است: ring حالا داده را با remote store جابه‌جا می‌کند، و در این مدل هزینهٔ آن از remote loadهای نسخهٔ تک‌GPU بیشتر است. جدولِ کاملِ قبل و بعد در پیوست آمده است.</p>
+  </section>
+
+  <section id="sweep">
+    <h2>۳. اندازهٔ tile، bandها و overlap</h2>
+    <p class="lede">سؤال: وقتی All-Reduce مربوط به band <var>r</var> با GEMM مربوط به band <var>r</var>+1 overlap شود، آیا بهترین work-group tile عوض می‌شود؟</p>
+    <p>kernel برای هر work-item یک micro-tileِ خروجیِ ثابتِ 4×4 حساب می‌کند، پس یک work-groupِ <var>T</var>×<var>T</var> یک tileِ خروجیِ 4<var>T</var>×4<var>T</var> می‌سازد: <strong>tileSize 4، 8 و 16</strong> یعنی tileهای خروجیِ 16×16، 32×32 و 64×64. مقدارِ ۳۲ امکان‌پذیر نیست (۷۴ VGPR برای هر work-item، هر CU را به ۱۲ wavefront محدود می‌کند).</p>
+    <p><strong>band چیست؟</strong> یک band نواری افقی از سطرهای ماتریسِ خروجیِ C است. هر GPU یک C جزئیِ کامل (M×N) از برشِ K خودش حساب می‌کند و All-Reduce این C های جزئی را جمع می‌زند. به‌جای اینکه کلِ C یک‌جا محاسبه و reduce شود، M به bandهای ۱۲۸ یا ۶۴ سطری تقسیم می‌شود (یا دست‌نخورده می‌ماند). هر band یک GEMM launchِ جدا و یک All-Reduceِ جدا روی <var>rows</var>×N عنصر دارد، که یا پشت‌سرهم اجرا می‌شوند (<em>sequential</em>) یا با overlap. bandها سطرهای متفاوتی از C را می‌نویسند، برای همین GEMMِ یک band و All-Reduceِ band قبلی می‌توانند هم‌زمان اجرا شوند. همهٔ اجراها از Ring All-Reduce با mccl اصلاح‌شده استفاده می‌کنند.</p>
+    <p>در این shapeها M و N کوچک نگه داشته شده‌اند و K بزرگ شده، تا هزینهٔ GEMM و All-Reduce به هم نزدیک باشد. اجراهای یک‌bandی با tileSize 8 نشان می‌دهند هر shape چقدر به این تعادل نزدیک است:</p>
+    <div class="tablewrap">
+      <table>
+        <caption>shapeهای sweep‌شده (M×N×K) و تعادلِ یک‌bandیِ آن‌ها با tileSize 8.</caption>
+        <thead><tr><th>Shape</th><th>GPUها</th><th>K برای هر GPU</th><th>GEMM (µs)</th><th>All-Reduce (µs)</th><th>تعادل</th></tr></thead>
+        <tbody>
+          <tr><td class="num">256×256×1024</td><td class="num">2</td><td class="num">512</td><td class="num">266</td><td class="num">255</td><td>تقریباً برابر</td></tr>
+          <tr><td class="num">256×256×4096</td><td class="num">4</td><td class="num">1024</td><td class="num">530</td><td class="num">654</td><td>تقریباً برابر</td></tr>
+          <tr><td class="num">256×256×4096</td><td class="num">2</td><td class="num">2048</td><td class="num">1,247</td><td class="num">256</td><td>GEMM-heavy، حدودِ ۵ به ۱</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <figure>
+      <figcaption><strong>256×256×1024 روی ۲ GPU.</strong> زمانِ window (GEMM به‌علاوهٔ All-Reduce، µs شبیه‌سازی‌شده) برای هر پیکربندیِ band و هر tile size.</figcaption>
+      <div class="legend">
+        <span><i class="s1"></i>tileSize 4 (خروجیِ 16×16)</span>
+        <span><i class="s2"></i>tileSize 8 (32×32)</span>
+        <span><i class="s3"></i>tileSize 16 (64×64)</span>
+      </div>
+      <div class="chart-scroll" data-chart="grouped" data-set="k1024" data-gpus="2"></div>
+    </figure>
+
+    <figure>
+      <figcaption><strong>256×256×4096 روی ۴ GPU.</strong> همان چیدمان. علامتِ <span style="color: var(--fail); font-weight: 700;">×</span> دو اجرایی را نشان می‌دهد که نتیجه‌شان در verify رد شد.</figcaption>
+      <div class="legend">
+        <span><i class="s1"></i>tileSize 4</span>
+        <span><i class="s2"></i>tileSize 8</span>
+        <span><i class="s3"></i>tileSize 16</span>
+      </div>
+      <div class="chart-scroll" data-chart="grouped" data-set="k4096" data-gpus="4"></div>
+    </figure>
+
+    <figure>
+      <figcaption><strong>256×256×4096 روی ۲ GPU.</strong> GEMM-heavy: All-Reduce فقط یک‌پنجمِ کار است.</figcaption>
+      <div class="legend">
+        <span><i class="s1"></i>tileSize 4</span>
+        <span><i class="s2"></i>tileSize 8</span>
+        <span><i class="s3"></i>tileSize 16</span>
+      </div>
+      <div class="chart-scroll" data-chart="grouped" data-set="k4096" data-gpus="2"></div>
+    </figure>
+
+    <h3>در همهٔ shapeها یک band سریع‌ترین است</h3>
+    <p>هر band اضافه یک ring All-Reduceِ کامل با هزینهٔ ثابتِ launchهای خودش است. در 256×256×1024 روی ۲ GPU، زمانِ All-Reduce برای ۱، ۲ و ۴ band از <span class="n">255</span> به <span class="n">379</span> و بعد <span class="n">659</span>&nbsp;µs می‌رسد، در حالی که حجمِ داده ثابت است. band کردن GEMM را هم کندتر می‌کند: هر band یک launchِ جدا با work-groupهای کمتر است، و زمانِ GEMM با tileSize 8 از <span class="n">266</span> به <span class="n">424</span> و <span class="n">764</span>&nbsp;µs می‌رسد.</p>
+
+    <figure>
+      <figcaption><strong>window صرفِ چه می‌شود: 256×256×1024 روی ۲ GPU، tileSize 4.</strong> با overlap، «waiting on GEMM» آن بخش از زمانِ GEMM است که All-Reduce نتوانسته پنهانش کند.</figcaption>
+      <div class="legend">
+        <span><i class="s1"></i>انتظار برای GEMM</span>
+        <span><i class="ar"></i>داخلِ All-Reduce</span>
+      </div>
+      <div class="chart-scroll" data-chart="phases" data-set="k1024" data-gpus="2" data-tile="4"></div>
+    </figure>
+
+    <h3>overlap بیشترِ چیزی را که band به GEMM اضافه می‌کند پنهان می‌کند</h3>
+    <p>در مقایسه با اجرای پشت‌سرهمِ همان bandها، overlap زمانِ window را در 256×256×1024 به اندازهٔ <span class="n">22%</span> (bandهای ۱۲۸ سطری) و <span class="n">34%</span> (bandهای ۶۴ سطری)، در 256×256×4096 با ۴ GPU به اندازهٔ <span class="n">16%</span>، و در shapeِ GEMM-heavy بین <span class="n">10%</span> تا <span class="n">15%</span> کم می‌کند. با bandهای ۶۴ سطری در 256×256×1024، زمانِ پنهان‌نشدهٔ GEMM از <span class="n">747</span> به <span class="n">263</span>&nbsp;µs می‌رسد، یعنی تقریباً همان زمانِ GEMMِ یک‌bandی. زمانِ All-Reduce با و بدونِ overlap یکسان است (<span class="n">659</span> در برابرِ <span class="n">662</span>&nbsp;µs)، پس GEMMِ هم‌زمان collective را کند نمی‌کند. چیزی که overlap نمی‌تواند جبران کند، هزینهٔ All-Reduceهای اضافه‌ای است که از band بیشتر می‌آید.</p>
+
+    <h3>بهترین tile تابعِ اندازهٔ band است، نه overlap</h3>
+    <div class="tablewrap">
+      <table>
+        <caption>سریع‌ترین tileSize در هر پیکربندی، و اینکه کندترین tileِ verify‌شده چقدر کندتر است.</caption>
+        <thead><tr><th>Shape، GPUها</th><th>یک band</th><th>۱۲۸ سطر، sequential</th><th>۱۲۸ سطر، overlap</th><th>۶۴ سطر، sequential</th><th>۶۴ سطر، overlap</th></tr></thead>
+        <tbody>
+          <tr><td class="num">256×256×1024, 2</td><td class="num">16 (1.6%)</td><td class="num">4 (2.1%)</td><td class="num">4 (1.6%)</td><td class="num">4 (2.7%)</td><td class="num">4 (3.2%)</td></tr>
+          <tr><td class="num">256×256×4096, 4</td><td class="num">16 (2.7%)</td><td class="num">4 (1.9%)</td><td class="num">4 (0.8%)</td><td class="num">4 (2.5%)</td><td>16 (تنها اجرای verify‌شده)</td></tr>
+          <tr><td class="num">256×256×4096, 2</td><td class="num">16 (10.7%)</td><td class="num">4 (8.2%)</td><td class="num">4 (8.9%)</td><td class="num">4 (11.4%)</td><td class="num">4 (13.7%)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>بهترین tile عوض می‌شود، اما عاملش band است، نه overlap: اجراهای sequential و overlap با اندازهٔ band یکسان، tileِ یکسانی را انتخاب می‌کنند. دلیلِ محتمل، میزانِ موازی‌سازی در هر launch است. خروجیِ ۲۵۶ستونی برای کلِ ماتریس فقط ۱۶ work-groupِ 16×16 روی ۶۴ CUِ هر GPU می‌دهد، و یک bandِ ۶۴ سطری با tileSize 16 فقط ۴ work-group دارد. tileهای کوچک‌تر در launchهای کوتاه CUهای بیشتری را مشغول نگه می‌دارند. این اثر در shapeهای متعادل کوچک است (<span class="n">1–3%</span>) و در shapeِ GEMM-heavy بیشترین مقدار را دارد (<span class="n">8–14%</span>). همچنین به نفعِ tileهای بزرگ سوگیری دارد، چون MGPUSim مصرفِ LDS را در occupancy حساب نمی‌کند (بخش ۴).</p>
+
+    <h3>یک سرنخ از sweepِ 512³</h3>
+    <p>sweepِ 512³ پیش از اصلاحِ mccl اجرا شد، پس اعدادِ All-Reduce در آن از حالتِ تک‌GPU می‌آیند و فقط مرجع هستند. با این حال نشان می‌دهد overlap کِی می‌تواند برنده شود. در N = 512، All-Reduceِ کلِ ماتریس از قبل به چهار chunkِ 64K عنصری تقسیم می‌شود، پس bandهای ۱۲۸ و ۲۵۶ سطری هیچ گامِ All-Reduceِ اضافه‌ای نمی‌سازند (All-Reduce حدودِ <span class="n">1,004</span>&nbsp;µs باقی می‌ماند). آنجا bandهای ۱۲۸ سطری با overlap از یک band سریع‌تر بودند: <span class="n">1,167</span> در برابرِ <span class="n">1,196</span>&nbsp;µs با tileSize 8، و <span class="n">1,180</span> در برابرِ <span class="n">1,470</span>&nbsp;µs با tileSize 4. overlap وقتی سود می‌دهد که مرزِ bandها بر chunkهایی منطبق باشد که All-Reduce در هر حال می‌سازد. این آزمایش ارزشِ تکرار با mccl اصلاح‌شده را دارد (بخش ۵).</p>
+  </section>
+
+  <section id="validity">
+    <h2>۴. اعتبارِ نتایج و مسائلِ باز</h2>
+    <div class="callout warn">
+      <span class="tag">مسئلهٔ باز</span>
+      <p><strong>دو اجرای overlap روی ۴ GPU در verify رد می‌شوند.</strong> در 256×256×4096 روی ۴ GPU با bandهای ۶۴ سطری و overlap، tileSizeهای 4 و 8 مقادیری حدوداً دو برابرِ جمعِ مورد انتظار تولید می‌کنند (اولین mismatch در <span class="n">C[96,16]</span>: <span class="n">2,045.5</span> به‌جای <span class="n">1,027.8</span>). همین پیکربندی‌ها بدونِ overlap، با tileSize 16 و روی ۲ GPU درست هستند. علت هنوز مشخص نیست. بینِ kernelهای All-Reduce هیچ cache flush یا invalidationی رخ نمی‌دهد: در این driver، kernel launch هیچ‌وقت L1 را invalidate نمی‌کند و flush فقط هنگامِ host copy به bufferی رخ می‌دهد که dirty علامت خورده باشد. یک scratch bufferِ کهنه (stale) که بینِ bandها دوباره استفاده می‌شود و از طریقِ L1ِ یک GPUِ دیگر خوانده می‌شود با این علامت‌ها جور درمی‌آید، اما تأیید نشده است. تا حلِ این مشکل، نتایجِ overlap روی ۴ GPU را موقت بدانید؛ اجراهای verify‌شدهٔ این گزارش از چکِ کاملِ CPU گذشته‌اند.</p>
+    </div>
+    <ul>
+      <li><strong>مدلِ launch در driver قیمتِ band را تعیین می‌کند.</strong> ۲۲٫۷۵ میکروثانیه برای هر launch از یک latencyِ ثابتِ مدل‌شده برای copy می‌آید، سه copy برای هر launch (بخش ۲). نتیجه‌هایی که launch را با overlap معاوضه می‌کنند به این ثابت وابسته‌اند.</li>
+      <li><strong>LDS در شبیه‌ساز occupancy را محدود نمی‌کند.</strong> بررسیِ منابع در MGPUSim مقدارِ <code>WGGroupSegmentByteSize</code> را می‌خواند که برای این kernel صفر است، پس ۱۶ کیلوبایت LDS برای هر work-group در tileSize 16 هزینه‌ای ندارد. روی سخت‌افزاری با ۶۴ کیلوبایت LDS برای هر CU، این مقدار تعدادِ work-groupهای مقیم را به چهار محدود می‌کرد. نتایج به نفعِ tileهای بزرگ سوگیری دارند.</li>
+      <li><strong>kernel یک باینریِ patch‌شده است.</strong> اصلاحِ <code>mmmKernel_local</code> یک patchِ باینری روی code objectِ اصلی است، چون MGPUSim v3 فقط code object v2 را بارگذاری می‌کند و LLVMِ فعلی دیگر آن را تولید نمی‌کند. بقیهٔ دستورها با نسخهٔ اصلی یکسان‌اند، پس زمان‌بندی با اجراهای قبلی قابل مقایسه می‌ماند.</li>
+      <li><strong>phase timerها زمانِ شبیه‌سازی را از سمتِ host می‌خوانند</strong>، بعد از برگشتنِ هر فراخوانیِ blocking. آن‌ها window را تقسیم می‌کنند، اما kernelهای تکی را ردیابی نمی‌کنند.</li>
+      <li><strong>دامنه.</strong> یک kernelِ GEMM، سه shape، فقط Ring All-Reduce، و پیکربندیِ پیش‌فرضِ R9 Nano. sweepِ 512³ پیش از اصلاح است و فقط برای ۲ GPU کامل است (۳ اجرا از اجراهای ۴ GPU تمام شد).</li>
+    </ul>
+  </section>
+
+  <section id="next">
+    <h2>۵. گام‌های بعدی</h2>
+    <ol>
+      <li>پیدا کردنِ علتِ خطای overlap روی ۴ GPU؛ اول invalidationِ L1 بینِ kernelهای collective بررسی شود.</li>
+      <li>تکرارِ یک shapeِ ۵۱۲ستونی با mccl اصلاح‌شده، با اندازه‌های bandی که بر chunkهای All-Reduce منطبق‌اند. انتظار می‌رود آنجا overlap از یک band بهتر باشد.</li>
+      <li>گره زدنِ اندازهٔ band به اندازهٔ chunk (یک chunk برای هر band)، تا انتخابِ tile و band اندازهٔ پیامِ All-Reduce را هم تعیین کند.</li>
+      <li>سنجیدنِ حساسیتِ نتیجه‌ها به latencyِ هر copy در driver، مثلاً با نصف کردنِ <code>WithH2DCycles</code>، پیش از اینکه آن‌ها را نتیجهٔ سخت‌افزاری بدانیم.</li>
+    </ol>
+  </section>
+
+  <section id="reproduce">
+    <h2>۶. بازتولیدِ نتایج</h2>
+    <p>از ریشهٔ workspace، روی branch <code>All-reduce</code>. خروجی‌های خام در <code>results/</code> ذخیره می‌شوند و هر sweep از جایی که متوقف شده ادامه پیدا می‌کند.</p>
+<pre class="cmd"># All-Reduce breakdown (fixed mccl)
+cd simulator/mgpusim-3.0.3 &amp;&amp; go build -o allreducebench ./samples/allreducebench
+./allreducebench -ring-gpus 2 -out g2.csv     # and -ring-gpus 4
+
+# Tile x band x overlap sweeps
+python3 scripts/sweep_overlap.py --m 256 --k 1024 --n 256 --gpus 2 \
+    --tiles 16,8,4 --bands 0,128,64 --outdir results/overlap_sweep_k1024
+python3 scripts/sweep_overlap.py --m 256 --k 4096 --n 256 --gpus 4,2 \
+    --tiles 16,8,4 --bands 0,128,64 --outdir results/overlap_sweep_k4096
+
+# Everything above, detached and resumable
+scripts/run_pending_experiments.sh</pre>
+  </section>
+
+  <section id="appendix">
+    <h2>پیوست: دادهٔ کامل</h2>
+    <details>
+      <summary>All-Reduce breakdown، قبل و بعد از اصلاحِ mccl</summary>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>GPUها</th><th>پیام</th><th>Chunk</th><th>Launchها</th><th>قبل (µs)</th><th>بعد (µs)</th><th>Setup copyها</th><th>Kernelها</th><th>Link busy</th><th>Remote writes (MB)</th><th>Remote reads قبل (MB)</th></tr></thead>
+          <tbody data-breakdown></tbody>
+        </table>
+      </div>
+    </details>
+    <details>
+      <summary>sweepِ 256×256×1024 (۱۵ اجرا)</summary>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>GPUها</th><th>Tile</th><th>سطرهای band</th><th>Overlap</th><th>Window (µs)</th><th>GEMM wait</th><th>All-Reduce</th><th>Total time</th><th>Verified</th></tr></thead>
+          <tbody data-sweep="k1024"></tbody>
+        </table>
+      </div>
+    </details>
+    <details>
+      <summary>sweepِ 256×256×4096 (۳۰ اجرا)</summary>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>GPUها</th><th>Tile</th><th>سطرهای band</th><th>Overlap</th><th>Window (µs)</th><th>GEMM wait</th><th>All-Reduce</th><th>Total time</th><th>Verified</th></tr></thead>
+          <tbody data-sweep="k4096"></tbody>
+        </table>
+      </div>
+    </details>
+    <details>
+      <summary>sweepِ 512³، پیش از اصلاحِ mccl (۲۴ اجرا، فقط مرجع)</summary>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>GPUها</th><th>Tile</th><th>سطرهای band</th><th>Overlap</th><th>Window (µs)</th><th>GEMM wait</th><th>All-Reduce</th><th>Total time</th><th>Verified</th></tr></thead>
+          <tbody data-sweep="s512"></tbody>
+        </table>
+      </div>
+    </details>
+    <p style="font-size: 0.86rem; color: var(--text-muted);">Window: زمانِ شبیه‌سازی‌شده از اولین GEMM launch تا پایانِ آخرین All-Reduce. Total time: کلِ شبیه‌سازی، شاملِ host-to-device copyهای A و B. همهٔ زمان‌ها شبیه‌سازی‌شده‌اند، نه زمانِ واقعیِ ساعت.</p>
+  </section>
+
+  <footer>
+    <span>حامد علی‌نژاد &middot; HPCAN، دانشگاه صنعتی شریف</span>
+    <span class="en">MGPUSim v3.0.3 / Akita v3.0.0</span>
+  </footer>
+</div>
+
+<script id="report-data" type="application/json">{"k4096":[{"gpus":"2","tile_size":"4","band_rows":"0","overlap":"False","total_time":"0.001818079","kernel_time":"0.001246804","window":"0.001428923","gemm_wait":"0.00117379","allreduce":"0.000255133","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"64","overlap":"False","total_time":"0.003618699","kernel_time":"0.002501064","window":"0.003229544","gemm_wait":"0.002570228","allreduce":"0.000659316","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"64","overlap":"True","total_time":"0.003122371","kernel_time":"0.002414168","window":"0.002733216","gemm_wait":"0.002065876","allreduce":"0.00066734","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"128","overlap":"False","total_time":"0.002271537","kernel_time":"0.001518139","window":"0.001882378","gemm_wait":"0.001503685","allreduce":"0.000378693","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"128","overlap":"True","total_time":"0.002075443","kernel_time":"0.00145852","window":"0.001686284","gemm_wait":"0.001303853","allreduce":"0.000382431","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"0","overlap":"False","total_time":"0.001892349","kernel_time":"0.001321075","window":"0.001503194","gemm_wait":"0.001247465","allreduce":"0.000255729","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"64","overlap":"False","total_time":"0.003986015","kernel_time":"0.002868386","window":"0.003596857","gemm_wait":"0.002937227","allreduce":"0.00065963","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"64","overlap":"True","total_time":"0.003495463","kernel_time":"0.002787255","window":"0.003106305","gemm_wait":"0.002443699","allreduce":"0.000662606","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"128","overlap":"False","total_time":"0.002425487","kernel_time":"0.001672092","window":"0.002036329","gemm_wait":"0.001657454","allreduce":"0.000378875","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"128","overlap":"True","total_time":"0.002226111","kernel_time":"0.00160919","window":"0.001836952","gemm_wait":"0.00145784","allreduce":"0.000379112","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"0","overlap":"False","total_time":"0.001746823","kernel_time":"0.001175548","window":"0.001357667","gemm_wait":"0.001102486","allreduce":"0.000255181","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"64","overlap":"False","total_time":"0.003759415","kernel_time":"0.002641787","window":"0.003370259","gemm_wait":"0.002710865","allreduce":"0.000659394","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"64","overlap":"True","total_time":"0.003266111","kernel_time":"0.002557905","window":"0.002876953","gemm_wait":"0.002211588","allreduce":"0.000665365","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"128","overlap":"False","total_time":"0.002381153","kernel_time":"0.001627756","window":"0.001991994","gemm_wait":"0.001613159","allreduce":"0.000378835","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"128","overlap":"True","total_time":"0.002175623","kernel_time":"0.001558704","window":"0.001786467","gemm_wait":"0.001407748","allreduce":"0.000378719","verified":"True"},{"gpus":"4","tile_size":"4","band_rows":"0","overlap":"False","total_time":"0.001635023","kernel_time":"0.000729249","window":"0.001184867","gemm_wait":"0.000530682","allreduce":"0.000654185","verified":"True"},{"gpus":"4","tile_size":"4","band_rows":"64","overlap":"False","total_time":"0.003676313","kernel_time":"0.001403678","window":"0.003226157","gemm_wait":"0.00130593","allreduce":"0.001920225","verified":"True"},{"gpus":"4","tile_size":"4","band_rows":"64","overlap":"True","total_time":"","kernel_time":"","window":"0.002357452","gemm_wait":"0.000431348","allreduce":"0.001926102","verified":"False"},{"gpus":"4","tile_size":"4","band_rows":"128","overlap":"False","total_time":"0.002259669","kernel_time":"0.000898273","window":"0.001809513","gemm_wait":"0.000750666","allreduce":"0.001058847","verified":"True"},{"gpus":"4","tile_size":"4","band_rows":"128","overlap":"True","total_time":"0.001971175","kernel_time":"0.000842166","window":"0.001521019","gemm_wait":"0.000457903","allreduce":"0.001063115","verified":"True"},{"gpus":"4","tile_size":"8","band_rows":"0","overlap":"False","total_time":"0.001634383","kernel_time":"0.000728604","window":"0.001184227","gemm_wait":"0.000530007","allreduce":"0.00065422","verified":"True"},{"gpus":"4","tile_size":"8","band_rows":"64","overlap":"False","total_time":"0.003723709","kernel_time":"0.001451064","window":"0.00327355","gemm_wait":"0.001352612","allreduce":"0.001920936","verified":"True"},{"gpus":"4","tile_size":"8","band_rows":"64","overlap":"True","total_time":"","kernel_time":"","window":"0.002375403","gemm_wait":"0.000453182","allreduce":"0.001922219","verified":"False"},{"gpus":"4","tile_size":"8","band_rows":"128","overlap":"False","total_time":"0.002269989","kernel_time":"0.000908595","window":"0.001819833","gemm_wait":"0.000761004","allreduce":"0.001058829","verified":"True"},{"gpus":"4","tile_size":"8","band_rows":"128","overlap":"True","total_time":"0.001974751","kernel_time":"0.000845482","window":"0.001524595","gemm_wait":"0.000465158","allreduce":"0.001059437","verified":"True"},{"gpus":"4","tile_size":"16","band_rows":"0","overlap":"False","total_time":"0.001604199","kernel_time":"0.000698423","window":"0.00115404","gemm_wait":"0.000499882","allreduce":"0.000654158","verified":"True"},{"gpus":"4","tile_size":"16","band_rows":"64","overlap":"False","total_time":"0.003756299","kernel_time":"0.001483658","window":"0.00330614","gemm_wait":"0.001385554","allreduce":"0.001920584","verified":"True"},{"gpus":"4","tile_size":"16","band_rows":"64","overlap":"True","total_time":"0.002849931","kernel_time":"0.001380306","window":"0.002399772","gemm_wait":"0.000462889","allreduce":"0.001936881","verified":"True"},{"gpus":"4","tile_size":"16","band_rows":"128","overlap":"False","total_time":"0.002294317","kernel_time":"0.00093291","window":"0.001844158","gemm_wait":"0.000785272","allreduce":"0.001058885","verified":"True"},{"gpus":"4","tile_size":"16","band_rows":"128","overlap":"True","total_time":"0.001984097","kernel_time":"0.000871577","window":"0.001533938","gemm_wait":"0.00047125","allreduce":"0.001062688","verified":"True"}],"k1024":[{"gpus":"2","tile_size":"4","band_rows":"0","overlap":"False","total_time":"0.000681723","kernel_time":"0.000342383","window":"0.000524501","gemm_wait":"0.000269369","allreduce":"0.000255132","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"64","overlap":"False","total_time":"0.001563399","kernel_time":"0.000677704","window":"0.00140618","gemm_wait":"0.000746873","allreduce":"0.000659307","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"64","overlap":"True","total_time":"0.001082187","kernel_time":"0.000605919","window":"0.000924968","gemm_wait":"0.000262843","allreduce":"0.000662125","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"128","overlap":"False","total_time":"0.000952651","kernel_time":"0.00043119","window":"0.000795428","gemm_wait":"0.000416729","allreduce":"0.000378699","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"128","overlap":"True","total_time":"0.000781429","kernel_time":"0.000396444","window":"0.000624206","gemm_wait":"0.000243192","allreduce":"0.000381014","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"0","overlap":"False","total_time":"0.000678079","kernel_time":"0.000338741","window":"0.00052086","gemm_wait":"0.000265648","allreduce":"0.000255212","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"64","overlap":"False","total_time":"0.001580937","kernel_time":"0.000695245","window":"0.001423717","gemm_wait":"0.000764089","allreduce":"0.000659628","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"64","overlap":"True","total_time":"0.001086157","kernel_time":"0.000609885","window":"0.000928935","gemm_wait":"0.000269133","allreduce":"0.000659802","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"128","overlap":"False","total_time":"0.000960059","kernel_time":"0.000438599","window":"0.000802839","gemm_wait":"0.00042388","allreduce":"0.000378959","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"128","overlap":"True","total_time":"0.000788363","kernel_time":"0.00039808","window":"0.00063114","gemm_wait":"0.00025222","allreduce":"0.000378919","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"0","overlap":"False","total_time":"0.000673399","kernel_time":"0.00033406","window":"0.000516179","gemm_wait":"0.000260998","allreduce":"0.000255181","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"64","overlap":"False","total_time":"0.001601807","kernel_time":"0.000716116","window":"0.001444587","gemm_wait":"0.000785197","allreduce":"0.00065939","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"64","overlap":"True","total_time":"0.001112135","kernel_time":"0.000635867","window":"0.000954915","gemm_wait":"0.000294247","allreduce":"0.000660668","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"128","overlap":"False","total_time":"0.000969349","kernel_time":"0.000447888","window":"0.000812126","gemm_wait":"0.000433299","allreduce":"0.000378827","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"128","overlap":"True","total_time":"0.000791623","kernel_time":"0.000406637","window":"0.0006344","gemm_wait":"0.000255979","allreduce":"0.000378421","verified":"True"}],"s512":[{"gpus":"2","tile_size":"4","band_rows":"0","overlap":"False","total_time":"0.001657329","kernel_time":"0.000878535","window":"0.001470122","gemm_wait":"0.000471098","allreduce":"0.000999024","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"64","overlap":"False","total_time":"0.002727511","kernel_time":"0.001084275","window":"0.002541223","gemm_wait":"0.000947252","allreduce":"0.001593971","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"64","overlap":"True","total_time":"0.001933915","kernel_time":"0.000943675","window":"0.001747598","gemm_wait":"0.00015778","allreduce":"0.001589818","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"128","overlap":"False","total_time":"0.001718635","kernel_time":"0.000802967","window":"0.001531444","gemm_wait":"0.000526889","allreduce":"0.001004555","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"128","overlap":"True","total_time":"0.001367621","kernel_time":"0.000717343","window":"0.001180414","gemm_wait":"0.000172304","allreduce":"0.00100811","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"256","overlap":"False","total_time":"0.001646753","kernel_time":"0.000822332","window":"0.001459547","gemm_wait":"0.000455646","allreduce":"0.001003901","verified":"True"},{"gpus":"2","tile_size":"4","band_rows":"256","overlap":"True","total_time":"0.001455105","kernel_time":"0.000736131","window":"0.001267898","gemm_wait":"0.00026032","allreduce":"0.001007578","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"0","overlap":"False","total_time":"0.001383007","kernel_time":"0.000604216","window":"0.001195801","gemm_wait":"0.000191894","allreduce":"0.001003907","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"64","overlap":"False","total_time":"0.002720889","kernel_time":"0.001077649","window":"0.002534595","gemm_wait":"0.000943886","allreduce":"0.001590709","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"64","overlap":"True","total_time":"0.001938347","kernel_time":"0.000905782","window":"0.00175203","gemm_wait":"0.000161151","allreduce":"0.001590878","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"128","overlap":"False","total_time":"0.001689583","kernel_time":"0.000773923","window":"0.001502393","gemm_wait":"0.000498276","allreduce":"0.001004117","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"128","overlap":"True","total_time":"0.001353815","kernel_time":"0.000674903","window":"0.001166608","gemm_wait":"0.00016185","allreduce":"0.001004756","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"256","overlap":"False","total_time":"0.001478693","kernel_time":"0.000654272","window":"0.001291486","gemm_wait":"0.000287793","allreduce":"0.001003693","verified":"True"},{"gpus":"2","tile_size":"8","band_rows":"256","overlap":"True","total_time":"0.001358653","kernel_time":"0.000605718","window":"0.001171446","gemm_wait":"0.000168899","allreduce":"0.001002547","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"0","overlap":"False","total_time":"0.001359707","kernel_time":"0.00058092","window":"0.0011725","gemm_wait":"0.000168561","allreduce":"0.001003939","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"64","overlap":"False","total_time":"0.002757077","kernel_time":"0.00111385","window":"0.002570792","gemm_wait":"0.000982687","allreduce":"0.001588105","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"64","overlap":"True","total_time":"0.001937375","kernel_time":"0.000930013","window":"0.001751058","gemm_wait":"0.000163489","allreduce":"0.001587568","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"128","overlap":"False","total_time":"0.001702935","kernel_time":"0.000787274","window":"0.001515745","gemm_wait":"0.000514875","allreduce":"0.00100087","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"128","overlap":"True","total_time":"0.001350991","kernel_time":"0.000649239","window":"0.001163784","gemm_wait":"0.000163572","allreduce":"0.001000211","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"256","overlap":"False","total_time":"0.001471635","kernel_time":"0.000647215","window":"0.001284429","gemm_wait":"0.000282981","allreduce":"0.001001448","verified":"True"},{"gpus":"2","tile_size":"16","band_rows":"256","overlap":"True","total_time":"0.001352991","kernel_time":"0.000579518","window":"0.001165784","gemm_wait":"0.000165227","allreduce":"0.001000557","verified":"True"},{"gpus":"4","tile_size":"4","band_rows":"0","overlap":"False","total_time":"0.003624435","kernel_time":"0.001687866","window":"0.003373002","gemm_wait":"0.000270999","allreduce":"0.003102003","verified":"True"},{"gpus":"4","tile_size":"4","band_rows":"64","overlap":"False","total_time":"0.005977049","kernel_time":"0.002084726","window":"0.005729709","gemm_wait":"0.000683099","allreduce":"0.005046606","verified":"True"},{"gpus":"4","tile_size":"4","band_rows":"64","overlap":"True","total_time":"0.005364625","kernel_time":"0.001954685","window":"0.005117309","gemm_wait":"0.000105004","allreduce":"0.005012297","verified":"True"}],"before":[{"gpus":"2","size_elems":"1024","chunk_elems":"65536","kernel_launches":"6","total":"0.000152930","h2d_busy":"0.000136494","gpu_kernel_busy":"0.000014675","remote_busy":"0.000001989","remote_write_bytes":"6144","remote_read_bytes":"12800","gpus_running_kernels":"1","verified":"true"},{"gpus":"2","size_elems":"16384","chunk_elems":"65536","kernel_launches":"6","total":"0.000180622","h2d_busy":"0.000136494","gpu_kernel_busy":"0.000042367","remote_busy":"0.000012487","remote_write_bytes":"98304","remote_read_bytes":"135680","gpus_running_kernels":"1","verified":"true"},{"gpus":"2","size_elems":"65536","chunk_elems":"65536","kernel_launches":"6","total":"0.000272775","h2d_busy":"0.000136494","gpu_kernel_busy":"0.000134520","remote_busy":"0.000050243","remote_write_bytes":"393216","remote_read_bytes":"528896","gpus_running_kernels":"1","verified":"true"},{"gpus":"2","size_elems":"262144","chunk_elems":"65536","kernel_launches":"24","total":"0.000964916","h2d_busy":"0.000545977","gpu_kernel_busy":"0.000411895","remote_busy":"0.000181542","remote_write_bytes":"1572864","remote_read_bytes":"2115584","gpus_running_kernels":"1","verified":"true"},{"gpus":"2","size_elems":"262144","chunk_elems":"262144","kernel_launches":"6","total":"0.000472825","h2d_busy":"0.000136494","gpu_kernel_busy":"0.000334570","remote_busy":"0.000200790","remote_write_bytes":"1572864","remote_read_bytes":"2101760","gpus_running_kernels":"1","verified":"true"},{"gpus":"2","size_elems":"1048576","chunk_elems":"65536","kernel_launches":"96","total":"0.003951380","h2d_busy":"0.002183914","gpu_kernel_busy":"0.001739290","remote_busy":"0.000796529","remote_write_bytes":"6291456","remote_read_bytes":"8462336","gpus_running_kernels":"1","verified":"true"},{"gpus":"2","size_elems":"1048576","chunk_elems":"262144","kernel_launches":"24","total":"0.001635508","h2d_busy":"0.000545978","gpu_kernel_busy":"0.001082486","remote_busy":"0.000789006","remote_write_bytes":"6291456","remote_read_bytes":"8407040","gpus_running_kernels":"1","verified":"true"},{"gpus":"2","size_elems":"1048576","chunk_elems":"1048576","kernel_launches":"6","total":"0.001577930","h2d_busy":"0.000136496","gpu_kernel_busy":"0.001439672","remote_busy":"0.000949092","remote_write_bytes":"6291456","remote_read_bytes":"8393216","gpus_running_kernels":"1","verified":"true"},{"gpus":"4","size_elems":"1024","chunk_elems":"65536","kernel_launches":"36","total":"0.000493404","h2d_busy":"0.000409893","gpu_kernel_busy":"0.000078261","remote_busy":"0.000013358","remote_write_bytes":"27648","remote_read_bytes":"79488","gpus_running_kernels":"1","verified":"true"},{"gpus":"4","size_elems":"16384","chunk_elems":"65536","kernel_launches":"36","total":"0.000562375","h2d_busy":"0.000410474","gpu_kernel_busy":"0.000146651","remote_busy":"0.000059849","remote_write_bytes":"442368","remote_read_bytes":"635904","gpus_running_kernels":"1","verified":"true"},{"gpus":"4","size_elems":"65536","chunk_elems":"65536","kernel_launches":"36","total":"0.000805340","h2d_busy":"0.000409890","gpu_kernel_busy":"0.000390201","remote_busy":"0.000226081","remote_write_bytes":"1769472","remote_read_bytes":"2405376","gpus_running_kernels":"1","verified":"true"},{"gpus":"4","size_elems":"262144","chunk_elems":"65536","kernel_launches":"144","total":"0.003095556","h2d_busy":"0.001639566","gpu_kernel_busy":"0.001434992","remote_busy":"0.000933985","remote_write_bytes":"7077888","remote_read_bytes":"9621504","gpus_running_kernels":"1","verified":"true"},{"gpus":"4","size_elems":"262144","chunk_elems":"262144","kernel_launches":"36","total":"0.001695265","h2d_busy":"0.000409890","gpu_kernel_busy":"0.001280126","remote_busy":"0.000849918","remote_write_bytes":"7077888","remote_read_bytes":"9483264","gpus_running_kernels":"1","verified":"true"},{"gpus":"4","size_elems":"1048576","chunk_elems":"65536","kernel_launches":"576","total":"0.012470712","h2d_busy":"0.006558262","gpu_kernel_busy":"0.005828456","remote_busy":"0.003844557","remote_write_bytes":"28311552","remote_read_bytes":"38486016","gpus_running_kernels":"1","verified":"true"},{"gpus":"4","size_elems":"1048576","chunk_elems":"262144","kernel_launches":"144","total":"0.006423907","h2d_busy":"0.001639572","gpu_kernel_busy":"0.004763333","remote_busy":"0.003870628","remote_write_bytes":"28311552","remote_read_bytes":"37933056","gpus_running_kernels":"1","verified":"true"},{"gpus":"4","size_elems":"1048576","chunk_elems":"1048576","kernel_launches":"36","total":"0.005411717","h2d_busy":"0.000409891","gpu_kernel_busy":"0.004996576","remote_busy":"0.003508297","remote_write_bytes":"28311552","remote_read_bytes":"37794816","gpus_running_kernels":"1","verified":"true"}],"after":[{"gpus":"2","size_elems":"1024","chunk_elems":"65536","kernel_launches":"6","total":"0.000149824","h2d_busy":"0.000136496","gpu_kernel_busy":"0.000011567","remote_busy":"0.000000274","remote_write_bytes":"8192","remote_read_bytes":"0","gpus_running_kernels":"2","verified":"true"},{"gpus":"2","size_elems":"16384","chunk_elems":"65536","kernel_launches":"6","total":"0.000179665","h2d_busy":"0.000136495","gpu_kernel_busy":"0.000041409","remote_busy":"0.000008445","remote_write_bytes":"131072","remote_read_bytes":"0","gpus_running_kernels":"2","verified":"true"},{"gpus":"2","size_elems":"65536","chunk_elems":"65536","kernel_launches":"6","total":"0.000282454","h2d_busy":"0.000136495","gpu_kernel_busy":"0.000144198","remote_busy":"0.000020610","remote_write_bytes":"524288","remote_read_bytes":"0","gpus_running_kernels":"2","verified":"true"},{"gpus":"2","size_elems":"262144","chunk_elems":"65536","kernel_launches":"24","total":"0.001067799","h2d_busy":"0.000545977","gpu_kernel_busy":"0.000514777","remote_busy":"0.000062573","remote_write_bytes":"2097152","remote_read_bytes":"0","gpus_running_kernels":"2","verified":"true"},{"gpus":"2","size_elems":"262144","chunk_elems":"262144","kernel_launches":"6","total":"0.000548926","h2d_busy":"0.000136495","gpu_kernel_busy":"0.000410671","remote_busy":"0.000079429","remote_write_bytes":"2097152","remote_read_bytes":"0","gpus_running_kernels":"2","verified":"true"},{"gpus":"2","size_elems":"1048576","chunk_elems":"65536","kernel_launches":"96","total":"0.004269881","h2d_busy":"0.002183911","gpu_kernel_busy":"0.002057793","remote_busy":"0.000250650","remote_write_bytes":"8388608","remote_read_bytes":"0","gpus_running_kernels":"2","verified":"true"},{"gpus":"2","size_elems":"1048576","chunk_elems":"262144","kernel_launches":"24","total":"0.001773768","h2d_busy":"0.000545980","gpu_kernel_busy":"0.001220743","remote_busy":"0.000292770","remote_write_bytes":"8388608","remote_read_bytes":"0","gpus_running_kernels":"2","verified":"true"},{"gpus":"2","size_elems":"1048576","chunk_elems":"1048576","kernel_launches":"6","total":"0.001846650","h2d_busy":"0.000136496","gpu_kernel_busy":"0.001708393","remote_busy":"0.000383699","remote_write_bytes":"8388608","remote_read_bytes":"0","gpus_running_kernels":"2","verified":"true"},{"gpus":"4","size_elems":"1024","chunk_elems":"65536","kernel_launches":"36","total":"0.000447383","h2d_busy":"0.000409890","gpu_kernel_busy":"0.000032244","remote_busy":"0.000000874","remote_write_bytes":"24576","remote_read_bytes":"0","gpus_running_kernels":"4","verified":"true"},{"gpus":"4","size_elems":"16384","chunk_elems":"65536","kernel_launches":"36","total":"0.000496363","h2d_busy":"0.000409892","gpu_kernel_busy":"0.000081224","remote_busy":"0.000018650","remote_write_bytes":"393216","remote_read_bytes":"0","gpus_running_kernels":"4","verified":"true"},{"gpus":"4","size_elems":"65536","chunk_elems":"65536","kernel_launches":"36","total":"0.000671209","h2d_busy":"0.000409893","gpu_kernel_busy":"0.000256067","remote_busy":"0.000046925","remote_write_bytes":"1572864","remote_read_bytes":"0","gpus_running_kernels":"4","verified":"true"},{"gpus":"4","size_elems":"262144","chunk_elems":"65536","kernel_launches":"144","total":"0.002475324","h2d_busy":"0.001639567","gpu_kernel_busy":"0.000814760","remote_busy":"0.000201728","remote_write_bytes":"6291456","remote_read_bytes":"0","gpus_running_kernels":"4","verified":"true"},{"gpus":"4","size_elems":"262144","chunk_elems":"262144","kernel_launches":"36","total":"0.001209587","h2d_busy":"0.000409894","gpu_kernel_busy":"0.000794446","remote_busy":"0.000291199","remote_write_bytes":"6291456","remote_read_bytes":"0","gpus_running_kernels":"4","verified":"true"},{"gpus":"4","size_elems":"1048576","chunk_elems":"65536","kernel_launches":"576","total":"0.009975844","h2d_busy":"0.006558277","gpu_kernel_busy":"0.003333601","remote_busy":"0.000808044","remote_write_bytes":"25165824","remote_read_bytes":"0","gpus_running_kernels":"4","verified":"true"},{"gpus":"4","size_elems":"1048576","chunk_elems":"262144","kernel_launches":"144","total":"0.003899565","h2d_busy":"0.001639573","gpu_kernel_busy":"0.002239003","remote_busy":"0.001111575","remote_write_bytes":"25165824","remote_read_bytes":"0","gpus_running_kernels":"4","verified":"true"},{"gpus":"4","size_elems":"1048576","chunk_elems":"1048576","kernel_launches":"36","total":"0.003682019","h2d_busy":"0.000409894","gpu_kernel_busy":"0.003266878","remote_busy":"0.001361925","remote_write_bytes":"25165824","remote_read_bytes":"0","gpus_running_kernels":"4","verified":"true"}]}</script>
+<script>
+(function () {
+  const DATA = JSON.parse(document.getElementById('report-data').textContent);
+  const TILES = [4, 8, 16];
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  const us = (s) => +s * 1e6;
+  const f0 = (v) => Math.round(v).toLocaleString('en-US');
+
+  const el = (tag, attrs, parent) => {
+    const e = document.createElementNS(SVGNS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+    if (parent) parent.appendChild(e);
+    return e;
+  };
+  const text = (parent, x, y, str, cls, anchor) => {
+    const t = el('text', { x, y, class: cls || 'tick', 'text-anchor': anchor || 'start' }, parent);
+    t.textContent = str;
+    return t;
+  };
+
+  const ALL_CONFIGS = [
+    { label: '1 band', band: '0', ov: 'False' },
+    { label: '256 rows', sub: 'sequential', band: '256', ov: 'False' },
+    { label: '256 rows', sub: 'overlap', band: '256', ov: 'True' },
+    { label: '128 rows', sub: 'sequential', band: '128', ov: 'False' },
+    { label: '128 rows', sub: 'overlap', band: '128', ov: 'True' },
+    { label: '64 rows', sub: 'sequential', band: '64', ov: 'False' },
+    { label: '64 rows', sub: 'overlap', band: '64', ov: 'True' },
+  ];
+  const cfgName = (c) => c.sub ? `${c.label}, ${c.sub}` : c.label;
+
+  const findRun = (rows, g, t, c) => rows.find((r) =>
+    r.gpus === String(g) && r.tile_size === String(t) &&
+    r.band_rows === c.band && r.overlap === c.ov);
+
+  // ---- tooltip --------------------------------------------------------------
+  const tip = document.createElement('div');
+  tip.className = 'viz-tip';
+  tip.setAttribute('role', 'status');
+  document.body.appendChild(tip);
+  function showTip(evt, lines) {
+    tip.replaceChildren();
+    lines.forEach(([value, label], i) => {
+      const row = document.createElement('div');
+      if (i > 0) row.className = 'sub';
+      const v = document.createElement('strong');
+      v.textContent = value;
+      const l = document.createElement('span');
+      l.textContent = ' ' + label;
+      row.append(v, l);
+      tip.appendChild(row);
+    });
+    tip.style.opacity = '1';
+    let x = evt.clientX, y = evt.clientY;
+    if (x === undefined) {
+      const r = evt.target.getBoundingClientRect();
+      x = r.left + r.width / 2; y = r.top;
+    }
+    const w = tip.offsetWidth;
+    tip.style.left = Math.min(window.innerWidth - w - 8, Math.max(8, x + 12)) + 'px';
+    tip.style.top = Math.max(8, y + window.scrollY - tip.offsetHeight - 12) + 'px';
+  }
+  const hideTip = () => { tip.style.opacity = '0'; };
+  function hoverable(node, lines, mark) {
+    node.setAttribute('tabindex', '0');
+    node.setAttribute('role', 'img');
+    node.setAttribute('aria-label', lines.map((l) => l.join(' ')).join('; '));
+    const on = (e) => { showTip(e, lines); if (mark) mark.forEach((m) => m.classList.add('lift')); };
+    const off = () => { hideTip(); if (mark) mark.forEach((m) => m.classList.remove('lift')); };
+    node.addEventListener('pointermove', on);
+    node.addEventListener('pointerleave', off);
+    node.addEventListener('focus', on);
+    node.addEventListener('blur', off);
+  }
+
+  function colPath(x, yTop, w, yBase) {
+    const r = Math.max(0, Math.min(4, (yBase - yTop) / 2, w / 2));
+    return `M${x},${yBase}V${yTop + r}Q${x},${yTop} ${x + r},${yTop}` +
+      `H${x + w - r}Q${x + w},${yTop} ${x + w},${yTop + r}V${yBase}Z`;
+  }
+  function barPath(x0, x1, y, h, roundEnd) {
+    const r = roundEnd ? Math.max(0, Math.min(4, (x1 - x0) / 2, h / 2)) : 0;
+    return `M${x0},${y}H${x1 - r}Q${x1},${y} ${x1},${y + r}` +
+      `V${y + h - r}Q${x1},${y + h} ${x1 - r},${y + h}H${x0}Z`;
+  }
+  function niceMax(v) {
+    const p = Math.pow(10, Math.floor(Math.log10(v)));
+    for (const m of [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (m * p >= v) return m * p;
+    return 10 * p;
+  }
+
+  // ---- grouped columns: GEMM + All-Reduce window by configuration --------------
+  function groupedChart(host) {
+    const rows = DATA[host.dataset.set];
+    const g = host.dataset.gpus;
+    const configs = ALL_CONFIGS.filter((c) => TILES.some((t) => findRun(rows, g, t, c)));
+    const W = 720, H = 300, m = { l: 72, r: 8, t: 14, b: 50 };
+    const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, class: 'viz' });
+    const vals = [];
+    configs.forEach((c) => TILES.forEach((t) => {
+      const r = findRun(rows, g, t, c);
+      if (r && r.verified === 'True') vals.push(us(r.window));
+    }));
+    const max = niceMax(Math.max(...vals));
+    const ih = H - m.t - m.b, iw = W - m.l - m.r;
+    const y = (v) => m.t + ih - (v / max) * ih;
+    for (let i = 0; i <= 5; i++) {
+      const v = (max / 5) * i;
+      el('line', { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), class: 'grid' }, svg);
+      text(svg, m.l - 8, y(v) + 4, f0(v) + (i === 5 ? ' µs' : ''), 'tick', 'end');
+    }
+    const slot = iw / configs.length;
+    const bw = Math.min(22, (slot - 16) / 3 - 2);
+    configs.forEach((c, ci) => {
+      const gx = m.l + ci * slot + (slot - (3 * bw + 4)) / 2;
+      TILES.forEach((t, ti) => {
+        const r = findRun(rows, g, t, c);
+        if (!r) return;
+        const x = gx + ti * (bw + 2);
+        if (r.verified !== 'True') {
+          text(svg, x + bw / 2, y(0) - 6, '×', 'fail-mark', 'middle');
+          const hit = el('rect', { x: x - 1, y: m.t, width: bw + 2, height: ih, class: 'hitbox' }, svg);
+          hoverable(hit, [['failed', `tileSize ${t} · ${cfgName(c)}`], ['result did not verify', '']]);
+          return;
+        }
+        const v = us(r.window);
+        const p = el('path', { d: colPath(x, y(v), bw, y(0)), class: `s${ti + 1}` }, svg);
+        const hit = el('rect', { x: x - 1, y: m.t, width: bw + 2, height: ih, class: 'hitbox' }, svg);
+        hoverable(hit, [
+          [`${f0(v)} µs`, `tileSize ${t} · ${cfgName(c)}`],
+          [`${f0(us(r.gemm_wait))} µs`, 'waiting on GEMM'],
+          [`${f0(us(r.allreduce))} µs`, 'inside All-Reduce'],
+        ], [p]);
+      });
+      const cx = m.l + ci * slot + slot / 2;
+      text(svg, cx, H - m.b + 18, c.label, 'tick', 'middle');
+      if (c.sub) text(svg, cx, H - m.b + 33, c.sub, 'tick muted', 'middle');
+    });
+    el('line', { x1: m.l, x2: W - m.r, y1: y(0), y2: y(0), class: 'axis' }, svg);
+    host.appendChild(svg);
+  }
+
+  // ---- stacked bars: GEMM wait vs All-Reduce, one tile ------------------------
+  function phaseChart(host) {
+    const rows = DATA[host.dataset.set];
+    const g = host.dataset.gpus, t = +host.dataset.tile, ti = TILES.indexOf(t);
+    const items = ALL_CONFIGS
+      .map((c) => ({ c, r: findRun(rows, g, t, c) }))
+      .filter((d) => d.r && d.r.verified === 'True')
+      .map((d) => ({ c: d.c, gemm: us(d.r.gemm_wait), ar: us(d.r.allreduce) }));
+    const W = 720, rowH = 22, gap = 10, m = { l: 150, r: 70, t: 6, b: 28 };
+    const H = m.t + m.b + items.length * (rowH + gap) - gap;
+    const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, class: 'viz' });
+    const max = niceMax(Math.max(...items.map((d) => d.gemm + d.ar)));
+    const iw = W - m.l - m.r;
+    const x = (v) => m.l + (v / max) * iw;
+    for (let i = 0; i <= 4; i++) {
+      const v = (max / 4) * i;
+      el('line', { x1: x(v), x2: x(v), y1: m.t, y2: H - m.b, class: 'grid' }, svg);
+      text(svg, x(v), H - m.b + 18, f0(v) + (i === 4 ? ' µs' : ''), 'tick', 'middle');
+    }
+    items.forEach((d, i) => {
+      const yy = m.t + i * (rowH + gap);
+      text(svg, m.l - 10, yy + rowH / 2 + 4, cfgName(d.c), 'tick', 'end');
+      const xg = x(d.gemm);
+      const a = el('path', { d: barPath(x(0), Math.max(x(0) + 1, xg - 1), yy, rowH, false), class: `s${ti + 1}` }, svg);
+      const b = el('path', { d: barPath(xg + 1, x(d.gemm + d.ar), yy, rowH, true), class: 'ar' }, svg);
+      text(svg, x(d.gemm + d.ar) + 6, yy + rowH / 2 + 4, f0(d.gemm + d.ar), 'tick');
+      const hit = el('rect', { x: m.l, y: yy - gap / 2, width: iw + m.r, height: rowH + gap, class: 'hitbox' }, svg);
+      hoverable(hit, [
+        [`${f0(d.gemm + d.ar)} µs`, cfgName(d.c)],
+        [`${f0(d.gemm)} µs`, 'waiting on GEMM'],
+        [`${f0(d.ar)} µs`, 'inside All-Reduce'],
+      ], [a, b]);
+    });
+    el('line', { x1: x(0), x2: x(0), y1: m.t, y2: H - m.b, class: 'axis' }, svg);
+    host.appendChild(svg);
+  }
+
+  // ---- stacked bars: where one All-Reduce's time goes ------------------------
+  const kb = (elems) => {
+    const b = +elems * 4;
+    return b >= 1048576 ? `${b / 1048576} MB` : `${b / 1024} KB`;
+  };
+  const kElems = (e) => (+e >= 1048576 ? `${+e / 1048576}M` : `${+e / 1024}K`);
+  function breakdownChart(host) {
+    const rows = DATA[host.dataset.set].filter((r) => r.gpus === host.dataset.gpus);
+    const W = 720, rowH = 22, gap = 10, m = { l: 150, r: 70, t: 6, b: 28 };
+    const H = m.t + m.b + rows.length * (rowH + gap) - gap;
+    const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, class: 'viz' });
+    const items = rows.map((r) => {
+      const total = us(r.total), setup = us(r.h2d_busy), kern = us(r.gpu_kernel_busy);
+      return { r, total, setup, kern, other: Math.max(0, total - setup - kern) };
+    });
+    const max = niceMax(Math.max(...items.map((d) => d.total)));
+    const iw = W - m.l - m.r;
+    const x = (v) => m.l + (v / max) * iw;
+    for (let i = 0; i <= 4; i++) {
+      const v = (max / 4) * i;
+      el('line', { x1: x(v), x2: x(v), y1: m.t, y2: H - m.b, class: 'grid' }, svg);
+      text(svg, x(v), H - m.b + 18, f0(v) + (i === 4 ? ' µs' : ''), 'tick', 'middle');
+    }
+    items.forEach((d, i) => {
+      const yy = m.t + i * (rowH + gap);
+      text(svg, m.l - 10, yy + rowH / 2 + 4, `${kb(d.r.size_elems)} · ${kElems(d.r.chunk_elems)} chunk`, 'tick', 'end');
+      let x0 = x(0);
+      const segs = [['setup', d.setup], ['kern', d.kern], ['other', d.other]];
+      const marks = [];
+      segs.forEach(([cls, v], si) => {
+        if (v <= 0) return;
+        const x1 = x0 + (v / max) * iw;
+        const last = si === segs.length - 1 || segs.slice(si + 1).every(([, w]) => w <= 0);
+        marks.push(el('path', { d: barPath(x0 + (si ? 1 : 0), Math.max(x0 + 1, x1 - (last ? 0 : 1)), yy, rowH, last), class: `bd-${cls}` }, svg));
+        x0 = x1;
+      });
+      text(svg, x(d.total) + 6, yy + rowH / 2 + 4, f0(d.total), 'tick');
+      const hit = el('rect', { x: m.l, y: yy - gap / 2, width: iw + m.r, height: rowH + gap, class: 'hitbox' }, svg);
+      hoverable(hit, [
+        [`${f0(d.total)} µs`, `${kb(d.r.size_elems)} message, ${kElems(d.r.chunk_elems)}-element chunks, ${d.r.kernel_launches} launches`],
+        [`${f0(d.setup)} µs`, 'setup copies'],
+        [`${f0(d.kern)} µs`, 'push/reduce kernels running'],
+        [`${f0(d.other)} µs`, 'other'],
+      ], marks);
+    });
+    el('line', { x1: x(0), x2: x(0), y1: m.t, y2: H - m.b, class: 'axis' }, svg);
+    host.appendChild(svg);
+  }
+
+  document.querySelectorAll('[data-chart]').forEach((host) => {
+    ({ grouped: groupedChart, phases: phaseChart, breakdown: breakdownChart })[host.dataset.chart](host);
+  });
+
+  // ---- full data tables ----------------------------------------------------
+  function fill(tbody, cells) {
+    const tr = document.createElement('tr');
+    cells.forEach(([v, num]) => {
+      const td = document.createElement('td');
+      if (num) td.className = 'num';
+      td.textContent = v;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  }
+  document.querySelectorAll('tbody[data-sweep]').forEach((tbody) => {
+    DATA[tbody.dataset.sweep].forEach((r) => {
+      const ok = r.verified === 'True';
+      fill(tbody, [
+        [r.gpus, true], [r.tile_size, true],
+        [r.band_rows === '0' ? 'all of M' : r.band_rows, true],
+        [r.band_rows === '0' ? '—' : (r.overlap === 'True' ? 'on' : 'off'), false],
+        [ok ? f0(us(r.window)) : '—', true], [ok ? f0(us(r.gemm_wait)) : '—', true],
+        [ok ? f0(us(r.allreduce)) : '—', true], [ok ? f0(us(r.total_time)) : '—', true],
+        [ok ? 'yes' : 'FAILED', false],
+      ]);
+    });
+  });
+  document.querySelectorAll('tbody[data-breakdown]').forEach((tbody) => {
+    const before = DATA.before;
+    DATA.after.forEach((r) => {
+      const b = before.find((x) => x.gpus === r.gpus && x.size_elems === r.size_elems && x.chunk_elems === r.chunk_elems);
+      fill(tbody, [
+        [r.gpus, true], [kb(r.size_elems), true], [kElems(r.chunk_elems), true],
+        [r.kernel_launches, true],
+        [b ? f0(us(b.total)) : '—', true], [f0(us(r.total)), true],
+        [f0(us(r.h2d_busy)), true], [f0(us(r.gpu_kernel_busy)), true],
+        [f0(us(r.remote_busy)), true],
+        [(+r.remote_write_bytes / 1048576).toFixed(2), true],
+        [b ? (+b.remote_read_bytes / 1048576).toFixed(2) : '—', true],
+      ]);
+    });
+  });
+})();
+
+</script>
+</body>
+</html>
