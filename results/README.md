@@ -18,6 +18,8 @@ Layout: one subfolder per experiment.
 - `stage1_minrepro/`, `stage1_fixed/`: Stage 1 of the follow-up (the 4-GPU overlap
   correctness bug). `run*.sh` in each folder reproduce the runs; `stage1_fixed/` was run
   with the L1 acquire on (the default since then).
+- `stage2_h2d/`: Stage 2, sensitivity to the driver's per-copy latency (`-h2d-cycles`
+  14500 / 7250 / 1450): `gemm_h<cycles>/` sweeps and `allreduce/h<cycles>.csv`.
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

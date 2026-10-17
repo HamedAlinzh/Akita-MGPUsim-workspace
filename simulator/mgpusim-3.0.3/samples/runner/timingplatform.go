@@ -32,6 +32,7 @@ type R9NanoPlatformBuilder struct {
 	log2PageSize                       uint64
 	l1CacheSize                        uint64
 	l1AcquireOnLaunch                  bool
+	h2dCycles                          int
 	l2CacheSize                        uint64
 	dramSize                           uint64
 
@@ -56,6 +57,7 @@ func MakeR9NanoBuilder() R9NanoPlatformBuilder {
 		log2PageSize:      12,
 		l1CacheSize:       16 * mem.KB,
 		l1AcquireOnLaunch: true,
+		h2dCycles:         14500,
 		l2CacheSize:       2 * mem.MB,
 		dramSize:          4 * mem.GB,
 		traceVisStartTime: -1,
@@ -78,6 +80,14 @@ func (b R9NanoPlatformBuilder) WithL1AcquireOnLaunch(
 	on bool,
 ) R9NanoPlatformBuilder {
 	b.l1AcquireOnLaunch = on
+	return b
+}
+
+// WithH2DCycles sets the fixed latency, in driver cycles, that the driver
+// charges for every host-to-device copy. Each kernel launch makes three such
+// copies (code object, kernel arguments, dispatch packet).
+func (b R9NanoPlatformBuilder) WithH2DCycles(cycles int) R9NanoPlatformBuilder {
+	b.h2dCycles = cycles
 	return b
 }
 
@@ -227,7 +237,7 @@ func (b R9NanoPlatformBuilder) buildGPUDriver(
 		WithLog2PageSize(b.log2PageSize).
 		WithGlobalStorage(b.globalStorage).
 		WithD2HCycles(8500).
-		WithH2DCycles(14500).
+		WithH2DCycles(b.h2dCycles).
 		Build("Driver")
 	if b.visTracer != nil {
 		tracing.CollectTrace(gpuDriver, b.visTracer)

@@ -52,6 +52,9 @@ var l1AcquireFlag = flag.Bool("l1-acquire", true,
 	`Invalidate every L1 vector cache before dispatching each kernel, as a
 real kernel dispatch does. -l1-acquire=false reproduces results from before
 this was modeled, when kernels could read stale L1 lines.`)
+var h2dCyclesFlag = flag.Int("h2d-cycles", 14500,
+	`Fixed driver latency, in driver cycles, charged for every host-to-device
+copy. Each kernel launch makes three such copies.`)
 var l2CacheSizeFlag = flag.Uint64("l2-cache-size", 2*1024*1024,
 	"The total L2 cache size per GPU, in bytes.")
 var dramSizeFlag = flag.Uint64("dram-size", 4*1024*1024*1024,
@@ -135,6 +138,7 @@ func (r *Runner) ParseFlag() *Runner {
 
 	r.L1CacheSize = *l1CacheSizeFlag
 	r.L1AcquireOnLaunch = *l1AcquireFlag
+	r.H2DCycles = *h2dCyclesFlag
 	r.L2CacheSize = *l2CacheSizeFlag
 	r.DRAMSize = *dramSizeFlag
 

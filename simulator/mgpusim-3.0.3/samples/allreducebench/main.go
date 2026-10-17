@@ -183,7 +183,16 @@ func main() {
 	sizes := parseInts(*sizesFlag)
 	chunks := parseInts(*chunksFlag)
 
-	platform := runner.MakeR9NanoBuilder().WithNumGPU(numGPU).Build()
+	// -h2d-cycles is the runner's flag; this sample builds its own platform,
+	// so it reads the value directly.
+	h2dCycles, err := strconv.Atoi(flag.Lookup("h2d-cycles").Value.String())
+	if err != nil {
+		log.Fatal(err)
+	}
+	platform := runner.MakeR9NanoBuilder().
+		WithNumGPU(numGPU).
+		WithH2DCycles(h2dCycles).
+		Build()
 	d := platform.Driver
 	engine := platform.Engine
 
