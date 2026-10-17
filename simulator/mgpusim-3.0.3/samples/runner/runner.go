@@ -55,9 +55,10 @@ type Runner struct {
 	ReportSIMDBusyTime         bool
 	ReportCPIStack             bool
 
-	L1CacheSize uint64
-	L2CacheSize uint64
-	DRAMSize    uint64
+	L1CacheSize       uint64
+	L1AcquireOnLaunch bool
+	L2CacheSize       uint64
+	DRAMSize          uint64
 
 	GPUIDs []int
 }
@@ -113,6 +114,7 @@ func (r *Runner) buildTimingPlatform() {
 	b := MakeR9NanoBuilder().
 		WithNumGPU(r.GPUIDs[len(r.GPUIDs)-1]).
 		WithL1CacheSize(r.L1CacheSize).
+		WithL1AcquireOnLaunch(r.L1AcquireOnLaunch).
 		WithL2CacheSize(r.L2CacheSize).
 		WithDRAMSize(r.DRAMSize)
 

@@ -22,6 +22,8 @@ var overlapFlag = flag.Bool("overlap", false,
 	"All-reduce band r while band r+1's GEMM runs.")
 var allReduceChunkFlag = flag.Uint("allreduce-chunk", 0,
 	"All-Reduce scratch buffer size in elements (0 = 65536).")
+var perBandScratchFlag = flag.Bool("per-band-scratch", false,
+	"Give every band its own All-Reduce scratch buffers.")
 
 func main() {
 	flag.Parse()
@@ -35,6 +37,7 @@ func main() {
 	benchmark.BandRows = uint32(*bandRowsFlag)
 	benchmark.Overlap = *overlapFlag
 	benchmark.AllReduceChunk = uint32(*allReduceChunkFlag)
+	benchmark.PerBandScratch = *perBandScratchFlag
 
 	switch *algorithmFlag {
 	case "ring":

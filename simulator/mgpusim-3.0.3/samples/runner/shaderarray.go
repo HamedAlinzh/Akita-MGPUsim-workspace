@@ -34,6 +34,10 @@ type shaderArray struct {
 	l1vTLBs []*tlb.TLB
 	l1sTLB  *tlb.TLB
 	l1iTLB  *tlb.TLB
+
+	// l1vTopConns[i] connects l1vCaches[i]'s top port to its address
+	// translator. The CP plugs a port into it to invalidate that L1.
+	l1vTopConns []*sim.DirectConnection
 }
 
 type shaderArrayBuilder struct {
@@ -189,8 +193,9 @@ func (b *shaderArrayBuilder) connectVectorMem(sa *shaderArray) {
 		at.SetLowModuleFinder(&mem.SingleLowModuleFinder{
 			LowModule: l1v.GetPortByName("Top"),
 		})
-		b.connectWithDirectConnection(l1v.GetPortByName("Top"),
-			at.GetPortByName("Bottom"), 8)
+		sa.l1vTopConns = append(sa.l1vTopConns,
+			b.connectWithDirectConnection(l1v.GetPortByName("Top"),
+				at.GetPortByName("Bottom"), 8))
 	}
 }
 
@@ -258,7 +263,7 @@ func (b *shaderArrayBuilder) connectInstMem(sa *shaderArray) {
 func (b *shaderArrayBuilder) connectWithDirectConnection(
 	port1, port2 sim.Port,
 	bufferSize int,
-) {
+) *sim.DirectConnection {
 	name := fmt.Sprintf("%s.Conn[%d]", b.name, b.connectionCount)
 	b.connectionCount++
 
@@ -269,6 +274,8 @@ func (b *shaderArrayBuilder) connectWithDirectConnection(
 
 	conn.PlugIn(port1, bufferSize)
 	conn.PlugIn(port2, bufferSize)
+
+	return conn
 }
 
 func (b *shaderArrayBuilder) buildCUs(sa *shaderArray) {

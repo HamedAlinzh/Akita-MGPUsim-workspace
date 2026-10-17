@@ -15,6 +15,9 @@ Layout: one subfolder per experiment.
 - `allreduce_breakdown/{before,after}/`: `samples/allreducebench` output, one CSV per GPU
   count, splitting each Ring All-Reduce into setup copies, kernel time, link time and bytes,
   before and after the mccl queue fix.
+- `stage1_minrepro/`, `stage1_fixed/`: Stage 1 of the follow-up (the 4-GPU overlap
+  correctness bug). `run*.sh` in each folder reproduce the runs; `stage1_fixed/` was run
+  with the L1 acquire on (the default since then).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

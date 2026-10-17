@@ -31,6 +31,7 @@ type R9NanoPlatformBuilder struct {
 	useMagicMemoryCopy                 bool
 	log2PageSize                       uint64
 	l1CacheSize                        uint64
+	l1AcquireOnLaunch                  bool
 	l2CacheSize                        uint64
 	dramSize                           uint64
 
@@ -54,6 +55,7 @@ func MakeR9NanoBuilder() R9NanoPlatformBuilder {
 		numCUPerSA:        4,
 		log2PageSize:      12,
 		l1CacheSize:       16 * mem.KB,
+		l1AcquireOnLaunch: true,
 		l2CacheSize:       2 * mem.MB,
 		dramSize:          4 * mem.GB,
 		traceVisStartTime: -1,
@@ -67,6 +69,15 @@ func (b R9NanoPlatformBuilder) WithL1CacheSize(
 	size uint64,
 ) R9NanoPlatformBuilder {
 	b.l1CacheSize = size
+	return b
+}
+
+// WithL1AcquireOnLaunch makes every GPU invalidate its L1 vector caches
+// before dispatching each kernel. See R9NanoGPUBuilder.WithL1AcquireOnLaunch.
+func (b R9NanoPlatformBuilder) WithL1AcquireOnLaunch(
+	on bool,
+) R9NanoPlatformBuilder {
+	b.l1AcquireOnLaunch = on
 	return b
 }
 
@@ -392,6 +403,7 @@ func (b *R9NanoPlatformBuilder) createGPUBuilder(
 		WithLog2PageSize(b.log2PageSize).
 		WithGlobalStorage(b.globalStorage).
 		WithL1CacheSize(b.l1CacheSize).
+		WithL1AcquireOnLaunch(b.l1AcquireOnLaunch).
 		WithL2CacheSize(b.l2CacheSize).
 		WithDRAMSize(b.dramSize)
 

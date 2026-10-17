@@ -111,7 +111,7 @@ def run_one(binary: Path, run_dir: Path, args, gpus, band, overlap, chunk):
         f"-band-rows={band}",
         f"-overlap={'true' if overlap else 'false'}",
         f"-allreduce-chunk={chunk}",
-    ]
+    ] + args.extra
     with RUNNING_LOCK:
         if STOPPING.is_set():
             return None
@@ -165,6 +165,13 @@ def main():
         help="All-Reduce chunk sizes in elements; 0 = benchmark default (65536)")
     ap.add_argument("--algorithm", choices=["ring", "naive"], default="ring")
     ap.add_argument("--jobs", type=int, default=3)
+    ap.add_argument(
+        "--only-overlap", action="store_true",
+        help="For banded configurations, run only with overlap on")
+    ap.add_argument(
+        "--extra", nargs="*", default=[],
+        help="Extra simulator flags for every run, e.g. --extra=-l1-acquire; "
+             "use a separate --outdir per set of extra flags")
     ap.add_argument("--outdir", type=Path, default=None)
     args = ap.parse_args()
 
@@ -199,7 +206,8 @@ def main():
             for band in bands:
                 if band and (band % out_tile or args.m % band):
                     continue
-                for overlap in ([False] if band == 0 else [False, True]):
+                modes = [True] if args.only_overlap else [False, True]
+                for overlap in ([False] if band == 0 else modes):
                     for chunk in chunks:
                         name = config_name(gpus, tile, band, overlap, chunk)
                         if name not in done:

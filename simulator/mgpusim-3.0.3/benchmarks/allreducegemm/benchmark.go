@@ -77,10 +77,14 @@ type Benchmark struct {
 	// round of ring steps. 0 means defaultAllReduceChunk.
 	AllReduceChunk uint32
 
+	// PerBandScratch gives every band its own All-Reduce scratch buffers
+	// instead of one set reused by all bands.
+	PerBandScratch bool
+
 	kernel *insts.HsaCo
 
 	comms []*mccl.Communicator
-	bufs  []driver.Ptr
+	bufs  [][]driver.Ptr // [scratch set][GPU]
 
 	matrixA, matrixB, matrixC *matrix
 
@@ -304,17 +308,26 @@ func (b *Benchmark) validateDimensions(numGPU uint32) {
 	}
 }
 
-// initAllReduce creates the communicators and the per-GPU scratch buffers
-// shared by every band's All-Reduce.
+// initAllReduce creates the communicators and the per-GPU scratch buffers:
+// one set shared by every band's All-Reduce, or one set per band with
+// PerBandScratch.
 func (b *Benchmark) initAllReduce() {
 	numGPU := len(b.gpus)
 	b.comms = mccl.CommInitAll(numGPU, b.driver, b.context, b.gpus)
 
-	b.bufs = make([]driver.Ptr, numGPU)
-	for g, gpuID := range b.gpus {
-		b.driver.SelectGPU(b.context, gpuID)
-		b.bufs[g] = b.driver.AllocateMemory(
-			b.context, uint64(b.allReduceBufSize()*4))
+	numSets := 1
+	if b.PerBandScratch {
+		numSets = int(b.M / b.bandRows())
+	}
+
+	b.bufs = make([][]driver.Ptr, numSets)
+	for s := range b.bufs {
+		b.bufs[s] = make([]driver.Ptr, numGPU)
+		for g, gpuID := range b.gpus {
+			b.driver.SelectGPU(b.context, gpuID)
+			b.bufs[s][g] = b.driver.AllocateMemory(
+				b.context, uint64(b.allReduceBufSize()*4))
+		}
 	}
 }
 
@@ -346,11 +359,15 @@ func (b *Benchmark) allReduce(
 
 	dataSize := int(numRows * b.N)
 	bufSize := b.allReduceBufSize()
+	bufs := b.bufs[0]
+	if b.PerBandScratch {
+		bufs = b.bufs[rowStart/b.bandRows()]
+	}
 
 	if b.Algorithm == AlgorithmNaive {
-		mccl.AllReduceNaive(b.driver, b.comms, data, dataSize, b.bufs, bufSize)
+		mccl.AllReduceNaive(b.driver, b.comms, data, dataSize, bufs, bufSize)
 	} else {
-		mccl.AllReduceRing(b.driver, b.comms, data, dataSize, b.bufs, bufSize)
+		mccl.AllReduceRing(b.driver, b.comms, data, dataSize, bufs, bufSize)
 	}
 }
 
@@ -371,6 +388,7 @@ func (b *Benchmark) Verify() {
 		return
 	}
 
+	m := mismatchSummary{}
 	for row := uint32(0); row < b.M; row++ {
 		for col := uint32(0); col < b.N; col++ {
 			var sum float32
@@ -381,12 +399,61 @@ func (b *Benchmark) Verify() {
 			got := b.matrixC.Data[row*b.N+col]
 			tolerance := float32(1e-2) * (float32(math.Abs(float64(sum))) + 1)
 			if float32(math.Abs(float64(sum-got))) > tolerance {
-				log.Panicf(
-					"mismatch at [%d, %d]: expected %f, got %f",
-					row, col, sum, got)
+				m.add(b, row, col, sum, got)
 			}
 		}
 	}
 
+	if m.count > 0 {
+		m.report(b)
+		log.Panicf("mismatch at [%d, %d]: expected %f, got %f",
+			m.firstRow, m.firstCol, m.firstWant, m.firstGot)
+	}
+
 	log.Print("Passed!")
+}
+
+// mismatchSummary describes where a failed verification went wrong: which
+// bands and which per-GPU ring chunks within a band, and how far off.
+type mismatchSummary struct {
+	count               int
+	firstRow, firstCol  uint32
+	firstWant, firstGot float32
+	minRatio, maxRatio  float64
+	perBandChunk        map[[2]int]int
+	rowsWithErrors      map[uint32]bool
+}
+
+func (m *mismatchSummary) add(b *Benchmark, row, col uint32, want, got float32) {
+	ratio := float64(got) / float64(want)
+	if m.count == 0 {
+		m.firstRow, m.firstCol, m.firstWant, m.firstGot = row, col, want, got
+		m.minRatio, m.maxRatio = ratio, ratio
+		m.perBandChunk = make(map[[2]int]int)
+		m.rowsWithErrors = make(map[uint32]bool)
+	}
+	m.count++
+	m.minRatio = math.Min(m.minRatio, ratio)
+	m.maxRatio = math.Max(m.maxRatio, ratio)
+	m.rowsWithErrors[row] = true
+
+	bandRows := b.bandRows()
+	band := row / bandRows
+	elem := (row-band*bandRows)*b.N + col
+	numGPU := uint32(len(b.gpus))
+	chunkElems := (bandRows*b.N + numGPU - 1) / numGPU
+	m.perBandChunk[[2]int{int(band), int(elem / chunkElems)}]++
+}
+
+func (m *mismatchSummary) report(b *Benchmark) {
+	log.Printf("verify: %d of %d elements wrong, in %d rows; got/expected "+
+		"between %.3f and %.3f", m.count, b.M*b.N, len(m.rowsWithErrors),
+		m.minRatio, m.maxRatio)
+	for band := 0; band < int(b.M/b.bandRows()); band++ {
+		for chunk := 0; chunk < len(b.gpus); chunk++ {
+			if n := m.perBandChunk[[2]int{band, chunk}]; n > 0 {
+				log.Printf("verify: band %d, ring chunk %d: %d wrong", band, chunk, n)
+			}
+		}
+	}
 }

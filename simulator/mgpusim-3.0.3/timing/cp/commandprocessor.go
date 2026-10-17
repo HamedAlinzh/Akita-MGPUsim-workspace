@@ -1,6 +1,8 @@
 package cp
 
 import (
+	"log"
+
 	"github.com/sarchlab/akita/v3/mem/cache"
 	"github.com/sarchlab/akita/v3/mem/idealmemcontroller"
 	"github.com/sarchlab/akita/v3/mem/mem"
@@ -33,6 +35,19 @@ type CommandProcessor struct {
 	L1ICaches          []sim.Port
 	L2Caches           []sim.Port
 	DRAMControllers    []*idealmemcontroller.Comp
+
+	// AcquireOnLaunch makes the CP invalidate every L1 vector cache before it
+	// dispatches each kernel, modeling the acquire fence of a kernel
+	// dispatch. L1VInvalidatePorts[i] is the CP's port on the connection to
+	// L1VTopPorts[i]; the invalidate goes there because the L1's top port is
+	// where it handles mem.GL0InvalidateReq.
+	AcquireOnLaunch    bool
+	L1VInvalidatePorts []sim.Port
+	L1VTopPorts        []sim.Port
+
+	acquireFor  *protocol.LaunchKernelReq
+	acquireSent []bool
+	acquireAcks int
 
 	ToDriver                   sim.Port
 	toDriverSender             sim.BufferedSender
@@ -93,6 +108,7 @@ func (p *CommandProcessor) Tick(now sim.VTimeInSec) bool {
 	madeProgress = p.tickDispatchers(now) || madeProgress
 	madeProgress = p.processReqFromDriver(now) || madeProgress
 	madeProgress = p.processRspFromInternal(now) || madeProgress
+	madeProgress = p.processL1InvalidateRsps(now) || madeProgress
 
 	return madeProgress
 }
@@ -298,6 +314,14 @@ func (p *CommandProcessor) processLaunchKernelReq(
 		return false
 	}
 
+	if p.AcquireOnLaunch && len(p.L1VInvalidatePorts) > 0 {
+		madeProgress := p.acquire(now, req)
+		if p.acquireAcks < len(p.L1VInvalidatePorts) {
+			return madeProgress
+		}
+		p.acquireFor = nil
+	}
+
 	d.StartDispatching(req)
 	p.ToDriver.Retrieve(now)
 
@@ -306,6 +330,59 @@ func (p *CommandProcessor) processLaunchKernelReq(
 	// 	tracing.MsgIDAtReceiver(req, p))
 
 	return true
+}
+
+// acquire invalidates every L1 vector cache on behalf of req. It sends one
+// invalidate per cache, retrying ports that were full, and the kernel is
+// dispatched once every cache has acknowledged.
+func (p *CommandProcessor) acquire(
+	now sim.VTimeInSec,
+	req *protocol.LaunchKernelReq,
+) (madeProgress bool) {
+	if p.acquireFor != req {
+		p.acquireFor = req
+		p.acquireSent = make([]bool, len(p.L1VInvalidatePorts))
+		p.acquireAcks = 0
+	}
+
+	for i, port := range p.L1VInvalidatePorts {
+		if p.acquireSent[i] {
+			continue
+		}
+
+		inv := mem.GL0InvalidateReqBuilder{}.
+			WithSendTime(now).
+			WithSrc(port).
+			WithDst(p.L1VTopPorts[i]).
+			Build()
+		if port.Send(inv) == nil {
+			p.acquireSent[i] = true
+			madeProgress = true
+		}
+	}
+
+	return madeProgress
+}
+
+func (p *CommandProcessor) processL1InvalidateRsps(now sim.VTimeInSec) bool {
+	madeProgress := false
+
+	for _, port := range p.L1VInvalidatePorts {
+		for {
+			msg := port.Peek()
+			if msg == nil {
+				break
+			}
+			if _, ok := msg.(*mem.GL0InvalidateRsp); !ok {
+				log.Panicf("unexpected %T on L1 invalidate port", msg)
+			}
+			port.Retrieve(now)
+			p.acquireAcks++
+			madeProgress = true
+		}
+	}
+
+	return madeProgress
 }
 
 func (p *CommandProcessor) findAvailableDispatcher() dispatching.Dispatcher {

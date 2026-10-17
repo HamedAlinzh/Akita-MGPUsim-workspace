@@ -48,6 +48,10 @@ will be used.`)
 
 var l1CacheSizeFlag = flag.Uint64("l1-cache-size", 16*1024,
 	"The size of each CU's L1 vector (data) cache, in bytes.")
+var l1AcquireFlag = flag.Bool("l1-acquire", true,
+	`Invalidate every L1 vector cache before dispatching each kernel, as a
+real kernel dispatch does. -l1-acquire=false reproduces results from before
+this was modeled, when kernels could read stale L1 lines.`)
 var l2CacheSizeFlag = flag.Uint64("l2-cache-size", 2*1024*1024,
 	"The total L2 cache size per GPU, in bytes.")
 var dramSizeFlag = flag.Uint64("dram-size", 4*1024*1024*1024,
@@ -130,6 +134,7 @@ func (r *Runner) ParseFlag() *Runner {
 	}
 
 	r.L1CacheSize = *l1CacheSizeFlag
+	r.L1AcquireOnLaunch = *l1AcquireFlag
 	r.L2CacheSize = *l2CacheSizeFlag
 	r.DRAMSize = *dramSizeFlag
 

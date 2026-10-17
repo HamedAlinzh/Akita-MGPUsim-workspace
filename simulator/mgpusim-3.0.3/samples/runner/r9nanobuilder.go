@@ -34,6 +34,7 @@ type R9NanoGPUBuilder struct {
 	numMemoryBank                  int
 	dramSize                       uint64
 	l1CacheSize                    uint64
+	l1AcquireOnLaunch              bool
 	l2CacheSize                    uint64
 	log2PageSize                   uint64
 	log2CacheLineSize              uint64
@@ -56,6 +57,7 @@ type R9NanoGPUBuilder struct {
 	l1iReorderBuffers       []*rob2.ReorderBuffer
 	l1sReorderBuffers       []*rob2.ReorderBuffer
 	l1vCaches               []*writearound.Cache
+	l1vTopConns             []*sim.DirectConnection
 	l1sCaches               []*writethrough.Cache
 	l1iCaches               []*writethrough.Cache
 	l2Caches                []*writeback.Cache
@@ -92,6 +94,7 @@ func MakeR9NanoGPUBuilder() R9NanoGPUBuilder {
 		log2PageSize:                   12,
 		log2MemoryBankInterleavingSize: 12,
 		l1CacheSize:                    16 * mem.KB,
+		l1AcquireOnLaunch:              true,
 		l2CacheSize:                    2 * mem.MB,
 		dramSize:                       4 * mem.GB,
 	}
@@ -208,6 +211,15 @@ func (b R9NanoGPUBuilder) WithPerfAnalyzer(
 // WithL1CacheSize sets the size of each CU's L1 vector (data) cache.
 func (b R9NanoGPUBuilder) WithL1CacheSize(size uint64) R9NanoGPUBuilder {
 	b.l1CacheSize = size
+	return b
+}
+
+// WithL1AcquireOnLaunch makes the Command Processor invalidate every L1
+// vector cache before it dispatches each kernel, as the acquire fence of a
+// real kernel dispatch does. Without it, L1 lines survive across kernels and
+// a kernel can read data that another GPU has since overwritten remotely.
+func (b R9NanoGPUBuilder) WithL1AcquireOnLaunch(on bool) R9NanoGPUBuilder {
+	b.l1AcquireOnLaunch = on
 	return b
 }
 
@@ -470,11 +482,18 @@ func (b *R9NanoGPUBuilder) connectCPWithCaches() {
 		b.internalConn.PlugIn(ctrlPort, 1)
 	}
 
-	for _, c := range b.l1vCaches {
+	for i, c := range b.l1vCaches {
 		ctrlPort := c.GetPortByName("Control")
 		b.cp.L1VCaches = append(b.cp.L1VCaches, ctrlPort)
 		b.internalConn.PlugIn(ctrlPort, 1)
+
+		invPort := sim.NewLimitNumMsgPort(b.cp, 2,
+			fmt.Sprintf("%s.ToL1VInvalidate[%d]", b.cp.Name(), i))
+		b.l1vTopConns[i].PlugIn(invPort, 2)
+		b.cp.L1VInvalidatePorts = append(b.cp.L1VInvalidatePorts, invPort)
+		b.cp.L1VTopPorts = append(b.cp.L1VTopPorts, c.GetPortByName("Top"))
 	}
+	b.cp.AcquireOnLaunch = b.l1AcquireOnLaunch
 
 	for _, c := range b.l1sCaches {
 		ctrlPort := c.GetPortByName("Control")
@@ -708,6 +727,7 @@ func (b *R9NanoGPUBuilder) populateTLBs(sa *shaderArray) {
 }
 
 func (b *R9NanoGPUBuilder) populateL1Vs(sa *shaderArray) {
+	b.l1vTopConns = append(b.l1vTopConns, sa.l1vTopConns...)
 	for _, l1v := range sa.l1vCaches {
 		b.l1vCaches = append(b.l1vCaches, l1v)
 		b.gpu.L1VCaches = append(b.gpu.L1VCaches, l1v)
