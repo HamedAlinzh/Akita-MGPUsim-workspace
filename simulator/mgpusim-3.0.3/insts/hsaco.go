@@ -12,6 +12,15 @@ type HsaCo struct {
 	*HsaCoHeader
 	Symbol *elf.Symbol
 	Data   []byte
+
+	// Simulation hints for this kernel only, overriding the platform-wide
+	// flags when set (0 = use the flag): WGCap caps its work-groups in
+	// flight per CU (see -wg-cap), and VALUCyclesScale multiplies the cycles
+	// of its vector ALU instructions (see -valu-cycles-scale). They let one
+	// kernel model a different GPU's compute without changing others, such
+	// as the collectives' kernels.
+	WGCap           int
+	VALUCyclesScale float64
 }
 
 // HsaCoHeader contains the header information of an HSACO

@@ -238,7 +238,8 @@ def sim_comm_bytes(pt: Point) -> float:
     return c * share * (2 if pt.layer.collective == "all-reduce" else 1)
 
 
-def derive_knobs(pt: Point, f: float, latency_ns: float = REAL_MSG_LATENCY_NS):
+def derive_knobs(pt: Point, f: float, latency_ns: float = REAL_MSG_LATENCY_NS,
+                 measured=None):
     """Simulator knobs that match f and the per-message latency ratio.
 
     1. t_comm = f / (1 - f) x measured GEMM time; the link must move this
@@ -248,7 +249,7 @@ def derive_knobs(pt: Point, f: float, latency_ns: float = REAL_MSG_LATENCY_NS):
        multiplying each by X_sim gives -link-latency and -msg-overhead.
     3. The fabric clock is bw / 16 B flit; -link-latency is realized in whole
        cycles of it."""
-    t_g, first_share = tracker_times(pt.m, pt.n, pt.kg, pt.cus)
+    t_g, first_share = measured or tracker_times(pt.m, pt.n, pt.kg, pt.cus)
     t_c = f / (1 - f) * t_g
     bw_eff = sim_comm_bytes(pt) / (t_c * 1e-6)
     bw = bw_eff / SIM_FABRIC_EFF
@@ -361,6 +362,30 @@ def tile_rows(tokens: int, pt: "Point"):
                 real_f=round(c_real / (g_real + c_real), 3) if curve != "native" else "",
                 sim_f_n1=round(comm_us / (g_sim + comm_us), 3)))
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Capped baseline (from Step 4 on): the GEMM runs with -gemm-wg-cap 8, the
+# cap that minimizes its time (results/step4a_shaping/tracker). With 8
+# resident work-groups per CU, 256x256 at tileSize 8 is 64 tiles / 32 slots
+# = 2.0 waves, the old match; 384x256 would be 3.0. Measured on 1 GPU
+# (results/step4b_capped/calib): GEMM 359.4 us from the launch, first tile
+# 205.3 us, launch 22.75 us. tileSize 4 at -gemm-valu-scale 0.738 follows the
+# matrix-core curve (2.77x the kernel time; 0.647 -> 890.9 us, 0.5 -> 786.8).
+CAP = 8
+CAPPED = dict(m=256, n=256, kg=256, cus=4, gemm_us=359.4, first_us=205.3)
+CAPPED_T4_SCALE = 0.738
+
+
+def capped_points(tokens: int) -> list[Point]:
+    c = CAPPED
+    return [Point(p.label, p.layer, c["m"], c["n"], c["kg"], c["cus"])
+            for p in points(tokens)[:2]]
+
+
+def capped_measured():
+    g = CAPPED["gemm_us"] - SIM_LAUNCH_US
+    return g, (CAPPED["first_us"] - SIM_LAUNCH_US) / g
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +557,34 @@ def main():
     print(table(trows, ["sim_tile_size", "real_tile", "curve", "valu_scale",
                         "sim_gemm_rel", "real_waves", "sim_waves", "real_LX",
                         "sim_LX", "real_f", "sim_f_n1"]))
+
+    # 2b. Capped baseline.
+    cap_rows = []
+    for pt in capped_points(args.tokens):
+        f = pt.layer.frac()
+        k = derive_knobs(pt, f, measured=capped_measured())
+        cap_rows.append(dict(
+            point=pt.label, layer=f"{pt.layer.model.name} {pt.layer.gemm}",
+            real_f=round(f, 3),
+            sim_f=round(k["t_comm_us"] / (k["t_comm_us"] + k["t_gemm_us"]), 3),
+            real_LX=round(REAL_MSG_LATENCY_NS / x_real, 2), sim_LX=round(k["ratio"], 2),
+            real_waves=round(pt.layer.waves, 2),
+            sim_waves=round((pt.m // SIM_TILE) * (pt.n // SIM_TILE) / (pt.cus * CAP), 2),
+            real_first_share=round(first_tile_share(pt.layer.waves), 2),
+            sim_first_share=round(k["first_share"], 2),
+            sim_shape=f"{pt.m}x{pt.n}, K/GPU {pt.kg}", sim_gemm_us=round(k["t_gemm_us"], 1),
+            sim_comm_us=round(k["t_comm_us"], 1),
+            link_bw_gbps=round(k["link_bw_gbps"], 4),
+            link_latency_ns=round(k["link_latency_ns"]),
+            msg_overhead_ns=round(k["msg_overhead_ns"]),
+            latency_cycles=k["latency_cycles"]))
+    write_csv(os.path.join(args.outdir, "points_capped.csv"), cap_rows)
+    print(f"\n2b. Capped baseline (-gemm-wg-cap {CAP}), 2 GPUs, 4 CUs, tileSize 8")
+    print(table(cap_rows, ["point", "real_f", "sim_f", "real_LX", "sim_LX", "real_waves",
+                           "sim_waves", "real_first_share", "sim_first_share"]))
+    print(table(cap_rows, ["point", "sim_shape", "sim_gemm_us", "sim_comm_us",
+                           "link_bw_gbps", "link_latency_ns", "latency_cycles",
+                           "msg_overhead_ns"]))
 
     # 4. MoE.
     moe = moe_rows()

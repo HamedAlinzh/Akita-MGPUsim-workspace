@@ -83,6 +83,22 @@ const physicalPID = vm.PID(0)
 // msgHeaderBytes is the network header of a tile message.
 const msgHeaderBytes = 16
 
+// ConsecutiveGroups splits tiles 0..numTiles-1 into groups of n consecutive
+// tiles.
+func ConsecutiveGroups(numTiles, n int) [][]int {
+	if numTiles%n != 0 {
+		panic(fmt.Sprintf("commengine: %d tiles do not split into groups of %d",
+			numTiles, n))
+	}
+	groups := make([][]int, numTiles/n)
+	for g := range groups {
+		for i := 0; i < n; i++ {
+			groups[g] = append(groups[g], g*n+i)
+		}
+	}
+	return groups
+}
+
 // Owner returns the GPU index that owns a group.
 func Owner(group, numGPU int) int {
 	return group % numGPU
@@ -105,9 +121,12 @@ type Config struct {
 	VToP               func(vAddr uint64) uint64
 
 	TilesPerMsg int
-	Mode        Mode
-	Collective  Collective
-	Placement   Placement
+	// Groups, if set, lists the tiles of every message group instead of
+	// TilesPerMsg consecutive tiles; every tile must be in exactly one.
+	Groups     [][]int
+	Mode       Mode
+	Collective Collective
+	Placement  Placement
 
 	// OnDone is called, inside the simulation, when this engine has
 	// finished all its work.
@@ -187,6 +206,8 @@ type Engine struct {
 	tilesX    uint32
 	numTiles  int
 	numGroups int
+	groups    [][]int
+	tileGroup []int
 
 	localDone []int
 	localAll  int
@@ -232,7 +253,7 @@ func (e *Engine) Finished() bool {
 // Arm prepares the engine for one GEMM. It must be called before the GEMM's
 // first tile completes.
 func (e *Engine) Arm(cfg Config) {
-	if cfg.TilesPerMsg < 1 {
+	if cfg.TilesPerMsg < 1 && cfg.Groups == nil {
 		panic("commengine: TilesPerMsg must be at least 1")
 	}
 	if cfg.Rows%cfg.TileRows != 0 || cfg.Cols%cfg.TileCols != 0 {
@@ -244,11 +265,28 @@ func (e *Engine) Arm(cfg Config) {
 	e.tileBytes = int(cfg.TileRows * cfg.TileCols * 4)
 	e.tilesX = cfg.Cols / cfg.TileCols
 	e.numTiles = int(cfg.Rows/cfg.TileRows) * int(e.tilesX)
-	if e.numTiles%cfg.TilesPerMsg != 0 {
-		panic(fmt.Sprintf("commengine: %d tiles do not split into groups of %d",
-			e.numTiles, cfg.TilesPerMsg))
+	e.groups = cfg.Groups
+	if e.groups == nil {
+		e.groups = ConsecutiveGroups(e.numTiles, cfg.TilesPerMsg)
 	}
-	e.numGroups = e.numTiles / cfg.TilesPerMsg
+	e.numGroups = len(e.groups)
+	e.tileGroup = make([]int, e.numTiles)
+	for i := range e.tileGroup {
+		e.tileGroup[i] = -1
+	}
+	for g, tiles := range e.groups {
+		for _, tile := range tiles {
+			if e.tileGroup[tile] >= 0 {
+				panic(fmt.Sprintf("commengine: tile %d in two groups", tile))
+			}
+			e.tileGroup[tile] = g
+		}
+	}
+	for tile, g := range e.tileGroup {
+		if g < 0 {
+			panic(fmt.Sprintf("commengine: tile %d in no group", tile))
+		}
+	}
 
 	e.localDone = make([]int, e.numGroups)
 	e.localAll = 0
@@ -286,13 +324,13 @@ func (e *Engine) OnTileLocal(ev tiletracker.TileEvent) {
 		return
 	}
 
-	g := ev.Tile / e.cfg.TilesPerMsg
+	g := e.tileGroup[ev.Tile]
 	e.localDone[g]++
 	e.localAll++
 
 	switch e.cfg.Mode {
 	case ModeTile:
-		if e.localDone[g] == e.cfg.TilesPerMsg {
+		if e.localDone[g] == len(e.groups[g]) {
 			e.release(g)
 		}
 	case ModeBulk:
@@ -316,7 +354,7 @@ func (e *Engine) OnTileComplete(ev tiletracker.TileEvent) {
 		return
 	}
 
-	g := ev.Tile / e.cfg.TilesPerMsg
+	g := e.tileGroup[ev.Tile]
 	if Owner(g, e.cfg.NumGPU) != e.cfg.GPU {
 		return
 	}
@@ -330,7 +368,7 @@ func (e *Engine) OnTileComplete(ev tiletracker.TileEvent) {
 // then complete; an all-reduce reads the sum and sends it to every peer.
 func (e *Engine) tryGather(now sim.VTimeInSec, g int) {
 	if e.cfg.Placement != NearMemory || Owner(g, e.cfg.NumGPU) != e.cfg.GPU ||
-		e.gathered[g] || e.nearDone[g] < e.cfg.TilesPerMsg ||
+		e.gathered[g] || e.nearDone[g] < len(e.groups[g]) ||
 		e.cfg.Mode == ModeBulk && e.localAll < e.numTiles {
 		return
 	}
@@ -461,8 +499,7 @@ func (e *Engine) groupSegments(g int) []segment {
 	cfg := &e.cfg
 	rowBytes := int(cfg.TileCols * 4)
 	var segs []segment
-	for i := 0; i < cfg.TilesPerMsg; i++ {
-		tile := g*cfg.TilesPerMsg + i
+	for i, tile := range e.groups[g] {
 		tr := uint32(tile) / e.tilesX
 		tc := uint32(tile) % e.tilesX
 		for r := uint32(0); r < cfg.TileRows; r++ {
@@ -489,7 +526,7 @@ func (e *Engine) enqueueMem(
 ) {
 	job := &memJob{write: write, segs: e.groupSegments(g), data: data, onDone: onDone}
 	if !write {
-		job.data = make([]byte, e.tileBytes*e.cfg.TilesPerMsg)
+		job.data = make([]byte, e.tileBytes*len(e.groups[g]))
 	}
 	e.memJobs = append(e.memJobs, job)
 }

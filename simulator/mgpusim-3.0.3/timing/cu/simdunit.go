@@ -68,16 +68,21 @@ func (u *SIMDUnit) IsIdle() bool {
 func (u *SIMDUnit) AcceptWave(wave *wavefront.Wavefront, now sim.VTimeInSec) {
 	u.toExec = wave
 
-	u.cycleLeft = u.execCycles()
+	u.cycleLeft = u.execCycles(wave)
 	u.logPipelineTask(now, u.toExec.DynamicInst(), false)
 }
 
-func (u *SIMDUnit) execCycles() int {
+func (u *SIMDUnit) execCycles(wave *wavefront.Wavefront) int {
 	base := 64 / u.NumSinglePrecisionUnit
-	if u.CyclesScale == 1 {
+	scale := u.CyclesScale
+	if wave != nil && wave.Wavefront != nil && wave.CodeObject != nil &&
+		wave.CodeObject.VALUCyclesScale > 0 {
+		scale = wave.CodeObject.VALUCyclesScale
+	}
+	if scale == 1 {
 		return base
 	}
-	exact := float64(base)*u.CyclesScale + u.carry
+	exact := float64(base)*scale + u.carry
 	cycles := max(1, int(exact))
 	u.carry = exact - float64(cycles)
 	return cycles

@@ -70,6 +70,14 @@ Layout: one subfolder per experiment.
   tile mode N=1 at f≈0.5 and f≈0.8 with `-wg-ramp 1` and `-wg-cap 4`, the f≈0.8 baseline,
   tileSize 4 at f≈0.8 (matrix-core curve), 4-GPU mccl/bulk/tile on the per-pair mesh
   (`-peer-mesh`), and the default 433 us check (window 432.742 us).
+- `step4b_capped/`: the capped baseline (`-gemm-wg-cap 8`). `calib/`: 1-GPU GEMM at 256x256
+  (tileSize 8; tileSize 4 at -gemm-valu-scale 0.647 and 0.5 -> 0.738 for the matrix-core
+  curve). `runs/` (`scripts/step4b_runs.sh`, `summary.txt` from `scripts/step4b_summary.py`):
+  mccl ring / engine bulk / engine tile at f≈0.5 and f≈0.8 with re-derived knobs, `-wg-ramp
+  1` on top, small-tiles-first at R = 32/64/128 (2 GPUs) and its GEMM alone (1 GPU), and the
+  default 433 us check. `runs_queue_order_bug/`: the first small-tiles-first runs, invalid:
+  the main GEMM's queue was created first and the driver serves queues in creation order, so
+  the small-tile kernel did not start first.
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

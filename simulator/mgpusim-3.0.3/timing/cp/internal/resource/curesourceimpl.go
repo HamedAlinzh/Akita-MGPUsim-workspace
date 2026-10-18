@@ -55,7 +55,7 @@ func (r *CUResourceImpl) ReserveResourceForWG(wg *kernels.WorkGroup) (
 	locations []WfLocation,
 	ok bool,
 ) {
-	if limit := r.wgLimit(); limit > 0 && len(r.reservedWGs) >= limit {
+	if limit := r.wgLimit(wg); limit > 0 && len(r.reservedWGs) >= limit {
 		return nil, false
 	}
 
@@ -178,9 +178,13 @@ func (r *CUResourceImpl) matchWfWithSIMDs(
 	return true
 }
 
-// wgLimit returns the current cap on work-groups in flight, 0 for none.
-func (r *CUResourceImpl) wgLimit() int {
+// wgLimit returns the current cap on work-groups in flight, 0 for none. A
+// kernel's own WGCap replaces the platform-wide cap.
+func (r *CUResourceImpl) wgLimit(wg *kernels.WorkGroup) int {
 	limit := r.wgCap
+	if wg.CodeObject != nil && wg.CodeObject.WGCap > 0 {
+		limit = wg.CodeObject.WGCap
+	}
 	if r.rampStart > 0 {
 		ramp := r.rampStart + r.completed
 		if limit == 0 || ramp < limit {

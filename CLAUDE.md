@@ -225,6 +225,14 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   switch, `-link-bw`, `-link-latency`) per GPU pair; RDMA gets `PeerRoutes` (a port per peer,
   replies on the arrival port) and the engine `Links`. A single switch with one endpoint per
   GPU serializes a GPU's links (head-of-line blocking), so 4-GPU runs need `-peer-mesh`.
+- **Per-kernel hints** (`insts.HsaCo.WGCap`, `.VALUCyclesScale`; 0 = the platform flag).
+  `allreducegemm` sets them on its GEMM code objects only: `-gemm-wg-cap`,
+  `-gemm-valu-scale`, so collective kernels keep their own settings.
+- **Small tiles first** (`-small-rows R`, `-small-tile-size`, `-small-valu-scale`,
+  `-small-tiles-per-msg`): a tileSize-4 GEMM over rows [0, R) on its own queue (created
+  first: the driver serves queues in creation order) plus the main GEMM over the rest; the
+  tracker uses the small tile grid and the engine takes explicit groups
+  (`commengine.Options.Groups`). R must be a multiple of the main tile edge (32).
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -290,6 +298,16 @@ Step requirements, as the user set them:
    implement.
 
 No tile-size × N sweep until the user has seen Step 4.
+
+**Baseline from Step 4 on (user decision):** the GEMM runs with `-gemm-wg-cap 8` (the cap that
+minimizes its time; 12 resident work-groups oversubscribe a CU) in every version (mccl ring,
+engine bulk, engine tile). With cap 8, f≈0.5 and f≈0.8 use 256×256, K/GPU 256, 4 CUs, tileSize
+8 (2.0 waves, first share 0.54), and knobs from `results/step0_ratio/points_capped.csv`:
+f≈0.5 `-link-bw 0.7807 -link-latency 441 -msg-overhead 2121`; f≈0.8 `-link-bw 0.223
+-link-latency 1542 -msg-overhead 7424`. tileSize 4 on the matrix-core curve under the cap:
+`-valu-cycles-scale`/`-small-valu-scale` 0.738. Default flags still reproduce 433 µs.
+Plan for Step 4 on the per-pair mesh: a ring is not the fair software baseline there; add a
+direct reduce-scatter + all-gather to mccl (each GPU sends its 1/n share straight to each peer).
 
 Representative points (user-approved; use only these in Step 4 and later sweeps). Knobs from
 `scripts/ratio_model.py` (`results/step0_ratio/points.csv`), all 2 GPUs, 4 CUs

@@ -35,6 +35,18 @@ var placementFlag = flag.String("placement", "owner",
 	`With -engine-mode: where tiles are reduced, "owner" (the owner's engine
 adds the partials) or "near-memory" (T3-style op-and-store at the owner's
 memory side).`)
+var gemmWGCapFlag = flag.Int("gemm-wg-cap", 0,
+	"Cap the GEMM kernels' work-groups in flight per CU (0 = -wg-cap).")
+var gemmVALUScaleFlag = flag.Float64("gemm-valu-scale", 0,
+	"Scale the main GEMM kernel's vector ALU cycles (0 = -valu-cycles-scale).")
+var smallRowsFlag = flag.Uint("small-rows", 0,
+	"Compute the first rows of C with a small-tile GEMM launched first.")
+var smallTileSizeFlag = flag.Uint("small-tile-size", 4,
+	"Work-group edge of the small-tile GEMM.")
+var smallVALUScaleFlag = flag.Float64("small-valu-scale", 0,
+	"Scale the small-tile GEMM's vector ALU cycles (0 = -valu-cycles-scale).")
+var smallTilesPerMsgFlag = flag.Int("small-tiles-per-msg", 1,
+	"With -engine-mode: small tiles per engine message.")
 var tileSizeFlag = flag.Uint("tile-size", 0,
 	"Work-group edge T; each work-group computes a 4T x 4T tile (0 = 8).")
 var perBandScratchFlag = flag.Bool("per-band-scratch", false,
@@ -54,6 +66,12 @@ func main() {
 	benchmark.AllReduceChunk = uint32(*allReduceChunkFlag)
 	benchmark.PerBandScratch = *perBandScratchFlag
 	benchmark.TileSize = uint32(*tileSizeFlag)
+	benchmark.GEMMWGCap = *gemmWGCapFlag
+	benchmark.GEMMVALUScale = *gemmVALUScaleFlag
+	benchmark.SmallRows = uint32(*smallRowsFlag)
+	benchmark.SmallTileSize = uint32(*smallTileSizeFlag)
+	benchmark.SmallVALUScale = *smallVALUScaleFlag
+	benchmark.SmallTilesPerMsg = *smallTilesPerMsgFlag
 	mccl.CollectiveThreads = *collectiveThreadsFlag
 
 	if runner.EngineMode != "" {

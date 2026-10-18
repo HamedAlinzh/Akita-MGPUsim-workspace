@@ -98,11 +98,29 @@ type Benchmark struct {
 	Comm        *commengine.Session
 	CommOptions commengine.Options
 
+	// GEMMWGCap and GEMMVALUScale are simulation hints for the GEMM kernels
+	// only (insts.HsaCo.WGCap and VALUCyclesScale; 0 = platform default):
+	// cap the GEMM's work-groups in flight per CU, and scale its vector ALU
+	// cycles. The collectives' kernels are not affected.
+	GEMMWGCap     int
+	GEMMVALUScale float64
+
+	// SmallRows, if set, computes the first SmallRows rows of C with a
+	// second GEMM launch at SmallTileSize (default 4), with its own
+	// SmallVALUScale, launched before the main one on its own queue so its
+	// small tiles finish early. With Comm, the small part's tiles are sent
+	// SmallTilesPerMsg at a time and the main part's one tile per message.
+	SmallRows        uint32
+	SmallTileSize    uint32
+	SmallVALUScale   float64
+	SmallTilesPerMsg int
+
 	// OnPartialC, if set, is called for each GPU once its partial C is
 	// allocated and A and B are copied, before any GEMM launch.
 	OnPartialC func(ctx *driver.Context, g, gpuID int, c driver.Ptr)
 
-	kernel *insts.HsaCo
+	kernel      *insts.HsaCo
+	smallKernel *insts.HsaCo
 
 	comms []*mccl.Communicator
 	bufs  [][]driver.Ptr // [scratch set][GPU]
@@ -152,6 +170,15 @@ func (b *Benchmark) loadKernel() {
 	if b.kernel == nil {
 		log.Panic("failed to load mmmKernel_local kernel binary")
 	}
+	b.kernel.WGCap = b.GEMMWGCap
+	b.kernel.VALUCyclesScale = b.GEMMVALUScale
+
+	if b.SmallRows > 0 {
+		// A separate code object, so its hints are its own.
+		b.smallKernel = kernels.LoadProgramFromMemory(hsacoBytes, "mmmKernel_local")
+		b.smallKernel.WGCap = b.GEMMWGCap
+		b.smallKernel.VALUCyclesScale = b.SmallVALUScale
+	}
 }
 
 func (b *Benchmark) initMem() {
@@ -177,6 +204,7 @@ func (b *Benchmark) exec() {
 	gAs := make([]driver.Ptr, numGPU)
 	gBs := make([]driver.Ptr, numGPU)
 	cmdQs := make([]*driver.CommandQueue, numGPU)
+	var smallQs []*driver.CommandQueue
 
 	for g, gpuID := range b.gpus {
 		b.driver.SelectGPU(b.context, gpuID)
@@ -197,6 +225,11 @@ func (b *Benchmark) exec() {
 		gAs[g] = gA
 		gBs[g] = gB
 		partialC[g] = gC
+		// The driver serves queues in creation order, so the small-tile
+		// queue is created first for its launch to start first.
+		if b.SmallRows > 0 {
+			smallQs = append(smallQs, b.driver.CreateCommandQueue(b.context))
+		}
 		cmdQs[g] = b.driver.CreateCommandQueue(b.context)
 
 		if b.OnPartialC != nil {
@@ -212,6 +245,10 @@ func (b *Benchmark) exec() {
 	// LocalPtr keeps the BlockA line in the form tune_gemm_tile.py expects.
 	tileSize := driver.LocalPtr(b.tileSize())
 	launchBand := func(rowStart uint32) {
+		if b.SmallRows > 0 {
+			b.launchSmallFirst(gAs, gBs, partialC, cmdQs, smallQs, kSlice)
+			return
+		}
 		for g, gpuID := range b.gpus {
 			b.driver.SelectGPU(b.context, gpuID)
 
@@ -235,6 +272,9 @@ func (b *Benchmark) exec() {
 		}
 	}
 	drain := func() {
+		for _, q := range smallQs {
+			b.driver.DrainCommandQueue(q)
+		}
 		for _, q := range cmdQs {
 			b.driver.DrainCommandQueue(q)
 		}
@@ -339,6 +379,10 @@ func (b *Benchmark) execFused(
 	}
 
 	tileEdge := 4 * b.tileSize()
+	if b.SmallRows > 0 {
+		tileEdge = 4 * b.smallTileSize()
+		b.CommOptions.Groups = b.smallFirstGroups(tileEdge)
+	}
 	b.Comm.Arm(b.context, partialC, b.M, b.N, tileEdge, b.CommOptions)
 
 	var gemmWait sim.VTimeInSec
@@ -402,13 +446,79 @@ func (b *Benchmark) collectFused(partialC []driver.Ptr, tileEdge uint32) {
 	}
 
 	tilesX := b.N / tileEdge
+	ownerOf := b.CommOptions.TileOwner(int((b.M/tileEdge)*tilesX), numGPU)
 	for row := uint32(0); row < b.M; row++ {
 		for col := uint32(0); col < b.N; col++ {
 			tile := int((row/tileEdge)*tilesX + col/tileEdge)
-			owner := commengine.Owner(tile/b.CommOptions.TilesPerMsg, numGPU)
+			owner := ownerOf(tile)
 			b.matrixC.Data[row*b.N+col] = copies[owner][row*b.N+col]
 		}
 	}
+}
+
+func (b *Benchmark) smallTileSize() uint32 {
+	if b.SmallTileSize == 0 {
+		return 4
+	}
+	return b.SmallTileSize
+}
+
+// launchSmallFirst launches, on every GPU, the small-tile GEMM over rows
+// [0, SmallRows) on its own queue, then the main GEMM over the rest.
+func (b *Benchmark) launchSmallFirst(
+	gAs, gBs, partialC []driver.Ptr,
+	cmdQs, smallQs []*driver.CommandQueue,
+	kSlice uint32,
+) {
+	launch := func(q *driver.CommandQueue, co *insts.HsaCo, g int,
+		rowStart, rows, ts uint32) {
+		edge := driver.LocalPtr(4 * ts)
+		b.driver.EnqueueLaunchKernel(q, co,
+			[3]uint32{b.N / 4, rows / 4, 1},
+			[3]uint16{uint16(ts), uint16(ts), 1},
+			&matrixmultiplication.KernelArgs{
+				MatrixA: gAs[g] + driver.Ptr(uint64(rowStart)*uint64(kSlice)*4),
+				MatrixB: gBs[g],
+				MatrixC: partialC[g] + driver.Ptr(uint64(rowStart)*uint64(b.N)*4),
+				WidthA:  kSlice,
+				BlockA:  edge * edge * 4,
+			})
+	}
+	for g, gpuID := range b.gpus {
+		b.driver.SelectGPU(b.context, gpuID)
+		launch(smallQs[g], b.smallKernel, g, 0, b.SmallRows, b.smallTileSize())
+		launch(cmdQs[g], b.kernel, g, b.SmallRows, b.M-b.SmallRows, b.tileSize())
+	}
+}
+
+// smallFirstGroups groups the tracker's tiles (edge x edge, the small tile)
+// into messages: SmallTilesPerMsg consecutive small tiles in the small rows,
+// and the small tiles covering one main tile elsewhere.
+func (b *Benchmark) smallFirstGroups(edge uint32) [][]int {
+	tilesX := b.N / edge
+	per := 4 * b.tileSize() / edge // small tiles per main-tile edge
+	n := max(1, b.SmallTilesPerMsg)
+	var groups [][]int
+	smallTiles := int(b.SmallRows / edge * tilesX)
+	for t := 0; t < smallTiles; t += n {
+		var g []int
+		for i := t; i < min(t+n, smallTiles); i++ {
+			g = append(g, i)
+		}
+		groups = append(groups, g)
+	}
+	for r := b.SmallRows / edge; r < b.M/edge; r += per {
+		for c := uint32(0); c < tilesX; c += per {
+			var g []int
+			for dr := uint32(0); dr < per; dr++ {
+				for dc := uint32(0); dc < per; dc++ {
+					g = append(g, int((r+dr)*tilesX+c+dc))
+				}
+			}
+			groups = append(groups, g)
+		}
+	}
+	return groups
 }
 
 func (b *Benchmark) tileSize() uint32 {
@@ -430,6 +540,12 @@ func (b *Benchmark) bandRows() uint32 {
 // kernel's internal loop counts silently truncate and produce wrong
 // results rather than erroring.
 func (b *Benchmark) validateDimensions(numGPU uint32) {
+	if b.SmallRows > 0 && (b.SmallRows%(4*b.tileSize()) != 0 ||
+		b.SmallRows >= b.M || b.bandRows() != b.M || b.Overlap ||
+		b.N%(4*b.smallTileSize()) != 0) {
+		log.Panicf("SmallRows (%d) must be a multiple of %d below M, "+
+			"with one band", b.SmallRows, 4*b.tileSize())
+	}
 	if b.ReduceScatter && (b.Algorithm == AlgorithmNaive ||
 		b.bandRows() != b.M || b.Overlap) {
 		log.Panic("ReduceScatter needs the ring algorithm and one band")

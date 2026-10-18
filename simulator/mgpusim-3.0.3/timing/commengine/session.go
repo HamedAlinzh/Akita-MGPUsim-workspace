@@ -17,9 +17,11 @@ type Participant struct {
 // Options configures one fused collective.
 type Options struct {
 	TilesPerMsg int
-	Mode        Mode
-	Collective  Collective
-	Placement   Placement
+	// Groups, if set, replaces TilesPerMsg with explicit tile groups.
+	Groups     [][]int
+	Mode       Mode
+	Collective Collective
+	Placement  Placement
 }
 
 // Session drives the engines of a set of GPUs from the host: arm them before
@@ -71,8 +73,9 @@ func (s *Session) Arm(
 
 		region := s.region(ctx, uint64(cs[i]), rows, cols, tileEdge)
 		if opt.Placement == NearMemory {
-			gpu, numGPU, n := i, len(s.parts), opt.TilesPerMsg
-			owned := func(tile int) bool { return Owner(tile/n, numGPU) == gpu }
+			gpu, numGPU := i, len(s.parts)
+			groupOf := opt.groupIndex(int((rows / tileEdge) * (cols / tileEdge)))
+			owned := func(tile int) bool { return Owner(groupOf[tile], numGPU) == gpu }
 			region.Accumulate = owned
 			region.Expected = func(tile int) int {
 				if owned(tile) {
@@ -103,12 +106,35 @@ func (s *Session) Arm(
 				return pPage | v&mask
 			},
 			TilesPerMsg: opt.TilesPerMsg,
+			Groups:      opt.Groups,
 			Mode:        opt.Mode,
 			Collective:  opt.Collective,
 			Placement:   opt.Placement,
 			OnDone:      s.engineDone,
 		})
 	}
+}
+
+// groupIndex maps every tile to its group.
+func (o Options) groupIndex(numTiles int) []int {
+	groups := o.Groups
+	if groups == nil {
+		groups = ConsecutiveGroups(numTiles, o.TilesPerMsg)
+	}
+	index := make([]int, numTiles)
+	for g, tiles := range groups {
+		for _, tile := range tiles {
+			index[tile] = g
+		}
+	}
+	return index
+}
+
+// TileOwner returns the GPU index that owns a tile's group, for a C of
+// numTiles tiles.
+func (o Options) TileOwner(numTiles, numGPU int) func(tile int) int {
+	index := o.groupIndex(numTiles)
+	return func(tile int) int { return Owner(index[tile], numGPU) }
 }
 
 func (s *Session) region(
