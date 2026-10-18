@@ -7,10 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```
 go.work, go.work.sum   Go workspace wiring the two simulator modules together
 simulator/             Simulator source code (the two Go modules below)
-scripts/               Experiment drivers (e.g. tune_gemm_tile.py)
+scripts/               Experiment drivers (sweep_overlap.py, ratio_model.py, run_pending_experiments.sh, tune_gemm_tile.py)
 results/               Raw simulation output (metrics.csv, stdout); gitignored except README
 diagrams/              Plots/figures derived from results/; tracked in git
-reports/               Standalone HTML write-ups of experiments
+reports/               Standalone HTML write-ups of experiments, plus design notes (*.md)
 ```
 
 Keep this separation: generated data goes in `results/<experiment>/`, never inside
@@ -153,3 +153,77 @@ When adding a new GPU component or modifying timing behavior, follow the existin
 it as an Akita `Component`/`TickingComponent`, wire it up via ports/connections, and expose a
 builder (see `*builder.go` files, e.g. `timing/cu/cubuilder.go`, `timing/cp/builder.go`) that
 `samples/runner` or a custom experiment can call to assemble it into a `Platform`.
+
+## Changes on branch `All-reduce`
+
+The simulator here is no longer stock MGPUSim v3.0.3. Know these before reading results or
+changing timing code. Commit hashes are on branch `All-reduce`.
+
+- **Patched GEMM kernel** (`3be1037`). `benchmarks/allreducegemm/kernels.hsaco` is the upstream
+  `mmmKernel_local` binary with A indexed by the global Y id instead of `lIdY`, so one launch can
+  cover all of M. It is produced by `benchmarks/allreducegemm/native/patch_gidy.py` from the
+  upstream binary; don't hand-edit it. The upstream copy in `benchmarks/amdappsdk/` still has the
+  bug.
+- **mccl ring collectives** (`141ff40`). `createCommandQueues` now selects each communicator's GPU
+  before creating its queue; before, every push/reduce kernel of Ring All-Reduce and Ring
+  Broadcast ran on the last-selected GPU. `mccl.CollectiveThreads` (`485f19d`, flag
+  `-collective-threads`, default 1024) sets the threads per collective kernel.
+- **L1 acquire at kernel dispatch** (`8d33e6c`). Per-CU L1 vector caches are not coherent, and
+  the dispatcher's CU rotation continues across kernels, so a kernel could read stale L1 lines.
+  The CP now sends a `GL0InvalidateReq` to every L1V (through `L1VInvalidatePorts` on each L1V's
+  top-port connection) and dispatches once all acknowledge. On by default; `-l1-acquire=false`
+  restores old behavior. Regression test: `benchmarks/mccl/l1acquire_test.go`.
+- **Runner flags added:** `-l1-acquire`, `-h2d-cycles` (`156e143`; fixed driver latency per
+  host-to-device copy, default 14500; each kernel launch makes three copies, about 22.75 µs).
+- **`allreducegemm`** gained `-band-rows`, `-overlap`, `-allreduce-chunk`, `-per-band-scratch`,
+  `-collective-threads`. It logs `allreducegemm phases: window=… gemm_wait=… allreduce=…`, and
+  `Verify` prints a mismatch summary by band and ring chunk before panicking.
+- **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
+  kernel time, link-busy time and bytes; resumable via its `-out` CSV.
+
+Gotchas that cost time before:
+- MGPUSim v3 loads only **code object v2**. Upstream LLVM ≤ 16 can still emit it
+  (`-mcode-object-version=2`); Ubuntu 24.04 ships clang/lld 14–16.
+- Akita's PCIe link bandwidth is whole bytes per cycle at the network clock, so very low or
+  fractional bandwidths need a lower network frequency.
+- In a pattern for `pkill -f`, the pattern also matches the shell running it; kill by PID.
+
+## Running experiments
+
+- Every run uses `-verify`. Results go to `results/<experiment>/` with the script that produced
+  them; list new folders in `results/README.md`.
+- One simulation needs about 0.8–1.3 GB of RAM; run at most 3 at a time on this machine. Wall
+  time grows 2–10× when runs share the machine.
+- Run long batches as a systemd user service so they survive VS Code or Claude Code closing,
+  and make them resumable (`sweep_overlap.py` and `allreducebench` skip finished work):
+  `systemd-run --user --unit=<name> --collect -E PATH="$PATH" --working-directory="$PWD" bash -c '<script> >> <log> 2>&1'`.
+- Agreed working rules with the user: smallest shape that shows the effect; state run count and
+  wall time before a batch and ask first if it exceeds 30 minutes; commit after each step, then
+  stop and report a short table.
+
+## Fused GEMM + collective project: status
+
+Goal: co-design GEMM tile size and message granularity under hardware-triggered communication,
+compared across reduction placements (related work: T3, ASPLOS 2024; CAIS, arXiv 2605.05628).
+Design: option (b) in `reports/fused-gemm-comm-design.md`, an L2-side tile tracker (Akita port
+hooks on L2 top ports) plus a DMA-like send engine over RDMA, so the existing GEMM binary runs
+unchanged.
+
+| Step | What | Status |
+|---|---|---|
+| 0 | Ratio-matched sizing (`scripts/ratio_model.py`) | Done, `210936c`. Proposal: 256×256×512, 2 GPUs, 64 CUs, tileSize 8, link bandwidth 0.7–40 GB/s per real layer |
+| 1 | Tracker spike: 1 GPU, every tile completes exactly once after its last L2-acknowledged store (tileSize 4/8/16, 128×128×256) | Not started; go/no-go |
+| 2 | Send engine, per-tile reduce-scatter + all-gather, `-tiles-per-msg N`; verify 128×128×256 at N = 1, 2, 4 | Not started |
+| 3 | Reduction placement: (a) owner reduces via engine, (b) T3-style near memory | Not started |
+| 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
+| 5 | MoE all-to-all extension (design note section only) | Not started |
+
+Knobs still to add for Step 4: `-link-bw` (with network clock and flit size), `-link-latency`
+(PCIe switch latency, hardcoded 140 cycles), `-cus-per-gpu` (platform hardcodes 16 SAs × 4 CUs).
+No tile-size × N sweep until the user has seen Step 4.
+
+Findings that shape the design (details in `reports/gemm-allreduce-overlap.html`):
+- Banding a GEMM to overlap All-Reduce never beat one launch: extra launches, low-occupancy
+  short GEMMs, and collective kernels competing for CUs. This holds at `-h2d-cycles` 1450.
+- Ring All-Reduce cost is per-launch setup plus latency-bound kernels; the link is busy under
+  10% of the time.
