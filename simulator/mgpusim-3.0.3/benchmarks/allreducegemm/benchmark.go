@@ -20,6 +20,7 @@ import (
 	"github.com/sarchlab/mgpusim/v3/driver"
 	"github.com/sarchlab/mgpusim/v3/insts"
 	"github.com/sarchlab/mgpusim/v3/kernels"
+	"github.com/sarchlab/mgpusim/v3/timing/commengine"
 )
 
 //go:embed kernels.hsaco
@@ -84,6 +85,18 @@ type Benchmark struct {
 	// TileSize is the work-group edge length T; each work-group computes a
 	// 4T x 4T output tile. 0 means tileSize.
 	TileSize uint32
+
+	// ReduceScatter replaces the mccl All-Reduce with a ring reduce-scatter
+	// (one band, ring algorithm only); the result is assembled from each
+	// element's owner. With Comm, set CommOptions.Collective instead.
+	ReduceScatter bool
+
+	// Comm, if set, reduces C with the communication engines instead of
+	// mccl: the host arms them, launches one GEMM per GPU and waits. Each
+	// finished tile group is reduced while the GEMM still runs (or after it,
+	// in bulk mode). BandRows and Overlap do not apply.
+	Comm        *commengine.Session
+	CommOptions commengine.Options
 
 	// OnPartialC, if set, is called for each GPU once its partial C is
 	// allocated and A and B are copied, before any GEMM launch.
@@ -191,7 +204,9 @@ func (b *Benchmark) exec() {
 		}
 	}
 
-	b.initAllReduce()
+	if b.Comm == nil {
+		b.initAllReduce()
+	}
 
 	bandRows := b.bandRows()
 	// LocalPtr keeps the BlockA line in the form tune_gemm_tile.py expects.
@@ -254,6 +269,11 @@ func (b *Benchmark) exec() {
 		})
 	}
 
+	if b.Comm != nil {
+		b.execFused(partialC, launchBand, drain, timed)
+		return
+	}
+
 	windowStart := b.driver.Engine.CurrentTime()
 	for rowStart := uint32(0); rowStart < b.M; rowStart += bandRows {
 		launchBand(rowStart)
@@ -278,7 +298,116 @@ func (b *Benchmark) exec() {
 	log.Printf("allreducegemm phases: window=%.9f gemm_wait=%.9f "+
 		"allreduce=%.9f", window, gemmWait, allReduceTime)
 
+	if b.ReduceScatter {
+		b.collectReduceScatter(partialC)
+		return
+	}
 	b.collectResult(partialC[0])
+}
+
+// collectReduceScatter assembles C from the GPU that holds each element
+// after mccl.ReduceScatterRing, scaling the mean to the sum.
+func (b *Benchmark) collectReduceScatter(partialC []driver.Ptr) {
+	numGPU := len(b.gpus)
+	copies := make([][]float32, numGPU)
+	for g, gpuID := range b.gpus {
+		copies[g] = make([]float32, b.M*b.N)
+		b.driver.SelectGPU(b.context, gpuID)
+		b.driver.MemCopyD2H(b.context, copies[g], partialC[g])
+	}
+
+	b.matrixC = newMatrix(b.N, b.M)
+	size := int(b.M * b.N)
+	for i := range b.matrixC.Data {
+		owner := mccl.ReduceScatterRingOwner(i, size, b.allReduceBufSize(), numGPU)
+		b.matrixC.Data[i] = copies[owner][i] * float32(numGPU)
+	}
+}
+
+// execFused arms the engines, launches the GEMM on every GPU and waits until
+// the engines have reduced all of C. The window runs from the launch to the
+// last engine finishing; comm_tail is the part after the GEMM drained.
+func (b *Benchmark) execFused(
+	partialC []driver.Ptr,
+	launch func(rowStart uint32),
+	drain func(),
+	timed func(acc *sim.VTimeInSec, f func()),
+) {
+	if b.BandRows != 0 && b.BandRows != b.M || b.Overlap {
+		log.Panic("the communication engine runs one GEMM over all of M; " +
+			"do not set BandRows or Overlap")
+	}
+
+	tileEdge := 4 * b.tileSize()
+	b.Comm.Arm(b.context, partialC, b.M, b.N, tileEdge, b.CommOptions)
+
+	var gemmWait sim.VTimeInSec
+	windowStart := b.driver.Engine.CurrentTime()
+	launch(0)
+	timed(&gemmWait, drain)
+	doneAt := b.Comm.Wait()
+	window := max(doneAt, windowStart+gemmWait) - windowStart
+
+	log.Printf("allreducegemm fused phases: window=%.9f gemm_wait=%.9f "+
+		"comm_tail=%.9f", window, gemmWait, window-gemmWait)
+	b.logMessages()
+
+	b.collectFused(partialC, tileEdge)
+}
+
+// logMessages prints message counts per direction and the first messages'
+// timeline.
+func (b *Benchmark) logMessages() {
+	type dir struct{ from, to int }
+	count := map[dir]int{}
+	bytes := map[dir]int{}
+	recs := b.Comm.Records()
+	for _, r := range recs {
+		d := dir{r.From, r.To}
+		count[d]++
+		bytes[d] += r.TrafficBytes
+	}
+	for d, n := range count {
+		log.Printf("allreducegemm messages: from=%d to=%d count=%d "+
+			"traffic_bytes=%d", d.from, d.to, n, bytes[d])
+	}
+	for i, r := range recs {
+		if i >= 8 {
+			break
+		}
+		log.Printf("allreducegemm msg: group=%d reduced=%v from=%d to=%d "+
+			"queued=%.9f sent=%.9f received=%.9f",
+			r.Group, r.Reduced, r.From, r.To, r.Queued, r.Sent, r.Received)
+	}
+}
+
+// collectFused copies the reduced C to the host. After an all-reduce every
+// GPU holds it; after a reduce-scatter each tile group is taken from its
+// owner. The engines produce the sum, not the mean, so nothing is scaled.
+func (b *Benchmark) collectFused(partialC []driver.Ptr, tileEdge uint32) {
+	b.matrixC = newMatrix(b.N, b.M)
+	if b.CommOptions.Collective == commengine.AllReduce {
+		b.driver.SelectGPU(b.context, b.gpus[0])
+		b.driver.MemCopyD2H(b.context, b.matrixC.Data, partialC[0])
+		return
+	}
+
+	numGPU := len(b.gpus)
+	copies := make([][]float32, numGPU)
+	for g, gpuID := range b.gpus {
+		copies[g] = make([]float32, b.M*b.N)
+		b.driver.SelectGPU(b.context, gpuID)
+		b.driver.MemCopyD2H(b.context, copies[g], partialC[g])
+	}
+
+	tilesX := b.N / tileEdge
+	for row := uint32(0); row < b.M; row++ {
+		for col := uint32(0); col < b.N; col++ {
+			tile := int((row/tileEdge)*tilesX + col/tileEdge)
+			owner := commengine.Owner(tile/b.CommOptions.TilesPerMsg, numGPU)
+			b.matrixC.Data[row*b.N+col] = copies[owner][row*b.N+col]
+		}
+	}
 }
 
 func (b *Benchmark) tileSize() uint32 {
@@ -300,6 +429,11 @@ func (b *Benchmark) bandRows() uint32 {
 // kernel's internal loop counts silently truncate and produce wrong
 // results rather than erroring.
 func (b *Benchmark) validateDimensions(numGPU uint32) {
+	if b.ReduceScatter && (b.Algorithm == AlgorithmNaive ||
+		b.bandRows() != b.M || b.Overlap) {
+		log.Panic("ReduceScatter needs the ring algorithm and one band")
+	}
+
 	if b.K%numGPU != 0 {
 		log.Panicf("K (%d) must be divisible by the number of GPUs (%d)",
 			b.K, numGPU)
@@ -383,6 +517,11 @@ func (b *Benchmark) allReduce(
 	bufs := b.bufs[0]
 	if b.PerBandScratch {
 		bufs = b.bufs[rowStart/b.bandRows()]
+	}
+
+	if b.ReduceScatter {
+		mccl.ReduceScatterRing(b.driver, b.comms, data, dataSize, bufs, bufSize)
+		return
 	}
 
 	if b.Algorithm == AlgorithmNaive {

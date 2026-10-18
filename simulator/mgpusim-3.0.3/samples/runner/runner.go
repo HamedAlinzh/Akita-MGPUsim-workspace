@@ -62,10 +62,17 @@ type Runner struct {
 	CUsPerGPU         int
 	LinkBW            float64 // bytes/s
 	LinkLatencyNS     float64
+	EngineMode        string
+	MsgOverheadNS     float64
 	L2CacheSize       uint64
 	DRAMSize          uint64
 
 	GPUIDs []int
+}
+
+// Platform returns the simulated platform, built by Init.
+func (r *Runner) Platform() *Platform {
+	return r.platform
 }
 
 // Init initializes the platform simulate
@@ -125,6 +132,7 @@ func (r *Runner) buildTimingPlatform() {
 		WithNumCUPerGPU(r.CUsPerGPU).
 		WithLinkBandwidth(r.LinkBW).
 		WithLinkLatency(r.LinkLatencyNS).
+		WithCommEngine(r.EngineMode != "", r.MsgOverheadNS).
 		WithL2CacheSize(r.L2CacheSize).
 		WithDRAMSize(r.DRAMSize)
 

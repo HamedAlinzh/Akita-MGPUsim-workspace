@@ -25,27 +25,8 @@ func AllReduceRing(
 		}
 
 		// Step 1: Perform k-1 push and k-1 reduce.
-		for step := 0; step < numGPU-1; step++ {
-			allReducePushToBuffer(
-				d, comms, cmdQs, data, bufs, step, numGPU, numThread,
-				uint64(currBufSize),
-				uint64(eachGPUDataSize),
-				uint64(dataOffset),
-			)
-			for i := 0; i < numGPU; i++ {
-				d.DrainCommandQueue(cmdQs[i])
-			}
-
-			allReduceReduce(
-				d, comms, cmdQs, data, bufs, step, numGPU, numThread,
-				uint64(currBufSize),
-				uint64(eachGPUDataSize),
-				uint64(dataOffset),
-			)
-			for i := 0; i < numGPU; i++ {
-				d.DrainCommandQueue(cmdQs[i])
-			}
-		}
+		ringReduceScatterPass(d, comms, cmdQs, data, bufs, numGPU, numThread,
+			currBufSize, eachGPUDataSize, dataOffset)
 
 		//Step 2: k-1 steps push only. push to next gpu directly
 		for step := 0; step < numGPU-1; step++ {
@@ -200,5 +181,75 @@ func allReducePushToGPU(
 			[3]uint16{64, 1, 1},
 			kernelArgs,
 		)
+	}
+}
+
+// ReduceScatterRing is the first half of AllReduceRing: k-1 rounds of push
+// and reduce. Afterwards each GPU holds the mean of one 1/k share of every
+// sizePerBuf-element pass; ReduceScatterRingOwner tells which.
+func ReduceScatterRing(
+	d *driver.Driver,
+	comms []*Communicator,
+	data []driver.Ptr,
+	dataSize int,
+	bufs []driver.Ptr,
+	sizePerBuf int,
+) {
+	numGPU := len(comms)
+	cmdQs := createCommandQueues(d, comms)
+	bigSteps := (dataSize-1)/sizePerBuf + 1
+	numThread := collectiveThreads()
+
+	for j := 0; j < bigSteps; j++ {
+		dataOffset := j * sizePerBuf
+		currBufSize := min(sizePerBuf, dataSize-j*sizePerBuf)
+		eachGPUDataSize := currBufSize / numGPU
+		if eachGPUDataSize*numGPU < currBufSize {
+			eachGPUDataSize++
+		}
+
+		ringReduceScatterPass(d, comms, cmdQs, data, bufs, numGPU, numThread,
+			currBufSize, eachGPUDataSize, dataOffset)
+	}
+}
+
+// ReduceScatterRingOwner returns the index of the GPU that holds element
+// elem after ReduceScatterRing: in each pass, GPU i ends with chunk (i+1)
+// mod k.
+func ReduceScatterRingOwner(elem, dataSize, sizePerBuf, numGPU int) int {
+	j := elem / sizePerBuf
+	currBufSize := min(sizePerBuf, dataSize-j*sizePerBuf)
+	each := (currBufSize + numGPU - 1) / numGPU
+	chunk := (elem - j*sizePerBuf) / each
+	return (chunk - 1 + numGPU) % numGPU
+}
+
+func ringReduceScatterPass(
+	d *driver.Driver,
+	comms []*Communicator,
+	cmdQs []*driver.CommandQueue,
+	data, bufs []driver.Ptr,
+	numGPU, numThread, currBufSize, eachGPUDataSize, dataOffset int,
+) {
+	for step := 0; step < numGPU-1; step++ {
+		allReducePushToBuffer(
+			d, comms, cmdQs, data, bufs, step, numGPU, numThread,
+			uint64(currBufSize),
+			uint64(eachGPUDataSize),
+			uint64(dataOffset),
+		)
+		for i := 0; i < numGPU; i++ {
+			d.DrainCommandQueue(cmdQs[i])
+		}
+
+		allReduceReduce(
+			d, comms, cmdQs, data, bufs, step, numGPU, numThread,
+			uint64(currBufSize),
+			uint64(eachGPUDataSize),
+			uint64(dataOffset),
+		)
+		for i := 0; i < numGPU; i++ {
+			d.DrainCommandQueue(cmdQs[i])
+		}
 	}
 }

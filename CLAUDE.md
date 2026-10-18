@@ -195,6 +195,17 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   bandwidth / 16, latency rounded to whole cycles of that clock (logged at startup). With 2
   GPUs, one switch input pipeline = the one-way latency. Defaults reproduce old results
   exactly.
+- **Communication engine** (Step 2, `timing/commengine`). One per GPU when `-engine-mode`
+  is `tile` or `bulk`: plugs into the L1→L2 connection for local reads/writes and onto the
+  peer fabric (created automatically) for engine-to-engine `TileMsg`s. Triggered by the
+  tile tracker; groups of `-tiles-per-msg` consecutive tiles, group g owned by GPU g mod p;
+  non-owners send partials, the owner adds them and writes C, then (all-reduce) sends the sum
+  back. `-msg-overhead` ns is a per-message cost serialized per engine but overlapped with
+  earlier transmissions. `-reduce-scatter` selects reduce-scatter (engine) or
+  `mccl.ReduceScatterRing` (without an engine). Host side: `commengine.Session` (Arm,
+  Wait via `driver.WaitFor`), `allreducegemm.Benchmark.Comm`. `-tile-size` sets T.
+  Gotcha: behind the address translators all memory requests carry PID 0, so anything that
+  issues physical-address requests to L2 must use PID 0 or it misses dirty lines.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -230,7 +241,7 @@ unchanged.
 |---|---|---|
 | 0 | Ratio-matched sizing (`scripts/ratio_model.py`) | Done, `210936c`. Proposal: 256×256×512, 2 GPUs, 64 CUs, tileSize 8, link bandwidth 0.7–40 GB/s per real layer |
 | 1 | Tracker spike: 1 GPU, every tile completes exactly once after its last L2-acknowledged store (tileSize 4/8/16, 128×128×256) | Done: go. `timing/tiletracker`, test `benchmarks/allreducegemm/tiletracker_test.go`, `results/step1_tracker/` |
-| 2 | Send engine, per-tile reduce-scatter + all-gather, `-tiles-per-msg N`; verify 128×128×256 at N = 1, 2, 4 | Not started |
+| 2 | Send engine, per-tile reduce-scatter + all-gather, `-tiles-per-msg N`; verify at N = 1, 2, 4 | Done: `timing/commengine`, `results/step2_engine/` |
 | 3 | Reduction placement: (a) owner reduces via engine, (b) T3-style near memory | Not started |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
 | 5 | MoE all-to-all extension (design note section only) | Not started |
@@ -272,10 +283,11 @@ Representative points (user-approved; use only these in Step 4 and later sweeps)
 
 Latency/transfer for a 1-tile message is matched to the real 0.39 (1 µs DMA copy = 172 ns wire
 + 828 ns engine, MI300A data; 128 KiB tile at 51.2 GB/s); the sensitivity range is 0.27–0.78.
-Still to build in Steps 2–4: `-msg-overhead` (per-message cost in the send engine, saved by
-`-tiles-per-msg`), the engine's reduce-scatter-only mode and an mccl ring reduce-scatter
-baseline (for the f≈0.25 point). Calibrate Akita's fixed per-hop fabric cycles (wire latency
-is always 22 fabric cycles at these points) and the engine's fabric efficiency (assumed 0.8).
+Calibrated in Step 2 (`TestCalibration`, `results/step2_engine/calibration.csv`): the
+engine streams at 0.794 of `-link-bw` (assumed 0.80), and one message's latency beyond its
+transfer time is 6–7% above `-link-latency` + `-msg-overhead` (≈9 fixed fabric cycles), both
+within 10%, so the knobs stand. Step 4 versions: mccl ring after the GEMM
+(`-collective-threads 16384`), engine `-engine-mode bulk`, engine `-engine-mode tile`.
 
 Rule added after Step 1: every simulated config must have tiles finishing spread out over
 time (at 64 CUs a 256×256 GEMM finishes all tiles within 1 µs, leaving nothing to overlap).

@@ -4,6 +4,7 @@ import (
 	"github.com/sarchlab/akita/v3/sim"
 	"github.com/sarchlab/akita/v3/tracing"
 	"github.com/sarchlab/mgpusim/v3/driver"
+	"github.com/sarchlab/mgpusim/v3/timing/commengine"
 	"github.com/sarchlab/mgpusim/v3/timing/cp"
 	"github.com/sarchlab/mgpusim/v3/timing/pagemigrationcontroller"
 	"github.com/sarchlab/mgpusim/v3/timing/rdma"
@@ -44,4 +45,8 @@ type GPU struct {
 	// TileTracker watches stores into a region at the L2 top ports. It is
 	// attached to every GPU and does nothing until armed.
 	TileTracker *tiletracker.Tracker
+
+	// CommEngine is the GPU's communication engine, nil unless the platform
+	// was built with one.
+	CommEngine *commengine.Engine
 }

@@ -36,6 +36,8 @@ type R9NanoPlatformBuilder struct {
 	ldsOccupancy                       bool
 	linkBW                             float64 // bytes/s; 0 = shared PCIe
 	linkLatencyNS                      float64 // < 0 = shared PCIe
+	commEngine                         bool
+	msgOverheadNS                      float64
 	h2dCycles                          int
 	l2CacheSize                        uint64
 	dramSize                           uint64
@@ -119,6 +121,17 @@ func (b R9NanoPlatformBuilder) WithLinkBandwidth(bytesPerSec float64) R9NanoPlat
 // negative value keeps the shared PCIe network.
 func (b R9NanoPlatformBuilder) WithLinkLatency(ns float64) R9NanoPlatformBuilder {
 	b.linkLatencyNS = ns
+	return b
+}
+
+// WithCommEngine gives every GPU a communication engine with the given
+// per-message overhead in ns. The engines talk over the peer fabric, which is
+// created even if no link knob is set.
+func (b R9NanoPlatformBuilder) WithCommEngine(
+	on bool, msgOverheadNS float64,
+) R9NanoPlatformBuilder {
+	b.commEngine = on
+	b.msgOverheadNS = msgOverheadNS
 	return b
 }
 
@@ -459,6 +472,7 @@ func (b *R9NanoPlatformBuilder) createGPUBuilder(
 		WithL1CacheSize(b.l1CacheSize).
 		WithL1AcquireOnLaunch(b.l1AcquireOnLaunch).
 		WithLDSOccupancy(b.ldsOccupancy).
+		WithCommEngine(b.commEngine, sim.VTimeInSec(b.msgOverheadNS*1e-9)).
 		WithL2CacheSize(b.l2CacheSize).
 		WithDRAMSize(b.dramSize)
 
@@ -569,7 +583,7 @@ func (b *R9NanoPlatformBuilder) configPMC(
 }
 
 func (b *R9NanoPlatformBuilder) usePeerFabric() bool {
-	return b.linkBW > 0 || b.linkLatencyNS >= 0
+	return b.linkBW > 0 || b.linkLatencyNS >= 0 || b.commEngine
 }
 
 func withoutPort(ports []sim.Port, drop sim.Port) []sim.Port {
@@ -619,6 +633,9 @@ func (b *R9NanoPlatformBuilder) createPeerFabric() {
 	switchID := -1
 	for _, gpu := range b.gpus {
 		port := []sim.Port{gpu.RDMAEngine.ToOutside}
+		if gpu.CommEngine != nil {
+			port = append(port, gpu.CommEngine.ToFabric)
+		}
 		if switchID < 0 {
 			switchID = fabric.AddRootComplex(port)
 			continue

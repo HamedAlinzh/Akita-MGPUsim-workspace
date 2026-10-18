@@ -1,6 +1,7 @@
 # Fused GEMM + All-Reduce in MGPUSim: design note
 
-Status: proposal, not implemented. Branch `All-reduce` at `485f19d`.
+Status: option (b) is implemented (Steps 1–2); see "As built" at the end. The proposal
+below is kept as written at `485f19d`.
 
 ## Why
 
@@ -198,6 +199,24 @@ half-day tracker spike.
 Option (a) is cheap to set up, and worth keeping in mind for writing new kernels later.
 But as the vehicle for this experiment, it changes too much at once: the kernel, the
 memory-model assumptions, and the baseline.
+
+## As built (Steps 1–2)
+
+Differences from the proposal above:
+- **Tracker** (`timing/tiletracker`) as proposed, plus listeners and an ignored source port
+  so the engine's own writes into C don't count.
+- **Engine-to-engine messages instead of RDMA writes and ready flags.** Each engine
+  (`timing/commengine`) has its own port on a separate GPU-to-GPU network (the peer fabric,
+  `-link-bw`, `-link-latency`); a tile group travels as one message, so there is no flag
+  protocol and no remote store ordering to get right.
+- **Ownership by group**, not tile parity: `-tiles-per-msg` consecutive tiles form a group,
+  owned by GPU g mod p.
+- **Completion** through `commengine.Session.Wait` (`driver.WaitFor`), not a new driver
+  command: the host blocks until every engine reports done.
+- **Per-message cost** `-msg-overhead`, serialized per engine, overlapped with the previous
+  message's transmission. Reduce cost: 1 cycle per 64-byte line per partial.
+- **Modes**: `tile` (send as groups finish) and `bulk` (same engine, after the whole GEMM);
+  `-reduce-scatter` stops after the owner's sum.
 
 ## Sources
 

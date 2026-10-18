@@ -88,6 +88,35 @@ type Tracker struct {
 	// OnComplete, if set, is called when a tile completes, with the tile's
 	// bytes as L2 holds them.
 	OnComplete func(ev TileEvent, data []byte)
+
+	listeners []func(ev TileEvent)
+	ignored   map[sim.Port]bool
+}
+
+// AddListener registers a function called, inside the simulation, every
+// time a tile completes.
+func (t *Tracker) AddListener(f func(ev TileEvent)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.listeners = append(t.listeners, f)
+}
+
+// ClearListeners removes every listener.
+func (t *Tracker) ClearListeners() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.listeners = nil
+}
+
+// IgnoreSrc makes the tracker ignore stores sent from the given port, such
+// as a communication engine writing reduced tiles back into the region.
+func (t *Tracker) IgnoreSrc(p sim.Port) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.ignored == nil {
+		t.ignored = map[sim.Port]bool{}
+	}
+	t.ignored[p] = true
 }
 
 // New creates an unarmed tracker.
@@ -217,7 +246,7 @@ func (t *Tracker) storeReceived(w *mem.WriteReq) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if !t.armed {
+	if !t.armed || t.ignored[w.Src] {
 		return
 	}
 
@@ -315,6 +344,9 @@ func (t *Tracker) storeAcked(rsp *mem.WriteDoneRsp) {
 		t.events = append(t.events, ev)
 		if t.OnComplete != nil {
 			t.OnComplete(ev, append([]byte(nil), ts.data...))
+		}
+		for _, f := range t.listeners {
+			f(ev)
 		}
 	}
 }

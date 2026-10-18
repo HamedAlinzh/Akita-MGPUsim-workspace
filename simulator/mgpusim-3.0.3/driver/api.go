@@ -4,6 +4,7 @@ import (
 	"log"
 	"math"
 	"sync/atomic"
+	"time"
 
 	// embed hsaco files
 	_ "embed"
@@ -300,4 +301,34 @@ func (d *Driver) PhysicalAddress(ctx *Context, vAddr uint64) (uint64, bool) {
 		return 0, false
 	}
 	return page.PAddr + (vAddr - page.VAddr), true
+}
+
+// WaitFor blocks the host until done is closed by a component inside the
+// simulation, such as a communication engine that finished. It panics if the
+// simulation runs out of events first, which would otherwise hang forever.
+func (d *Driver) WaitFor(done <-chan struct{}) {
+	d.enqueueSignal <- true
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-time.After(time.Second):
+			d.engineRunningMutex.Lock()
+			running := d.engineRunning
+			d.engineRunningMutex.Unlock()
+
+			if running {
+				continue
+			}
+
+			select {
+			case <-done:
+				return
+			default:
+				panic("driver: the simulation went idle before the awaited " +
+					"signal")
+			}
+		}
+	}
 }

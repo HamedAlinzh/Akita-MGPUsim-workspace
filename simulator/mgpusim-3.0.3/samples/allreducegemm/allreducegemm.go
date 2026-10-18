@@ -7,6 +7,7 @@ import (
 	"github.com/sarchlab/mgpusim/v3/benchmarks/allreducegemm"
 	"github.com/sarchlab/mgpusim/v3/benchmarks/mccl"
 	"github.com/sarchlab/mgpusim/v3/samples/runner"
+	"github.com/sarchlab/mgpusim/v3/timing/commengine"
 )
 
 var mFlag = flag.Uint("m", 128, "Number of rows of matrix A and C.")
@@ -25,6 +26,13 @@ var allReduceChunkFlag = flag.Uint("allreduce-chunk", 0,
 	"All-Reduce scratch buffer size in elements (0 = 65536).")
 var collectiveThreadsFlag = flag.Int("collective-threads", 1024,
 	"Threads per All-Reduce push/reduce kernel, a multiple of 64.")
+var tilesPerMsgFlag = flag.Int("tiles-per-msg", 1,
+	"With -engine-mode: finished tiles merged into one engine message.")
+var reduceScatterFlag = flag.Bool("reduce-scatter", false,
+	"Reduce-scatter instead of all-reduce: with -engine-mode in the engines, "+
+		"otherwise a ring reduce-scatter (one band only).")
+var tileSizeFlag = flag.Uint("tile-size", 0,
+	"Work-group edge T; each work-group computes a 4T x 4T tile (0 = 8).")
 var perBandScratchFlag = flag.Bool("per-band-scratch", false,
 	"Give every band its own All-Reduce scratch buffers.")
 
@@ -41,7 +49,14 @@ func main() {
 	benchmark.Overlap = *overlapFlag
 	benchmark.AllReduceChunk = uint32(*allReduceChunkFlag)
 	benchmark.PerBandScratch = *perBandScratchFlag
+	benchmark.TileSize = uint32(*tileSizeFlag)
 	mccl.CollectiveThreads = *collectiveThreadsFlag
+
+	if runner.EngineMode != "" {
+		benchmark.Comm, benchmark.CommOptions = fusedComm(runner)
+	} else {
+		benchmark.ReduceScatter = *reduceScatterFlag
+	}
 
 	switch *algorithmFlag {
 	case "ring":
@@ -56,4 +71,29 @@ func main() {
 	runner.AddBenchmark(benchmark)
 
 	runner.Run()
+}
+
+// fusedComm builds the communication-engine session over the GPUs the runner
+// selected, from -engine-mode, -tiles-per-msg and -reduce-scatter.
+func fusedComm(r *runner.Runner) (*commengine.Session, commengine.Options) {
+	opt := commengine.Options{TilesPerMsg: *tilesPerMsgFlag}
+	switch r.EngineMode {
+	case "tile":
+		opt.Mode = commengine.ModeTile
+	case "bulk":
+		opt.Mode = commengine.ModeBulk
+	default:
+		log.Panicf(`-engine-mode must be "tile" or "bulk", got %q`, r.EngineMode)
+	}
+	if *reduceScatterFlag {
+		opt.Collective = commengine.ReduceScatter
+	}
+
+	var parts []commengine.Participant
+	for _, id := range r.GPUIDs {
+		gpu := r.Platform().GPUs[id-1]
+		parts = append(parts, commengine.Participant{
+			Tracker: gpu.TileTracker, Engine: gpu.CommEngine})
+	}
+	return commengine.NewSession(r.Driver(), parts), opt
 }

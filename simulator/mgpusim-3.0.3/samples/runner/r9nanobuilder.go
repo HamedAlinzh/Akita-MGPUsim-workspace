@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"github.com/sarchlab/mgpusim/v3/timing/commengine"
 	"github.com/sarchlab/mgpusim/v3/timing/tiletracker"
 
 	rob2 "github.com/sarchlab/mgpusim/v3/timing/rob"
@@ -37,6 +38,8 @@ type R9NanoGPUBuilder struct {
 	l1CacheSize                    uint64
 	l1AcquireOnLaunch              bool
 	ldsOccupancy                   bool
+	commEngine                     bool
+	msgOverhead                    sim.VTimeInSec
 	l2CacheSize                    uint64
 	log2PageSize                   uint64
 	log2CacheLineSize              uint64
@@ -225,6 +228,16 @@ func (b R9NanoGPUBuilder) WithL1AcquireOnLaunch(on bool) R9NanoGPUBuilder {
 	return b
 }
 
+// WithCommEngine adds a communication engine (timing/commengine) to the GPU,
+// connected to the L2 caches, with the given per-message overhead.
+func (b R9NanoGPUBuilder) WithCommEngine(
+	on bool, msgOverhead sim.VTimeInSec,
+) R9NanoGPUBuilder {
+	b.commEngine = on
+	b.msgOverhead = msgOverhead
+	return b
+}
+
 // WithLDSOccupancy makes the dispatcher count dynamic LDS when deciding how
 // many work-groups fit on a CU. See cp.Builder.WithLDSOccupancy.
 func (b R9NanoGPUBuilder) WithLDSOccupancy(on bool) R9NanoGPUBuilder {
@@ -347,6 +360,18 @@ func (b *R9NanoGPUBuilder) connectL1ToL2() {
 	for _, l1v := range b.l1vCaches {
 		l1v.SetLowModuleFinder(lowModuleFinder)
 		l1ToL2Conn.PlugIn(l1v.GetPortByName("Bottom"), 16)
+	}
+
+	if b.commEngine {
+		e := commengine.MakeBuilder().
+			WithEngine(b.engine).
+			WithFreq(b.freq).
+			WithMsgOverhead(b.msgOverhead).
+			Build(b.gpuName + ".CommEngine")
+		e.SetMemFinder(lowModuleFinder)
+		l1ToL2Conn.PlugIn(e.ToMem, 64)
+		b.gpu.CommEngine = e
+		b.gpu.TileTracker.IgnoreSrc(e.ToMem)
 	}
 
 	for _, l1s := range b.l1sCaches {

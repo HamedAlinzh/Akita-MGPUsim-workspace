@@ -26,6 +26,12 @@ Layout: one subfolder per experiment.
   `real_layers.csv` (f and waves per real layer), `points.csv` (the three representative
   points, real vs simulated, and the derived knobs), `sensitivity_eff.csv`,
   `sensitivity_latency.csv`, `moe.csv`. Simulated GEMM times come from `step1_tracker/`.
+  Caveats: simulated waves at the f≈0.8 and f≈0.5 points (2.0) are a bit above real (1.68),
+  so the first tiles finish slightly early (0.42 of the GEMM vs 0.50) and overlap gains there
+  will be slightly optimistic. Real f at the f≈0.5 and f≈0.25 points moves by about ±0.1
+  with the efficiency guesses, so Step 4 sweeps `-link-bw` as a curve with the three points
+  marked. The MoE rows are a discussion item only: in-node, hardware triggering keeps f at
+  0.15 or below, so the win there is removing launch latency, not overlap.
 - `stepD_knobs/`: before/after check of `-link-bw`/`-link-latency` (`run.sh`). Defaults
   reproduce the 433 us baseline exactly (window 432.742 us); the peer fabric at PCIe-like
   values (34 GB/s, 140 ns) gives 430.195 us.
@@ -37,6 +43,13 @@ Layout: one subfolder per experiment.
   completion groups per CSV; the `cu4_` files are the representative-point shapes, run with
   `-lds-occupancy` on (`TestTileTrackerRepresentative`); `cu16_M768_N512` is the 16-CU
   scale check (`TestTileTrackerScaleCheck`, log in `scale_check.log`).
+- `step2_engine/`: Step 2, the communication engine. `correctness/` (from
+  `scripts/step2_correctness.sh`; summary `correctness_summary.txt` from
+  `scripts/step2_summary.py`): 2 GPUs, 4 CUs, 384x256, K/GPU 256, tileSize 8, f≈0.5 knobs,
+  N = 1/2/4 in tile and bulk mode, reduce-scatter at N = 1, and a 4-GPU all-reduce; every run
+  verifies and message/byte counts equal the expected values. `timing/` (from
+  `scripts/step2_timing.sh`): mccl ring all-reduce at f≈0.5 and ring reduce-scatter at
+  f≈0.25. `calibration.csv` from `TestCalibration` in `timing/commengine`.
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
