@@ -28,6 +28,9 @@ Layout: one subfolder per experiment.
   `TILETRACKER_OUT=<this dir> go test -run TestTileTracker -v ./benchmarks/allreducegemm/`.
   `test_output.txt` is the summary; `tiles_cu<CUs>_M_N_K_t<tileSize>.csv` lists every tile
   completion in order (times relative to arming, just before the GEMM launch).
+  `spread_summary.txt` (from `scripts/tile_spread.py`) gives first/median/last completion and
+  completion groups per CSV; the `cu4_` files are the representative-point shapes, run with
+  `-lds-occupancy` on (`TestTileTrackerRepresentative`).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

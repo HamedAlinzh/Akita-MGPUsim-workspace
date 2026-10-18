@@ -184,6 +184,11 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   addresses, so `Arm` takes a physical→virtual page map (`driver.PhysicalAddress`).
   `allreducegemm` gained `TileSize` (0 = `const tileSize`, which `tune_gemm_tile.py` still
   patches), `OnPartialC` and `ResultC`. Platform builder gained `WithNumCUPerGPU`.
+- **LDS occupancy** (`-lds-occupancy`, default off). The dispatcher can count a work-group's
+  dynamic LDS (`driver.LocalPtr` arguments, in the packet's `GroupSegmentSize`) instead of
+  only the code object's static LDS. For `mmmKernel_local` it changes nothing: 74 VGPRs
+  already cap a CU at 12 work-groups (tileSize 4, 8) or 3 (tileSize 16), below the LDS limit.
+  `-cus-per-gpu` (default 64) sets CUs per GPU.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -250,6 +255,12 @@ Step requirements, as the user set them:
 Knobs still to add for Step 4: `-link-bw` (with network clock and flit size), `-link-latency`
 (PCIe switch latency, hardcoded 140 cycles), `-cus-per-gpu` (platform hardcodes 16 SAs × 4 CUs).
 No tile-size × N sweep until the user has seen Step 4.
+
+Rule added after Step 1: every simulated config must have tiles finishing spread out over
+time (at 64 CUs a 256×256 GEMM finishes all tiles within 1 µs, leaving nothing to overlap).
+Waves = tiles / (CUs × resident work-groups per CU); check spread with the tracker
+(`TestTileTrackerRepresentative`, `scripts/tile_spread.py`). Candidate shapes: 4 CUs,
+tileSize 8, K/GPU 256: 384×256 (2.0 waves) and 512×320 (3.3 waves).
 
 Findings that shape the design (details in `reports/gemm-allreduce-overlap.html`):
 - Banding a GEMM to overlap All-Reduce never beat one launch: extra launches, low-occupancy

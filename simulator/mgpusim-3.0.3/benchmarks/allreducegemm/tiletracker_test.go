@@ -24,10 +24,18 @@ func trackTiles(t *testing.T, m, k, n, tileSize uint32) {
 
 func trackTilesOnCUs(t *testing.T, numCU int, m, k, n, tileSize uint32) {
 	t.Helper()
+	trackTilesWith(t, false, numCU, m, k, n, tileSize)
+}
+
+func trackTilesWith(
+	t *testing.T, ldsOccupancy bool, numCU int, m, k, n, tileSize uint32,
+) {
+	t.Helper()
 
 	platform := runner.MakeR9NanoBuilder().
 		WithNumGPU(1).
 		WithNumCUPerGPU(numCU).
+		WithLDSOccupancy(ldsOccupancy).
 		Build()
 	d := platform.Driver
 	d.Run()
@@ -184,4 +192,12 @@ func TestTileTrackerManyWorkGroups(t *testing.T) { trackTiles(t, 256, 256, 256, 
 func TestTileTrackerSequentialWaves(t *testing.T) {
 	trackTilesOnCUs(t, 1, 128, 256, 128, 16)
 	trackTilesOnCUs(t, 1, 128, 256, 128, 8)
+}
+
+// The simulated shapes proposed for the representative points (Step 0
+// follow-up), with LDS counted in occupancy: K per GPU 256, tileSize 8,
+// 4 CUs of 12 resident work-groups each.
+func TestTileTrackerRepresentative(t *testing.T) {
+	trackTilesWith(t, true, 4, 384, 256, 256, 8) // 96 tiles, 2.0 waves
+	trackTilesWith(t, true, 4, 512, 256, 320, 8) // 160 tiles, 3.3 waves
 }

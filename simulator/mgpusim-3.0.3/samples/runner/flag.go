@@ -59,6 +59,11 @@ var l2CacheSizeFlag = flag.Uint64("l2-cache-size", 2*1024*1024,
 	"The total L2 cache size per GPU, in bytes.")
 var dramSizeFlag = flag.Uint64("dram-size", 4*1024*1024*1024,
 	"The DRAM size per GPU, in bytes. Cannot exceed 4GB.")
+var ldsOccupancyFlag = flag.Bool("lds-occupancy", false,
+	"Count each work-group's dynamic LDS (local pointer kernel arguments) "+
+		"when deciding how many work-groups a CU holds.")
+var cusPerGPUFlag = flag.Int("cus-per-gpu", 64,
+	"Compute units per GPU: 1-3 or a multiple of 4 (shader arrays of 4 CUs).")
 
 var analyszerNameFlag = flag.String("analyzer-name", "",
 	"The name of the analyzer to use.")
@@ -139,6 +144,8 @@ func (r *Runner) ParseFlag() *Runner {
 	r.L1CacheSize = *l1CacheSizeFlag
 	r.L1AcquireOnLaunch = *l1AcquireFlag
 	r.H2DCycles = *h2dCyclesFlag
+	r.LDSOccupancy = *ldsOccupancyFlag
+	r.CUsPerGPU = *cusPerGPUFlag
 	r.L2CacheSize = *l2CacheSizeFlag
 	r.DRAMSize = *dramSizeFlag
 

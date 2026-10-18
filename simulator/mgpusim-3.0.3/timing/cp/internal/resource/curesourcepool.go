@@ -38,6 +38,10 @@ type CUResourcePool interface {
 type CUResourcePoolImpl struct {
 	registeredCUs map[DispatchableCU]bool
 	cus           []CUResource
+
+	// CountDynamicLDS makes CUs registered afterwards count a work-group's
+	// dynamic LDS (local pointer arguments) against the CU's LDS.
+	CountDynamicLDS bool
 }
 
 // NewCUResourcePool returns a CUResourcePoll
@@ -65,7 +69,8 @@ func (p *CUResourcePoolImpl) RegisterCU(cu DispatchableCU) {
 	}
 
 	r := &CUResourceImpl{
-		reservedWGs: make(map[*kernels.WorkGroup][]WfLocation),
+		reservedWGs:     make(map[*kernels.WorkGroup][]WfLocation),
+		countDynamicLDS: p.CountDynamicLDS,
 	}
 
 	r.port = cu.DispatchingPort()

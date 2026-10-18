@@ -21,6 +21,7 @@ type Builder struct {
 	monitor        *monitoring.Monitor
 	perfAnalyzer   *analysis.PerfAnalyzer
 	numDispatchers int
+	ldsOccupancy   bool
 }
 
 // MakeBuilder creates a new builder with default configuration values.
@@ -36,6 +37,14 @@ func MakeBuilder() Builder {
 // the dispatchers.
 func (b Builder) WithVisTracer(tracer tracing.Tracer) Builder {
 	b.visTracer = tracer
+	return b
+}
+
+// WithLDSOccupancy makes the dispatchers count each work-group's dynamic LDS
+// (the kernel's local pointer arguments) when deciding how many work-groups a
+// CU can hold. Off by default: then only the code object's static LDS counts.
+func (b Builder) WithLDSOccupancy(on bool) Builder {
+	b.ldsOccupancy = on
 	return b
 }
 
@@ -140,6 +149,7 @@ func (Builder) createPorts(cp *CommandProcessor, name string) {
 
 func (b *Builder) buildDispatchers(cp *CommandProcessor) {
 	cuResourcePool := resource.NewCUResourcePool()
+	cuResourcePool.CountDynamicLDS = b.ldsOccupancy
 	builder := dispatching.MakeBuilder().
 		WithCP(cp).
 		WithAlg("round-robin").

@@ -36,6 +36,7 @@ type R9NanoGPUBuilder struct {
 	dramSize                       uint64
 	l1CacheSize                    uint64
 	l1AcquireOnLaunch              bool
+	ldsOccupancy                   bool
 	l2CacheSize                    uint64
 	log2PageSize                   uint64
 	log2CacheLineSize              uint64
@@ -221,6 +222,13 @@ func (b R9NanoGPUBuilder) WithL1CacheSize(size uint64) R9NanoGPUBuilder {
 // a kernel can read data that another GPU has since overwritten remotely.
 func (b R9NanoGPUBuilder) WithL1AcquireOnLaunch(on bool) R9NanoGPUBuilder {
 	b.l1AcquireOnLaunch = on
+	return b
+}
+
+// WithLDSOccupancy makes the dispatcher count dynamic LDS when deciding how
+// many work-groups fit on a CU. See cp.Builder.WithLDSOccupancy.
+func (b R9NanoGPUBuilder) WithLDSOccupancy(on bool) R9NanoGPUBuilder {
+	b.ldsOccupancy = on
 	return b
 }
 
@@ -841,7 +849,8 @@ func (b *R9NanoGPUBuilder) buildCP() {
 		WithEngine(b.engine).
 		WithFreq(b.freq).
 		WithMonitor(b.monitor).
-		WithPerfAnalyzer(b.perfAnalyzer)
+		WithPerfAnalyzer(b.perfAnalyzer).
+		WithLDSOccupancy(b.ldsOccupancy)
 
 	if b.enableVisTracing {
 		builder = builder.WithVisTracer(b.visTracer)

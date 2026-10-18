@@ -58,6 +58,8 @@ type Runner struct {
 	L1CacheSize       uint64
 	L1AcquireOnLaunch bool
 	H2DCycles         int
+	LDSOccupancy      bool
+	CUsPerGPU         int
 	L2CacheSize       uint64
 	DRAMSize          uint64
 
@@ -117,6 +119,8 @@ func (r *Runner) buildTimingPlatform() {
 		WithL1CacheSize(r.L1CacheSize).
 		WithL1AcquireOnLaunch(r.L1AcquireOnLaunch).
 		WithH2DCycles(r.H2DCycles).
+		WithLDSOccupancy(r.LDSOccupancy).
+		WithNumCUPerGPU(r.CUsPerGPU).
 		WithL2CacheSize(r.L2CacheSize).
 		WithDRAMSize(r.DRAMSize)
 

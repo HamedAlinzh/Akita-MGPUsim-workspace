@@ -41,6 +41,17 @@ from dataclasses import dataclass
 #   https://rocm.docs.amd.com/en/latest/reference/gpu-arch/mi300.html
 # Efficiencies are assumptions, not measurements: large BF16 GEMMs on MI300X
 #   commonly reach well under peak, and collectives under link peak.
+# Waves: output tiles per GPU / (CUs x resident work-groups per CU).
+# MI300X has 304 CUs, 64 KiB LDS and a 512 KiB VGPR file per CU (ROCm "GPU
+#   hardware specifications" table).
+#   https://rocm.docs.amd.com/en/docs-6.3.3/reference/gpu-arch-specs.html
+# Residency of a 256x256 BF16 output tile is our estimate, not a measurement:
+#   its FP32 accumulators are 256 KiB, half the CU's VGPR file, and staging a
+#   256x64 BF16 slice of A and of B takes 64 KiB, all of the LDS. So one
+#   work-group per CU (two at most, with a smaller K slice).
+REAL_CUS = 304
+REAL_TILE = 256
+REAL_RESIDENT_WGS = 1
 REAL_PEAK_FLOPS = 1307.4e12
 REAL_LINK_BW = 64e9          # bytes/s per direction per link
 REAL_GEMM_EFF = 0.70         # assumed achieved fraction of peak FLOP/s
@@ -88,6 +99,17 @@ def gemm_time(m: int, n: int, k: int) -> float:
     return 2 * m * n * k / (REAL_PEAK_FLOPS * REAL_GEMM_EFF)
 
 
+def real_waves(m: int, n: int, resident: int = REAL_RESIDENT_WGS) -> float:
+    tiles = math.ceil(m / REAL_TILE) * math.ceil(n / REAL_TILE)
+    return tiles / (REAL_CUS * resident)
+
+
+def first_tile_share(waves: float) -> float:
+    """Share of the GEMM's time before the first tiles finish, if every
+    round of resident work-groups takes the same time."""
+    return 1 / math.ceil(waves)
+
+
 def real_layers(tokens: int) -> list[RealLayer]:
     out = []
     for model in (LLAMA70, LLAMA405):
@@ -128,6 +150,15 @@ CALIBRATION = [
 ]
 SIM_CUS = 64
 SIM_TILE = 32               # tileSize 8 -> 32x32 output tile per work-group
+# Resident work-groups per CU for mmmKernel_local with -lds-occupancy, from
+# TestGEMMResidency (timing/cp/internal/resource): 74 VGPRs limit a SIMD to 3
+# wavefronts, before LDS does. tileSize 4 and 8 -> 12, tileSize 16 -> 3.
+SIM_RESIDENT_WGS = {4: 12, 8: 12, 16: 3}
+
+
+def sim_waves(m: int, n: int, cus: int, tile_size: int = 8) -> float:
+    edge = 4 * tile_size
+    return (m // edge) * (n // edge) / (cus * SIM_RESIDENT_WGS[tile_size])
 SIM_LINK_NOMINAL = 32 * 2**30  # Akita PCIe 4.0 x16: 16 Gb/s x 16 / 8 per direction
 # Measured: a 1 MB All-Reduce on 2 GPUs (16384 threads) wrote 1 MB each way in
 # 52.7 us of link-busy time = 19.9 GB/s per direction, 58% of nominal. The

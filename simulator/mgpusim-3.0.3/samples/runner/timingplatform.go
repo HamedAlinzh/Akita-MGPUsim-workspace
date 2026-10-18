@@ -32,6 +32,7 @@ type R9NanoPlatformBuilder struct {
 	log2PageSize                       uint64
 	l1CacheSize                        uint64
 	l1AcquireOnLaunch                  bool
+	ldsOccupancy                       bool
 	h2dCycles                          int
 	l2CacheSize                        uint64
 	dramSize                           uint64
@@ -98,6 +99,13 @@ func (b R9NanoPlatformBuilder) WithNumCUPerGPU(n int) R9NanoPlatformBuilder {
 	default:
 		log.Panicf("CUs per GPU must be 1-3 or a multiple of 4, not %d", n)
 	}
+	return b
+}
+
+// WithLDSOccupancy makes every GPU's dispatcher count dynamic LDS when
+// deciding how many work-groups fit on a CU.
+func (b R9NanoPlatformBuilder) WithLDSOccupancy(on bool) R9NanoPlatformBuilder {
+	b.ldsOccupancy = on
 	return b
 }
 
@@ -429,6 +437,7 @@ func (b *R9NanoPlatformBuilder) createGPUBuilder(
 		WithGlobalStorage(b.globalStorage).
 		WithL1CacheSize(b.l1CacheSize).
 		WithL1AcquireOnLaunch(b.l1AcquireOnLaunch).
+		WithLDSOccupancy(b.ldsOccupancy).
 		WithL2CacheSize(b.l2CacheSize).
 		WithDRAMSize(b.dramSize)
 

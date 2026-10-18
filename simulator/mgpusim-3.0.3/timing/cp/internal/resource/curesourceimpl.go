@@ -27,6 +27,11 @@ type CUResourceImpl struct {
 	ldsGranularity int
 	ldsMask        resourceMask
 
+	// countDynamicLDS makes a work-group occupy the LDS in its dispatch
+	// packet, which includes the dynamic local arguments (driver.LocalPtr),
+	// rather than only the code object's static group segment.
+	countDynamicLDS bool
+
 	nextSIMD    int
 	reservedWGs map[*kernels.WorkGroup][]WfLocation
 }
@@ -95,8 +100,7 @@ func (r *CUResourceImpl) withinLDSLimitation(
 	wg *kernels.WorkGroup,
 	locations []WfLocation,
 ) bool {
-	co := wg.CodeObject
-	required := r.unitsOccupy(int(co.WGGroupSegmentByteSize), r.ldsGranularity)
+	required := r.unitsOccupy(r.ldsBytesOf(wg), r.ldsGranularity)
 	offset, ok := r.ldsMask.nextRegion(required, allocStatusFree)
 	if !ok {
 		return false
@@ -163,6 +167,14 @@ func (r *CUResourceImpl) matchWfWithSIMDs(
 	return true
 }
 
+// ldsBytesOf returns the LDS bytes a work-group occupies.
+func (r *CUResourceImpl) ldsBytesOf(wg *kernels.WorkGroup) int {
+	if r.countDynamicLDS && wg.Packet != nil {
+		return int(wg.Packet.GroupSegmentSize)
+	}
+	return int(wg.CodeObject.WGGroupSegmentByteSize)
+}
+
 func (r *CUResourceImpl) unitsOccupy(amount, granularity int) int {
 	if amount%granularity == 0 {
 		return amount / granularity
@@ -213,8 +225,7 @@ func (r *CUResourceImpl) FreeResourcesForWG(wg *kernels.WorkGroup) {
 	for _, location := range locations {
 		r.wfPoolFreeCount[location.SIMDID]++
 
-		ldsUnits := r.unitsOccupy(int(co.WGGroupSegmentByteSize),
-			r.ldsGranularity)
+		ldsUnits := r.unitsOccupy(r.ldsBytesOf(wg), r.ldsGranularity)
 		r.ldsMask.setStatus(location.LDSOffset/r.ldsGranularity, ldsUnits,
 			allocStatusFree)
 
