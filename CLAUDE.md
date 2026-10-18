@@ -218,6 +218,29 @@ unchanged.
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
 | 5 | MoE all-to-all extension (design note section only) | Not started |
 
+Step requirements, as the user set them:
+1. **Tracker spike.** One GPU, tracker only. Every output tile reports complete exactly once,
+   after its last store is acknowledged by L2. Test tileSize 4, 8 and 16 at 128×128×256. If it
+   isn't reliable, stop and explain.
+2. **Correctness on 2 GPUs.** Build the send engine and per-tile reduce-scatter + all-gather.
+   The tracker supports `-tiles-per-msg N`: merge N adjacent finished tiles into one message
+   (N=1 is per tile). Verify 128×128×256, tileSize 8, at N = 1, 2, 4 against the CPU sum.
+   Correctness only.
+3. **Two reduction placements**, configurable: (a) the tile owner reduces via the engine;
+   (b) T3-style near-memory reduction at the memory controller. Re-verify both at the Step 2
+   size. Read T3's mechanism section first and document what we model the same and what
+   differs.
+4. **First timing comparison** on one ratio-matched config from Step 0 that runs in a few
+   minutes: strong baseline (one GEMM launch + Ring All-Reduce, `-collective-threads 16384`),
+   placement (a), placement (b), at tileSize 8 and N = 1. Report the window, the gap to ideal
+   (GEMM time plus the last message's round trip), and a per-message timeline for the first
+   few messages.
+5. **MoE plan, design note only.** Append to `reports/fused-gemm-comm-design.md`: extending the
+   engine to MoE all-to-all (dispatch and combine) with skewed, uneven per-expert message
+   sizes. mccl has no all-to-all, so it needs a host-side baseline all-to-all and an expert
+   GEMM benchmark. Cite CAIS's MoE in-switch paper (arXiv 2605.05607) as related work. Don't
+   implement.
+
 Knobs still to add for Step 4: `-link-bw` (with network clock and flit size), `-link-latency`
 (PCIe switch latency, hardcoded 140 cycles), `-cus-per-gpu` (platform hardcodes 16 SAs × 4 CUs).
 No tile-size × N sweep until the user has seen Step 4.
