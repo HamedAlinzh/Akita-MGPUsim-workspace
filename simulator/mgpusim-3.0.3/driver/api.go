@@ -291,3 +291,13 @@ func (d *Driver) MemCopyD2D(ctx *Context, dst Ptr, src Ptr, num int) {
 	d.EnqueueMemCopyD2D(queue, dst, src, num)
 	d.DrainCommandQueue(queue)
 }
+
+// PhysicalAddress returns the physical address that a virtual address of the
+// context maps to, and whether it is mapped.
+func (d *Driver) PhysicalAddress(ctx *Context, vAddr uint64) (uint64, bool) {
+	page, found := d.pageTable.Find(ctx.pid, vAddr)
+	if !found {
+		return 0, false
+	}
+	return page.PAddr + (vAddr - page.VAddr), true
+}

@@ -178,6 +178,12 @@ changing timing code. Commit hashes are on branch `All-reduce`.
 - **`allreducegemm`** gained `-band-rows`, `-overlap`, `-allreduce-chunk`, `-per-band-scratch`,
   `-collective-threads`. It logs `allreducegemm phases: window=… gemm_wait=… allreduce=…`, and
   `Verify` prints a mismatch summary by band and ring chunk before panicking.
+- **Tile tracker** (Step 1). `timing/tiletracker` hooks every L2 bank's top port (attached
+  to each GPU as `GPU.TileTracker`, idle until `Arm`). Counts bytes of `WriteReq`s into a
+  region by request ID and credits them on the matching `WriteDoneRsp`; L2 sees physical
+  addresses, so `Arm` takes a physical→virtual page map (`driver.PhysicalAddress`).
+  `allreducegemm` gained `TileSize` (0 = `const tileSize`, which `tune_gemm_tile.py` still
+  patches), `OnPartialC` and `ResultC`. Platform builder gained `WithNumCUPerGPU`.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -212,7 +218,7 @@ unchanged.
 | Step | What | Status |
 |---|---|---|
 | 0 | Ratio-matched sizing (`scripts/ratio_model.py`) | Done, `210936c`. Proposal: 256×256×512, 2 GPUs, 64 CUs, tileSize 8, link bandwidth 0.7–40 GB/s per real layer |
-| 1 | Tracker spike: 1 GPU, every tile completes exactly once after its last L2-acknowledged store (tileSize 4/8/16, 128×128×256) | Not started; go/no-go |
+| 1 | Tracker spike: 1 GPU, every tile completes exactly once after its last L2-acknowledged store (tileSize 4/8/16, 128×128×256) | Done: go. `timing/tiletracker`, test `benchmarks/allreducegemm/tiletracker_test.go`, `results/step1_tracker/` |
 | 2 | Send engine, per-tile reduce-scatter + all-gather, `-tiles-per-msg N`; verify 128×128×256 at N = 1, 2, 4 | Not started |
 | 3 | Reduction placement: (a) owner reduces via engine, (b) T3-style near memory | Not started |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |

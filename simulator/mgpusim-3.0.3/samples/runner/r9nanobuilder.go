@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"github.com/sarchlab/mgpusim/v3/timing/tiletracker"
 
 	rob2 "github.com/sarchlab/mgpusim/v3/timing/rob"
 
@@ -250,6 +251,7 @@ func (b R9NanoGPUBuilder) Build(name string, id uint64) *GPU {
 	b.createGPU(name, id)
 	b.buildSAs()
 	b.buildL2Caches()
+	b.attachTileTracker()
 	b.buildDRAMControllers()
 	b.buildCP()
 	b.buildL2TLB()
@@ -533,6 +535,13 @@ func (b *R9NanoGPUBuilder) buildSAs() {
 	for i := 0; i < b.numShaderArray; i++ {
 		saName := fmt.Sprintf("%s.SA[%d]", b.gpuName, i)
 		b.buildSA(saBuilder, saName)
+	}
+}
+
+func (b *R9NanoGPUBuilder) attachTileTracker() {
+	b.gpu.TileTracker = tiletracker.New()
+	for _, l2 := range b.l2Caches {
+		b.gpu.TileTracker.Attach(l2.GetPortByName("Top"))
 	}
 }
 

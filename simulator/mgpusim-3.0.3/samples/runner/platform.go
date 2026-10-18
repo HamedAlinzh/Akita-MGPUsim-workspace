@@ -7,6 +7,7 @@ import (
 	"github.com/sarchlab/mgpusim/v3/timing/cp"
 	"github.com/sarchlab/mgpusim/v3/timing/pagemigrationcontroller"
 	"github.com/sarchlab/mgpusim/v3/timing/rdma"
+	"github.com/sarchlab/mgpusim/v3/timing/tiletracker"
 )
 
 // TraceableComponent is a component that can accept traces
@@ -39,4 +40,8 @@ type GPU struct {
 	L1ITLBs          []TraceableComponent
 	L2TLBs           []TraceableComponent
 	MemControllers   []TraceableComponent
+
+	// TileTracker watches stores into a region at the L2 top ports. It is
+	// attached to every GPU and does nothing until armed.
+	TileTracker *tiletracker.Tracker
 }

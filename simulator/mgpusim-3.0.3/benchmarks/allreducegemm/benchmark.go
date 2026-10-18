@@ -81,6 +81,14 @@ type Benchmark struct {
 	// instead of one set reused by all bands.
 	PerBandScratch bool
 
+	// TileSize is the work-group edge length T; each work-group computes a
+	// 4T x 4T output tile. 0 means tileSize.
+	TileSize uint32
+
+	// OnPartialC, if set, is called for each GPU once its partial C is
+	// allocated and A and B are copied, before any GEMM launch.
+	OnPartialC func(ctx *driver.Context, g, gpuID int, c driver.Ptr)
+
 	kernel *insts.HsaCo
 
 	comms []*mccl.Communicator
@@ -177,11 +185,17 @@ func (b *Benchmark) exec() {
 		gBs[g] = gB
 		partialC[g] = gC
 		cmdQs[g] = b.driver.CreateCommandQueue(b.context)
+
+		if b.OnPartialC != nil {
+			b.OnPartialC(b.context, g, gpuID, gC)
+		}
 	}
 
 	b.initAllReduce()
 
 	bandRows := b.bandRows()
+	// LocalPtr keeps the BlockA line in the form tune_gemm_tile.py expects.
+	tileSize := driver.LocalPtr(b.tileSize())
 	launchBand := func(rowStart uint32) {
 		for g, gpuID := range b.gpus {
 			b.driver.SelectGPU(b.context, gpuID)
@@ -200,7 +214,7 @@ func (b *Benchmark) exec() {
 				cmdQs[g],
 				b.kernel,
 				[3]uint32{b.N / 4, bandRows / 4, 1},
-				[3]uint16{tileSize, tileSize, 1},
+				[3]uint16{uint16(tileSize), uint16(tileSize), 1},
 				kernArgs,
 			)
 		}
@@ -267,6 +281,13 @@ func (b *Benchmark) exec() {
 	b.collectResult(partialC[0])
 }
 
+func (b *Benchmark) tileSize() uint32 {
+	if b.TileSize == 0 {
+		return tileSize
+	}
+	return b.TileSize
+}
+
 func (b *Benchmark) bandRows() uint32 {
 	if b.BandRows == 0 {
 		return b.M
@@ -285,7 +306,7 @@ func (b *Benchmark) validateDimensions(numGPU uint32) {
 	}
 
 	kSlice := b.K / numGPU
-	tile := uint32(4 * tileSize)
+	tile := 4 * b.tileSize()
 
 	if b.M%tile != 0 {
 		log.Panicf("M (%d) must be a multiple of %d", b.M, tile)
@@ -383,6 +404,11 @@ func (b *Benchmark) collectResult(reducedC driver.Ptr) {
 }
 
 // Verify checks the GPU result against a CPU reference implementation.
+// ResultC returns the all-reduced C after Run, row-major M x N.
+func (b *Benchmark) ResultC() []float32 {
+	return b.matrixC.Data
+}
+
 func (b *Benchmark) Verify() {
 	if !b.verify {
 		return

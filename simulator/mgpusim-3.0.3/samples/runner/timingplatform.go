@@ -86,6 +86,21 @@ func (b R9NanoPlatformBuilder) WithL1AcquireOnLaunch(
 // WithH2DCycles sets the fixed latency, in driver cycles, that the driver
 // charges for every host-to-device copy. Each kernel launch makes three such
 // copies (code object, kernel arguments, dispatch packet).
+// WithNumCUPerGPU sets the number of compute units per GPU. A multiple of 4
+// is built as shader arrays of 4 CUs, as the default 64 CUs are; any other
+// count up to 4 is one shader array.
+func (b R9NanoPlatformBuilder) WithNumCUPerGPU(n int) R9NanoPlatformBuilder {
+	switch {
+	case n > 0 && n%4 == 0:
+		b.numSAPerGPU, b.numCUPerSA = n/4, 4
+	case n > 0 && n < 4:
+		b.numSAPerGPU, b.numCUPerSA = 1, n
+	default:
+		log.Panicf("CUs per GPU must be 1-3 or a multiple of 4, not %d", n)
+	}
+	return b
+}
+
 func (b R9NanoPlatformBuilder) WithH2DCycles(cycles int) R9NanoPlatformBuilder {
 	b.h2dCycles = cycles
 	return b

@@ -24,6 +24,10 @@ Layout: one subfolder per experiment.
   16384) at 1 MB on 2 GPUs, and `gemm_t16384/` for one GEMM case at 16384 threads.
 - `step0_ratio/ratio_table.csv`: output of `scripts/ratio_model.py` (real-layer
   communication fractions and the simulated configs proposed to match them).
+- `step1_tracker/`: Step 1 tile-tracker spike, produced by
+  `TILETRACKER_OUT=<this dir> go test -run TestTileTracker -v ./benchmarks/allreducegemm/`.
+  `test_output.txt` is the summary; `tiles_cu<CUs>_M_N_K_t<tileSize>.csv` lists every tile
+  completion in order (times relative to arming, just before the GEMM launch).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
