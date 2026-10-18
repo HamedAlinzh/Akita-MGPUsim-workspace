@@ -201,3 +201,9 @@ func TestTileTrackerRepresentative(t *testing.T) {
 	trackTilesWith(t, true, 4, 384, 256, 256, 8) // 96 tiles, 2.0 waves
 	trackTilesWith(t, true, 4, 512, 256, 320, 8) // 160 tiles, 3.3 waves
 }
+
+// Checks that 4 CUs is not a toy: 16 CUs with 4x the tiles is also 2.0
+// waves and should complete tiles with a similar spread.
+func TestTileTrackerScaleCheck(t *testing.T) {
+	trackTilesWith(t, true, 16, 768, 256, 512, 8) // 384 tiles, 2.0 waves
+}

@@ -22,15 +22,21 @@ Layout: one subfolder per experiment.
   14500 / 7250 / 1450): `gemm_h<cycles>/` sweeps and `allreduce/h<cycles>.csv`.
 - `step1_threads/`: All-Reduce kernel thread count (`-collective-threads` 1024 / 4096 /
   16384) at 1 MB on 2 GPUs, and `gemm_t16384/` for one GEMM case at 16384 threads.
-- `step0_ratio/ratio_table.csv`: output of `scripts/ratio_model.py` (real-layer
-  communication fractions and the simulated configs proposed to match them).
+- `step0_ratio/`: output of `scripts/ratio_model.py`. `report.txt` is the printed summary;
+  `real_layers.csv` (f and waves per real layer), `points.csv` (the three representative
+  points, real vs simulated, and the derived knobs), `sensitivity_eff.csv`,
+  `sensitivity_latency.csv`, `moe.csv`. Simulated GEMM times come from `step1_tracker/`.
+- `stepD_knobs/`: before/after check of `-link-bw`/`-link-latency` (`run.sh`). Defaults
+  reproduce the 433 us baseline exactly (window 432.742 us); the peer fabric at PCIe-like
+  values (34 GB/s, 140 ns) gives 430.195 us.
 - `step1_tracker/`: Step 1 tile-tracker spike, produced by
   `TILETRACKER_OUT=<this dir> go test -run TestTileTracker -v ./benchmarks/allreducegemm/`.
   `test_output.txt` is the summary; `tiles_cu<CUs>_M_N_K_t<tileSize>.csv` lists every tile
   completion in order (times relative to arming, just before the GEMM launch).
   `spread_summary.txt` (from `scripts/tile_spread.py`) gives first/median/last completion and
   completion groups per CSV; the `cu4_` files are the representative-point shapes, run with
-  `-lds-occupancy` on (`TestTileTrackerRepresentative`).
+  `-lds-occupancy` on (`TestTileTrackerRepresentative`); `cu16_M768_N512` is the 16-CU
+  scale check (`TestTileTrackerScaleCheck`, log in `scale_check.log`).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

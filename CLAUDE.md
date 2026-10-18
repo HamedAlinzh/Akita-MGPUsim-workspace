@@ -189,6 +189,12 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   only the code object's static LDS. For `mmmKernel_local` it changes nothing: 74 VGPRs
   already cap a CU at 12 work-groups (tileSize 4, 8) or 3 (tileSize 16), below the LDS limit.
   `-cus-per-gpu` (default 64) sets CUs per GPU.
+- **Peer fabric** (`-link-bw` GB/s per direction, `-link-latency` one-way ns). Setting either
+  moves every GPU's RDMA port off the shared PCIe network onto its own one-switch network
+  (`createPeerFabric` in `timingplatform.go`); host traffic stays on PCIe. Flit 16 B, clock =
+  bandwidth / 16, latency rounded to whole cycles of that clock (logged at startup). With 2
+  GPUs, one switch input pipeline = the one-way latency. Defaults reproduce old results
+  exactly.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -252,15 +258,31 @@ Step requirements, as the user set them:
    GEMM benchmark. Cite CAIS's MoE in-switch paper (arXiv 2605.05607) as related work. Don't
    implement.
 
-Knobs still to add for Step 4: `-link-bw` (with network clock and flit size), `-link-latency`
-(PCIe switch latency, hardcoded 140 cycles), `-cus-per-gpu` (platform hardcodes 16 SAs × 4 CUs).
 No tile-size × N sweep until the user has seen Step 4.
+
+Representative points (user-approved; use only these in Step 4 and later sweeps). Knobs from
+`scripts/ratio_model.py` (`results/step0_ratio/points.csv`), all 2 GPUs, 4 CUs
+(`-cus-per-gpu 4`), tileSize 8, K/GPU 256, `-lds-occupancy`:
+
+| Point | Real layer | Sim shape (M×N×K) | `-link-bw` GB/s | `-link-latency` ns | `-msg-overhead` ns |
+|---|---|---|---|---|---|
+| f≈0.8 | Llama-3 70B attn out-proj all-reduce | 384×256×512 | 0.1807 | 1904 | 9163 |
+| f≈0.5 | Llama-3 70B MLP down-proj all-reduce | 384×256×512 | 0.6325 | 544 | 2618 |
+| f≈0.25 | Llama-3.1 405B MLP down-proj reduce-scatter | 512×320×512 | 1.1504 | 299 | 1440 |
+
+Latency/transfer for a 1-tile message is matched to the real 0.39 (1 µs DMA copy = 172 ns wire
++ 828 ns engine, MI300A data; 128 KiB tile at 51.2 GB/s); the sensitivity range is 0.27–0.78.
+Still to build in Steps 2–4: `-msg-overhead` (per-message cost in the send engine, saved by
+`-tiles-per-msg`), the engine's reduce-scatter-only mode and an mccl ring reduce-scatter
+baseline (for the f≈0.25 point). Calibrate Akita's fixed per-hop fabric cycles (wire latency
+is always 22 fabric cycles at these points) and the engine's fabric efficiency (assumed 0.8).
 
 Rule added after Step 1: every simulated config must have tiles finishing spread out over
 time (at 64 CUs a 256×256 GEMM finishes all tiles within 1 µs, leaving nothing to overlap).
 Waves = tiles / (CUs × resident work-groups per CU); check spread with the tracker
 (`TestTileTrackerRepresentative`, `scripts/tile_spread.py`). Candidate shapes: 4 CUs,
-tileSize 8, K/GPU 256: 384×256 (2.0 waves) and 512×320 (3.3 waves).
+tileSize 8, K/GPU 256: 384×256 (2.0 waves) and 512×320 (3.3 waves). A 16-CU 768×512 run
+(also 2.0 waves) has the same spread, so 4 CUs is not a toy.
 
 Findings that shape the design (details in `reports/gemm-allreduce-overlap.html`):
 - Banding a GEMM to overlap All-Reduce never beat one launch: extra launches, low-occupancy

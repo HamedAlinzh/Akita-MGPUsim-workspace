@@ -2,24 +2,32 @@
 """
 Ratio-matched workload sizing for the fused GEMM + collective study.
 
-We can only simulate small shapes, and at small sizes the communication share
-can look very different from a real system. So we match ratios, not sizes:
+We can only simulate small shapes, so we match ratios, not sizes. Three
+ratios shape the results we care about, and each is matched separately:
 
-  comm fraction  f = t_comm / (t_gemm + t_comm)
+  f          comm fraction t_comm / (t_gemm + t_comm) of the GEMM that produces
+             (or consumes) a collective, both phases serialized;
+  L / X      per-message latency over per-message transfer time, for a message
+             of one output tile (sets whether merging tiles, -tiles-per-msg,
+             pays off);
+  waves      output tiles per GPU / (CUs x resident work-groups per CU) (sets
+             when tiles become ready and how long the tail is).
 
-computed for the GEMM that produces a collective's input (the part a
-hardware-triggered design overlaps), with both phases serialized. The script
+The script prints
 
-  1. estimates f for real tensor-parallel and MoE layers on an MI300X-class
-     8-GPU node,
-  2. models f for small shapes on the simulated R9 Nano, calibrated on our own
-     measurements, and
-  3. proposes simulated configurations (shape, CUs per GPU, link bandwidth)
-     whose predicted f matches each real layer, with an estimated wall time.
+  1. f and waves for real tensor-parallel layers on an MI300X 8-GPU node,
+  2. the three representative points, real vs simulated, with the simulator
+     knobs (-link-bw, -link-latency, and the send engine's -msg-overhead)
+     derived from the ratios,
+  3. sensitivity of real f to the unsourced efficiencies, and of the knobs to
+     the latency range,
+  4. MoE all-to-all rows, including small-token (decode-like) and skewed
+     routing. Analysis only.
 
-Everything printed as "predicted" is a model. Step 4 measures one proposal.
+Simulated GEMM times are measured (1 GPU, tile tracker, -lds-occupancy) and
+read from results/step1_tracker/. Everything else is a model.
 
-Usage:  python3 scripts/ratio_model.py [--tokens 4096] [--csv out.csv]
+Usage:  python3 scripts/ratio_model.py [--tokens 4096] [--outdir results/step0_ratio]
 """
 
 from __future__ import annotations
@@ -27,20 +35,31 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 from dataclasses import dataclass
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------------------
 # Target system: AMD Instinct MI300X, 8 GPUs fully connected.
 # ---------------------------------------------------------------------------
-# Peak dense BF16: 1307.4 TFLOP/s per GPU (AMD MI300X platform specs; also
-#   SemiAnalysis chip page). https://www.amd.com/en/products/accelerators/instinct/mi300/platform.html
-# Interconnect: seven Infinity Fabric links per GPU form a fully connected
-#   8-GPU node; 896 GB/s total aggregate bidirectional peer-to-peer bandwidth
-#   per GPU (AMD platform page; ROCm MI300 microarchitecture page), i.e.
-#   128 GB/s bidirectional = 64 GB/s per direction per link.
+# Peak dense BF16: 1307.4 TFLOP/s per GPU (AMD MI300X platform specs).
+#   https://www.amd.com/en/products/accelerators/instinct/mi300/platform.html
+# Interconnect: seven Infinity Fabric links per GPU, fully connected; 896 GB/s
+#   aggregate bidirectional peer bandwidth per GPU, i.e. 64 GB/s per direction
+#   per link (AMD platform page; ROCm MI300 microarchitecture page).
 #   https://rocm.docs.amd.com/en/latest/reference/gpu-arch/mi300.html
-# Efficiencies are assumptions, not measurements: large BF16 GEMMs on MI300X
-#   commonly reach well under peak, and collectives under link peak.
+# HBM3: 5.3 TB/s per GPU (AMD MI300X product page).
+# GEMM, link and HBM efficiencies are assumptions, not measurements; see the
+#   sensitivity section.
+REAL_PEAK_FLOPS = 1307.4e12
+REAL_LINK_BW = 64e9          # bytes/s per direction per link
+REAL_HBM_BW = 5.3e12
+REAL_GEMM_EFF = 0.70
+REAL_LINK_EFF = 0.80
+REAL_HBM_EFF = 0.80
+BF16 = 2
+
 # Waves: output tiles per GPU / (CUs x resident work-groups per CU).
 # MI300X has 304 CUs, 64 KiB LDS and a 512 KiB VGPR file per CU (ROCm "GPU
 #   hardware specifications" table).
@@ -52,51 +71,33 @@ from dataclasses import dataclass
 REAL_CUS = 304
 REAL_TILE = 256
 REAL_RESIDENT_WGS = 1
-REAL_PEAK_FLOPS = 1307.4e12
-REAL_LINK_BW = 64e9          # bytes/s per direction per link
-REAL_GEMM_EFF = 0.70         # assumed achieved fraction of peak FLOP/s
-REAL_LINK_EFF = 0.80         # assumed achieved fraction of link bandwidth
-BF16 = 2                     # bytes per element
+
+# Per-message latency. MI300A shares MI300X's Infinity Fabric generation.
+#   "Inter-APU Communication on AMD MI300A Systems via Infinity Fabric: a Deep
+#   Dive" (MEMSYS 2025, arXiv 2508.11298), Sec. 5.1-5.2:
+#   - a GPU pointer-chasing load takes 346 ns from local HBM and 690 ns from a
+#     neighbour's HBM, so one Infinity Fabric crossing adds (690-346)/2 = 172 ns
+#     one way: the wire latency;
+#   - a hipMemcpy (DMA) between APUs costs about 1 us for any size from 1 B to
+#     128 KB: the per-message cost of a DMA transfer, wire included.
+#   DMA-Latte (arXiv 2511.06605, Sec. III-B3) agrees in kind: DMA command
+#   creation, scheduling and sync are up to ~60% of a small transfer's time.
+# The per-message engine overhead is the rest: 1000 - 172 = 828 ns. The range
+#   for sensitivity is 690 ns (the remote-load round trip, a lower bound for a
+#   hardware-triggered engine) to 2 us.
+REAL_WIRE_NS = (690 - 346) / 2
+REAL_MSG_LATENCY_NS = 1000.0
+REAL_MSG_LATENCY_RANGE_NS = (690.0, 1000.0, 2000.0)
 
 
-def real_out_bw(p: int) -> float:
+def real_out_bw(p: int, link_eff: float = REAL_LINK_EFF) -> float:
     """Per-GPU outbound bandwidth to the other p-1 members of a TP/EP group.
     In a fully connected node each peer is one direct link away."""
-    return (p - 1) * REAL_LINK_BW * REAL_LINK_EFF
+    return (p - 1) * REAL_LINK_BW * link_eff
 
 
-@dataclass
-class Model:
-    name: str
-    hidden: int
-    ffn: int
-
-
-# Hugging Face config.json values (Llama-3.x 70B: 8192 / 28672, 80 layers;
-# Llama-3.1 405B: 16384 / 53248, 126 layers; Mixtral-8x7B: 4096 / 14336,
-# 8 experts, top-2).
-LLAMA70 = Model("Llama-3 70B", 8192, 28672)
-LLAMA405 = Model("Llama-3.1 405B", 16384, 53248)
-MIXTRAL = Model("Mixtral 8x7B", 4096, 14336)
-MIXTRAL_EXPERTS, MIXTRAL_TOPK = 8, 2
-
-
-@dataclass
-class RealLayer:
-    layer: str
-    gemm: str            # the GEMM producing (or consuming) the collective
-    collective: str
-    p: int
-    t_gemm: float        # seconds
-    t_comm: float        # seconds
-
-    @property
-    def frac(self) -> float:
-        return self.t_comm / (self.t_gemm + self.t_comm)
-
-
-def gemm_time(m: int, n: int, k: int) -> float:
-    return 2 * m * n * k / (REAL_PEAK_FLOPS * REAL_GEMM_EFF)
+def gemm_time(m: int, n: int, k: int, eff: float = REAL_GEMM_EFF) -> float:
+    return 2 * m * n * k / (REAL_PEAK_FLOPS * eff)
 
 
 def real_waves(m: int, n: int, resident: int = REAL_RESIDENT_WGS) -> float:
@@ -110,203 +111,328 @@ def first_tile_share(waves: float) -> float:
     return 1 / math.ceil(waves)
 
 
+def real_tile_transfer_ns() -> float:
+    """One message of one output tile: 256x256 BF16 partial sums, over one
+    link."""
+    return REAL_TILE * REAL_TILE * BF16 / (REAL_LINK_BW * REAL_LINK_EFF) * 1e9
+
+
+@dataclass
+class Model:
+    name: str
+    hidden: int
+    ffn: int
+
+
+# Hugging Face config.json values (Llama-3.x 70B: 8192 / 28672; Llama-3.1
+# 405B: 16384 / 53248; Mixtral-8x7B: 4096 / 14336, 8 experts, top-2).
+LLAMA70 = Model("Llama-3 70B", 8192, 28672)
+LLAMA405 = Model("Llama-3.1 405B", 16384, 53248)
+MIXTRAL = Model("Mixtral 8x7B", 4096, 14336)
+MIXTRAL_EXPERTS, MIXTRAL_TOPK = 8, 2
+
+
+@dataclass
+class RealLayer:
+    model: Model
+    gemm: str            # "attn out-proj" or "MLP down-proj"
+    collective: str      # "all-reduce" or "reduce-scatter"
+    p: int
+    tokens: int
+
+    @property
+    def k(self) -> int:
+        full = self.model.hidden if self.gemm == "attn out-proj" else self.model.ffn
+        return full // self.p
+
+    def t_gemm(self, gemm_eff: float = REAL_GEMM_EFF) -> float:
+        return gemm_time(self.tokens, self.model.hidden, self.k, gemm_eff)
+
+    def t_comm(self, link_eff: float = REAL_LINK_EFF) -> float:
+        msg = self.tokens * self.model.hidden * BF16
+        share = 2 * (self.p - 1) / self.p if self.collective == "all-reduce" \
+            else (self.p - 1) / self.p
+        return share * msg / real_out_bw(self.p, link_eff)
+
+    def frac(self, gemm_eff=REAL_GEMM_EFF, link_eff=REAL_LINK_EFF) -> float:
+        g, c = self.t_gemm(gemm_eff), self.t_comm(link_eff)
+        return c / (g + c)
+
+    @property
+    def waves(self) -> float:
+        # Row-parallel GEMM: every GPU produces the full tokens x hidden output.
+        return real_waves(self.tokens, self.model.hidden)
+
+
 def real_layers(tokens: int) -> list[RealLayer]:
-    out = []
-    for model in (LLAMA70, LLAMA405):
-        h, f = model.hidden, model.ffn
-        for p in (2, 4, 8):
-            msg = tokens * h * BF16                     # T x H activations
-            ar = 2 * (p - 1) / p * msg / real_out_bw(p)  # all-reduce
-            rs = (p - 1) / p * msg / real_out_bw(p)      # reduce-scatter (SP)
-            # Row-parallel GEMMs that end each sublayer: K is split by p.
-            for gemm, k in (("attn out-proj", h // p), ("MLP down-proj", f // p)):
-                t = gemm_time(tokens, h, k)
-                out.append(RealLayer(model.name, gemm, "all-reduce", p, t, ar))
-                out.append(RealLayer(model.name, gemm, "reduce-scatter", p, t, rs))
-
-    # MoE: Mixtral 8x7B, expert parallel over 8 GPUs, uniform routing.
-    p, h, f = 8, MIXTRAL.hidden, MIXTRAL.ffn
-    routed = tokens * MIXTRAL_TOPK                   # token-expert pairs per GPU
-    a2a = (p - 1) / p * routed * h * BF16 / real_out_bw(p)
-    t_up = gemm_time(routed, 2 * f, h)              # gate + up projections
-    t_down = gemm_time(routed, h, f)                # down projection
-    out.append(RealLayer(MIXTRAL.name, "expert gate+up (consumer)",
-                         "dispatch all-to-all", p, t_up, a2a))
-    out.append(RealLayer(MIXTRAL.name, "expert down-proj (producer)",
-                         "combine all-to-all", p, t_down, a2a))
-    return out
+    return [RealLayer(m, g, c, p, tokens)
+            for m in (LLAMA70, LLAMA405)
+            for p in (2, 4, 8)
+            for g in ("attn out-proj", "MLP down-proj")
+            for c in ("all-reduce", "reduce-scatter")]
 
 
 # ---------------------------------------------------------------------------
-# Simulated system: MGPUSim R9 Nano (64 CUs, 1 GHz), PCIe 4.0 x16 links.
+# Simulated system: MGPUSim R9 Nano CUs at 1 GHz, 2 GPUs, tileSize 8.
 # ---------------------------------------------------------------------------
-# Calibration: measured one-band GEMM times (simulated us, tileSize 8, per GPU)
-# from results/overlap_sweep*/ and results/stage2_h2d/: (M, N, K per GPU, us).
-CALIBRATION = [
-    (256, 256, 512, 266.0),
-    (256, 256, 1024, 530.0),
-    (256, 256, 2048, 1247.0),
-    (512, 512, 256, 192.0),
-]
-SIM_CUS = 64
-SIM_TILE = 32               # tileSize 8 -> 32x32 output tile per work-group
+SIM_TILE_SIZE = 8
+SIM_TILE = 4 * SIM_TILE_SIZE  # 32x32 FP32 output tile = one 4 KiB message
+FP32 = 4
+SIM_GPUS = 2
 # Resident work-groups per CU for mmmKernel_local with -lds-occupancy, from
 # TestGEMMResidency (timing/cp/internal/resource): 74 VGPRs limit a SIMD to 3
 # wavefronts, before LDS does. tileSize 4 and 8 -> 12, tileSize 16 -> 3.
 SIM_RESIDENT_WGS = {4: 12, 8: 12, 16: 3}
+# Measured fixed cost of one kernel launch (three setup copies of 7.58 us at
+# the default -h2d-cycles, results/allreduce_breakdown/). The tracker times
+# start before the launch, so this is subtracted to get the GEMM's own time.
+SIM_LAUNCH_US = 22.75
+# Efficiency of the fused send engine on the peer fabric. Unknown until the
+# engine exists (Step 2); assumed equal to the real link's, to be measured.
+SIM_FABRIC_EFF = 0.80
+SIM_FABRIC_FLIT = 16          # bytes; fabric clock = bandwidth / flit
+TRACKER_DIR = os.path.join(ROOT, "results", "step1_tracker")
 
 
-def sim_waves(m: int, n: int, cus: int, tile_size: int = 8) -> float:
+def sim_waves(m: int, n: int, cus: int, tile_size: int = SIM_TILE_SIZE) -> float:
     edge = 4 * tile_size
     return (m // edge) * (n // edge) / (cus * SIM_RESIDENT_WGS[tile_size])
-SIM_LINK_NOMINAL = 32 * 2**30  # Akita PCIe 4.0 x16: 16 Gb/s x 16 / 8 per direction
-# Measured: a 1 MB All-Reduce on 2 GPUs (16384 threads) wrote 1 MB each way in
-# 52.7 us of link-busy time = 19.9 GB/s per direction, 58% of nominal. The
-# fused engine's efficiency is unknown; this is the best measured stand-in.
-SIM_LINK_EFF = 19.9e9 / SIM_LINK_NOMINAL
-FP32 = 4
 
 
-# Measured fixed cost of one GEMM launch: three host-to-device setup copies
-# of 7.58 us each at the default -h2d-cycles (results/allreduce_breakdown/).
-SIM_LAUNCH_US = 22.75
+def tracker_times(m: int, n: int, kg: int, cus: int):
+    """(GEMM us, first-tile share) measured by the tile tracker on 1 GPU."""
+    path = os.path.join(TRACKER_DIR,
+                        f"tiles_cu{cus}_M{m}_N{n}_K{kg}_t{SIM_TILE_SIZE}.csv")
+    with open(path) as f:
+        done = sorted(float(r["complete_us"]) for r in csv.DictReader(f))
+    gemm = done[-1] - SIM_LAUNCH_US
+    return gemm, (done[0] - SIM_LAUNCH_US) / gemm
 
 
-def fit_sim_gemm():
-    """t = t0 + Kg * r * load, load = max(1, WGs-per-CU / w_sat).
-
-    Simulated GEMM time grows faster than linearly in K (larger B, more L2
-    misses), so a straight-line fit over all points has a negative intercept.
-    The proposals all sit at small K, so t0 is pinned to the measured launch
-    cost and r comes from the smallest-K point with one work-group per CU;
-    the model then underestimates large-K points. w_sat comes from the 512^2
-    point (four work-groups per CU)."""
-    pts = [(kg, t) for m, n, kg, t in CALIBRATION if m * n // SIM_TILE**2 == SIM_CUS]
-    kg_min, t_min = min(pts)
-    t0 = SIM_LAUNCH_US
-    r = (t_min - t0) / kg_min
-    m, nn, kg, t = next(c for c in CALIBRATION if c[0] == 512)
-    wgs_per_cu = m * nn / SIM_TILE**2 / SIM_CUS
-    load = (t - t0) / (r * kg)
-    w_sat = wgs_per_cu / max(load, 1.0) if load > 1 else wgs_per_cu
-    return t0, r, w_sat
+@dataclass
+class Point:
+    label: str
+    layer: RealLayer
+    m: int
+    n: int
+    kg: int      # K per GPU
+    cus: int
 
 
-T0, R_PER_K, W_SAT = fit_sim_gemm()
+def points(tokens: int) -> list[Point]:
+    return [
+        Point("f~0.8", RealLayer(LLAMA70, "attn out-proj", "all-reduce", 8, tokens),
+              384, 256, 256, 4),
+        Point("f~0.5", RealLayer(LLAMA70, "MLP down-proj", "all-reduce", 8, tokens),
+              384, 256, 256, 4),
+        Point("f~0.25", RealLayer(LLAMA405, "MLP down-proj", "reduce-scatter", 8, tokens),
+              512, 320, 256, 4),
+    ]
 
 
-def sim_gemm_us(m: int, n: int, kg: int, cus: int) -> float:
-    wgs_per_cu = m * n / SIM_TILE**2 / cus
-    return T0 + R_PER_K * kg * max(1.0, wgs_per_cu / W_SAT)
+def sim_comm_bytes(pt: Point) -> float:
+    """Bytes each simulated GPU sends: the engine's reduce-scatter sends
+    (p-1)/p of C, and the all-gather sends as much again."""
+    c = pt.m * pt.n * FP32
+    share = (SIM_GPUS - 1) / SIM_GPUS
+    return c * share * (2 if pt.layer.collective == "all-reduce" else 1)
 
 
-def sim_comm_us(m: int, n: int, p: int, link_bw: float) -> float:
-    """Fused reduce-scatter + all-gather: each GPU sends 2(p-1)/p of C."""
-    return 2 * (p - 1) / p * m * n * FP32 / (link_bw * SIM_LINK_EFF) * 1e6
+def derive_knobs(pt: Point, f: float, latency_ns: float = REAL_MSG_LATENCY_NS):
+    """Simulator knobs that match f and the per-message latency ratio.
+
+    1. t_comm = f / (1 - f) x measured GEMM time; the link must move this
+       GPU's bytes in that time at SIM_FABRIC_EFF -> -link-bw.
+    2. One 4 KiB tile message then takes X_sim = 4096 / (bw x eff). The real
+       ratios are wire / X_real and overhead / X_real for one 128 KiB tile;
+       multiplying each by X_sim gives -link-latency and -msg-overhead.
+    3. The fabric clock is bw / 16 B flit; -link-latency is realized in whole
+       cycles of it."""
+    t_g, first_share = tracker_times(pt.m, pt.n, pt.kg, pt.cus)
+    t_c = f / (1 - f) * t_g
+    bw_eff = sim_comm_bytes(pt) / (t_c * 1e-6)
+    bw = bw_eff / SIM_FABRIC_EFF
+    x_sim = SIM_TILE * SIM_TILE * FP32 / bw_eff * 1e9
+    x_real = real_tile_transfer_ns()
+    wire = REAL_WIRE_NS / x_real * x_sim
+    overhead = (latency_ns - REAL_WIRE_NS) / x_real * x_sim
+    clock = bw / SIM_FABRIC_FLIT
+    cycles = max(1, round(wire * clock / 1e9))
+    return dict(t_gemm_us=t_g, first_share=first_share, t_comm_us=t_c,
+                link_bw_gbps=bw / 1e9, msg_transfer_ns=x_sim,
+                link_latency_ns=wire, msg_overhead_ns=overhead,
+                fabric_clock_mhz=clock / 1e6, latency_cycles=cycles,
+                realized_latency_ns=cycles / clock * 1e9,
+                ratio=(wire + overhead) / x_sim)
 
 
-def sim_wall_s(m: int, n: int, k: int) -> float:
-    """Uncontended wall time, fit to standalone runs: 256x256x1024 (2 GPUs)
-    about 70 s, 512^3 (2 GPUs) about 180 s. Runs sharing the machine take
-    2-10x longer."""
-    mmac = m * n * k / 1e6
-    return 10 + 1.25 * mmac
+# ---------------------------------------------------------------------------
+# MoE all-to-all (analysis only).
+# ---------------------------------------------------------------------------
+# Expert parallel over 8 GPUs, Mixtral 8x7B: one expert per GPU. Each GPU
+# routes tokens x top-2 token-expert pairs; uniform routing sends 7/8 of them
+# to other GPUs. Under skew s the busiest GPU receives s times the mean, and
+# it sets the layer's time. The expert GEMM time is the larger of compute and
+# reading the expert's weights from HBM: decode-sized batches are weight-bound.
+# All-to-all latency per collective: 1 us for a hardware-triggered DMA (the
+# MI300A per-copy cost above) or 20 us for a host-launched library collective
+# (MI300A RCCL point-to-point minimum, same paper, Sec. 6.1.1). The inter-node
+# rows assume one 400 Gb/s NIC per GPU (50 GB/s) and 5 us latency: an
+# assumption for contrast, not sourced.
+MOE_TOKENS = (4096, 256, 64, 16)
+MOE_SKEWS = (1, 4)
+MOE_LATENCIES_US = (1.0, 20.0)
 
 
-def needed_link_bw(m, n, kg, cus, p, frac):
-    """Nominal link bandwidth (bytes/s) that makes the predicted f equal frac."""
-    t_g = sim_gemm_us(m, n, kg, cus)
-    t_c = frac / (1 - frac) * t_g
-    return 2 * (p - 1) / p * m * n * FP32 / (t_c * 1e-6) / SIM_LINK_EFF
+def moe_rows(gemm_eff=REAL_GEMM_EFF):
+    p, h, ffn, k = 8, MIXTRAL.hidden, MIXTRAL.ffn, MIXTRAL_TOPK
+    hbm = REAL_HBM_BW * REAL_HBM_EFF
+    flops = REAL_PEAK_FLOPS * gemm_eff
+    fabrics = [("intra-node IF", (p - 1) * REAL_LINK_BW * REAL_LINK_EFF, MOE_LATENCIES_US),
+               ("inter-node 400G", 50e9 * REAL_LINK_EFF, (5.0,))]
+    rows = []
+    for fabric, in_bw, lats in fabrics:
+        for tokens in MOE_TOKENS:
+            for skew in MOE_SKEWS:
+                for lat in lats:
+                    pairs = tokens * k * skew              # into the busiest GPU
+                    t_a2a = lat * 1e-6 + pairs * h * BF16 * (p - 1) / p / in_bw
+                    up_compute = 2 * pairs * 2 * ffn * h / flops
+                    t_up = max(up_compute, 2 * h * ffn * BF16 / hbm)
+                    t_down = max(2 * pairs * h * ffn / flops, h * ffn * BF16 / hbm)
+                    rows.append(dict(
+                        fabric=fabric, tokens_per_gpu=tokens, skew=skew,
+                        a2a_latency_us=lat,
+                        a2a_us=round(t_a2a * 1e6, 1),
+                        gate_up_us=round(t_up * 1e6, 1),
+                        down_us=round(t_down * 1e6, 1),
+                        weight_bound=t_up > up_compute,
+                        f_dispatch=round(t_a2a / (t_a2a + t_up), 3),
+                        f_combine=round(t_a2a / (t_a2a + t_down), 3)))
+    return rows
 
 
-def akita_link(bw: float):
-    """Akita's PCIe model moves round(bw / freq) bytes per cycle. Return the
-    network clock and flit size that realize bw, preferring the 1 GHz default."""
-    for freq in (1e9, 500e6, 250e6, 100e6):
-        flit = round(bw / freq)
-        if flit >= 4 and abs(flit * freq - bw) / bw < 0.15:
-            return freq, flit, flit * freq
-    flit = max(1, round(bw / 100e6))
-    return 100e6, flit, flit * 100e6
+# ---------------------------------------------------------------------------
+
+def table(rows, cols):
+    out = [" | ".join(cols)]
+    for r in rows:
+        out.append(" | ".join(str(r[c]) for c in cols))
+    return "\n".join(out)
 
 
-# Candidate small shapes: 2 GPUs, tileSize 8, few minutes of wall time.
-CANDIDATES = [
-    # (M, N, K total, CUs per GPU)
-    (128, 128, 256, 16),
-    (256, 256, 512, 64),
-    (256, 256, 1024, 64),
-    (256, 256, 512, 16),
-]
+def write_csv(path, rows):
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=4096,
-                    help="tokens per GPU per step (fractions are nearly independent of it)")
-    ap.add_argument("--csv", default=None)
+                    help="tokens per GPU per step (sets waves; f is independent of it)")
+    ap.add_argument("--outdir", default=os.path.join(ROOT, "results", "step0_ratio"))
     args = ap.parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
 
-    layers = real_layers(args.tokens)
-    print(f"Simulated GEMM model: t = {T0:.1f} us + {R_PER_K:.3f} us x K-per-GPU "
-          f"x max(1, WGs-per-CU / {W_SAT:.1f})")
-    for m, n, kg, t in CALIBRATION:
-        print(f"  calibration {m}x{n}, K/GPU {kg}: measured {t:.0f} us, "
-              f"model {sim_gemm_us(m, n, kg, SIM_CUS):.0f} us")
-    print(f"Simulated link: nominal {SIM_LINK_NOMINAL/1e9:.1f} GB/s per direction, "
-          f"efficiency {SIM_LINK_EFF:.2f} (measured)\n")
+    # 1. Real layers.
+    real = []
+    for L in real_layers(args.tokens):
+        real.append(dict(layer=L.model.name, gemm=L.gemm, collective=L.collective,
+                         tp=L.p, real_gemm_us=round(L.t_gemm() * 1e6, 1),
+                         real_comm_us=round(L.t_comm() * 1e6, 1),
+                         real_frac=round(L.frac(), 3),
+                         real_waves=round(L.waves, 2),
+                         real_waves_2res=round(real_waves(args.tokens, L.model.hidden, 2), 2)))
+    write_csv(os.path.join(args.outdir, "real_layers.csv"), real)
+    print(f"1. Real layers, MI300X, {args.tokens} tokens per GPU "
+          f"(f does not depend on TP in a fully connected node; TP 8 shown)")
+    print(table([r for r in real if r["tp"] == 8],
+                ["layer", "gemm", "collective", "real_frac", "real_waves",
+                 "real_waves_2res"]))
 
-    print("Candidate simulated shapes at the default link (2 GPUs, tileSize 8):")
-    for m, n, k, cus in CANDIDATES:
-        tg = sim_gemm_us(m, n, k // 2, cus)
-        tc = sim_comm_us(m, n, 2, SIM_LINK_NOMINAL)
-        print(f"  {m}x{n}x{k}, {cus} CUs: GEMM {tg:.0f} us, comm {tc:.1f} us, "
-              f"f = {tc/(tg+tc):.3f}, wall ~{sim_wall_s(m, n, k):.0f} s")
-    print()
+    x_real = real_tile_transfer_ns()
+    print(f"\nReal one-tile message: {REAL_TILE}x{REAL_TILE} BF16 = "
+          f"{REAL_TILE * REAL_TILE * BF16 // 1024} KiB, {x_real:.0f} ns at "
+          f"{REAL_LINK_BW * REAL_LINK_EFF / 1e9:.1f} GB/s; latency "
+          f"{REAL_MSG_LATENCY_NS:.0f} ns = wire {REAL_WIRE_NS:.0f} + engine "
+          f"{REAL_MSG_LATENCY_NS - REAL_WIRE_NS:.0f}; L/X = "
+          f"{REAL_MSG_LATENCY_NS / x_real:.2f}")
 
-    # Proposals use one base shape so the only knob that moves is the link.
-    bm, bn, bk, bcus = 256, 256, 512, 64
-    rows = []
-    for L in layers:
-        bw = needed_link_bw(bm, bn, bk // 2, bcus, 2, L.frac)
-        freq, flit, real_bw = akita_link(bw)
-        tg = sim_gemm_us(bm, bn, bk // 2, bcus)
-        tc = sim_comm_us(bm, bn, 2, real_bw)
-        rows.append({
-            "layer": L.layer, "gemm": L.gemm, "collective": L.collective, "tp": L.p,
-            "real_gemm_us": round(L.t_gemm * 1e6, 1),
-            "real_comm_us": round(L.t_comm * 1e6, 1),
-            "real_frac": round(L.frac, 3),
-            "sim_shape": f"{bm}x{bn}x{bk}", "sim_gpus": 2, "sim_cus": bcus,
-            "sim_link_gbps": round(real_bw / 1e9, 2),
-            "sim_net_freq_mhz": int(freq / 1e6), "sim_flit_bytes": flit,
-            "sim_frac_pred": round(tc / (tg + tc), 3),
-            "wall_s_est": round(sim_wall_s(bm, bn, bk)),
-        })
+    # 2. Representative points.
+    rep = []
+    for pt in points(args.tokens):
+        f = pt.layer.frac()
+        k = derive_knobs(pt, f)
+        rep.append(dict(
+            point=pt.label, layer=f"{pt.layer.model.name} {pt.layer.gemm}",
+            collective=pt.layer.collective,
+            real_f=round(f, 3),
+            sim_f=round(k["t_comm_us"] / (k["t_comm_us"] + k["t_gemm_us"]), 3),
+            real_LX=round(REAL_MSG_LATENCY_NS / x_real, 2), sim_LX=round(k["ratio"], 2),
+            real_waves=round(pt.layer.waves, 2),
+            sim_waves=round(sim_waves(pt.m, pt.n, pt.cus), 2),
+            real_first_share=round(first_tile_share(pt.layer.waves), 2),
+            sim_first_share=round(k["first_share"], 2),
+            sim_shape=f"{pt.m}x{pt.n}, K/GPU {pt.kg}", sim_cus=pt.cus,
+            sim_gemm_us=round(k["t_gemm_us"], 1), sim_comm_us=round(k["t_comm_us"], 1),
+            link_bw_gbps=round(k["link_bw_gbps"], 4),
+            fabric_clock_mhz=round(k["fabric_clock_mhz"], 3),
+            msg_transfer_ns=round(k["msg_transfer_ns"]),
+            link_latency_ns=round(k["link_latency_ns"]),
+            latency_cycles=k["latency_cycles"],
+            realized_latency_ns=round(k["realized_latency_ns"]),
+            msg_overhead_ns=round(k["msg_overhead_ns"])))
+    write_csv(os.path.join(args.outdir, "points.csv"), rep)
+    print("\n2. Representative points, real vs simulated (2 GPUs, tileSize 8, N=1)")
+    print(table(rep, ["point", "layer", "collective", "real_f", "sim_f", "real_LX",
+                      "sim_LX", "real_waves", "sim_waves", "real_first_share",
+                      "sim_first_share"]))
+    print("\nKnobs:")
+    print(table(rep, ["point", "sim_shape", "sim_cus", "sim_gemm_us", "sim_comm_us",
+                      "link_bw_gbps", "fabric_clock_mhz", "msg_transfer_ns",
+                      "link_latency_ns", "latency_cycles", "realized_latency_ns",
+                      "msg_overhead_ns"]))
 
-    # In a fully connected node, per-GPU bandwidth grows with p-1 while the
-    # per-GPU GEMM shrinks with p, so f does not depend on the TP size here;
-    # rows that differ only in TP are printed once.
-    hdr = ("layer", "gemm", "collective", "tp", "real_frac", "sim_shape",
-           "sim_cus", "sim_link_gbps", "sim_net_freq_mhz", "sim_flit_bytes",
-           "sim_frac_pred", "wall_s_est")
-    print(" | ".join(hdr))
-    seen = {}
-    for r in rows:
-        key = (r["layer"], r["gemm"], r["collective"])
-        seen.setdefault(key, []).append(r)
-    for group in seen.values():
-        r = dict(group[0])
-        r["tp"] = ",".join(str(g["tp"]) for g in group)
-        print(" | ".join(str(r[h]) for h in hdr))
+    # 3. Sensitivity.
+    effs_g, effs_l = (0.50, 0.70, 0.85), (0.60, 0.80, 0.90)
+    sens = [dict(point=pt.label, gemm_eff=ge, link_eff=le,
+                 real_f=round(pt.layer.frac(ge, le), 3))
+            for pt in points(args.tokens) for ge in effs_g for le in effs_l]
+    write_csv(os.path.join(args.outdir, "sensitivity_eff.csv"), sens)
+    print("\n3a. Real f vs assumed efficiencies (rows: GEMM eff; columns: link eff)")
+    for pt in points(args.tokens):
+        print(f"  {pt.label} ({pt.layer.model.name} {pt.layer.gemm} {pt.layer.collective})")
+        print("    gemm\\link  " + "   ".join(f"{le:.2f}" for le in effs_l))
+        for ge in effs_g:
+            vals = [pt.layer.frac(ge, le) for le in effs_l]
+            print(f"    {ge:.2f}       " + "  ".join(f"{v:.3f}" for v in vals))
+        allv = [pt.layer.frac(ge, le) for ge in effs_g for le in effs_l]
+        print(f"    range {min(allv):.3f}-{max(allv):.3f}")
 
-    if args.csv:
-        with open(args.csv, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0]))
-            w.writeheader()
-            w.writerows(rows)
-        print(f"\nwrote {args.csv}")
+    lat = []
+    for pt in points(args.tokens):
+        for total in REAL_MSG_LATENCY_RANGE_NS:
+            k = derive_knobs(pt, pt.layer.frac(), total)
+            lat.append(dict(point=pt.label, real_latency_ns=total,
+                            LX=round(total / x_real, 2),
+                            link_latency_ns=round(k["link_latency_ns"]),
+                            msg_overhead_ns=round(k["msg_overhead_ns"])))
+    write_csv(os.path.join(args.outdir, "sensitivity_latency.csv"), lat)
+    print("\n3b. Knobs over the real per-message latency range (wire fixed at "
+          f"{REAL_WIRE_NS:.0f} ns real)")
+    print(table(lat, ["point", "real_latency_ns", "LX", "link_latency_ns",
+                      "msg_overhead_ns"]))
+
+    # 4. MoE.
+    moe = moe_rows()
+    write_csv(os.path.join(args.outdir, "moe.csv"), moe)
+    print("\n4. MoE all-to-all, Mixtral 8x7B, EP 8 (analysis only; busiest GPU)")
+    print(table(moe, ["fabric", "tokens_per_gpu", "skew", "a2a_latency_us", "a2a_us",
+                      "gate_up_us", "down_us", "weight_bound", "f_dispatch",
+                      "f_combine"]))
+    print(f"\nwrote CSVs to {args.outdir}")
 
 
 if __name__ == "__main__":

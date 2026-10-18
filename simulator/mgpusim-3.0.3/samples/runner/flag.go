@@ -62,6 +62,13 @@ var dramSizeFlag = flag.Uint64("dram-size", 4*1024*1024*1024,
 var ldsOccupancyFlag = flag.Bool("lds-occupancy", false,
 	"Count each work-group's dynamic LDS (local pointer kernel arguments) "+
 		"when deciding how many work-groups a CU holds.")
+var linkBWFlag = flag.Float64("link-bw", 0,
+	"GPU-to-GPU bandwidth per direction in GB/s (1e9 B/s). Setting it or "+
+		"-link-latency moves RDMA traffic to its own network; 0 keeps the "+
+		"PCIe network shared with the host.")
+var linkLatencyFlag = flag.Float64("link-latency", -1,
+	"GPU-to-GPU one-way latency in ns (switch latency between two GPUs). "+
+		"Negative keeps the shared PCIe network.")
 var cusPerGPUFlag = flag.Int("cus-per-gpu", 64,
 	"Compute units per GPU: 1-3 or a multiple of 4 (shader arrays of 4 CUs).")
 
@@ -146,6 +153,8 @@ func (r *Runner) ParseFlag() *Runner {
 	r.H2DCycles = *h2dCyclesFlag
 	r.LDSOccupancy = *ldsOccupancyFlag
 	r.CUsPerGPU = *cusPerGPUFlag
+	r.LinkBW = *linkBWFlag * 1e9
+	r.LinkLatencyNS = *linkLatencyFlag
 	r.L2CacheSize = *l2CacheSizeFlag
 	r.DRAMSize = *dramSizeFlag
 

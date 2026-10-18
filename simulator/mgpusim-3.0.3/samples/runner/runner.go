@@ -60,6 +60,8 @@ type Runner struct {
 	H2DCycles         int
 	LDSOccupancy      bool
 	CUsPerGPU         int
+	LinkBW            float64 // bytes/s
+	LinkLatencyNS     float64
 	L2CacheSize       uint64
 	DRAMSize          uint64
 
@@ -121,6 +123,8 @@ func (r *Runner) buildTimingPlatform() {
 		WithH2DCycles(r.H2DCycles).
 		WithLDSOccupancy(r.LDSOccupancy).
 		WithNumCUPerGPU(r.CUsPerGPU).
+		WithLinkBandwidth(r.LinkBW).
+		WithLinkLatency(r.LinkLatencyNS).
 		WithL2CacheSize(r.L2CacheSize).
 		WithDRAMSize(r.DRAMSize)
 

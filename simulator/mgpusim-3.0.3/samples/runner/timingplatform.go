@@ -3,6 +3,7 @@ package runner
 import (
 	"fmt"
 	"log"
+	"math"
 	"os"
 
 	memtraces "github.com/sarchlab/akita/v3/mem/trace"
@@ -33,6 +34,8 @@ type R9NanoPlatformBuilder struct {
 	l1CacheSize                        uint64
 	l1AcquireOnLaunch                  bool
 	ldsOccupancy                       bool
+	linkBW                             float64 // bytes/s; 0 = shared PCIe
+	linkLatencyNS                      float64 // < 0 = shared PCIe
 	h2dCycles                          int
 	l2CacheSize                        uint64
 	dramSize                           uint64
@@ -59,6 +62,7 @@ func MakeR9NanoBuilder() R9NanoPlatformBuilder {
 		l1CacheSize:       16 * mem.KB,
 		l1AcquireOnLaunch: true,
 		h2dCycles:         14500,
+		linkLatencyNS:     -1,
 		l2CacheSize:       2 * mem.MB,
 		dramSize:          4 * mem.GB,
 		traceVisStartTime: -1,
@@ -99,6 +103,22 @@ func (b R9NanoPlatformBuilder) WithNumCUPerGPU(n int) R9NanoPlatformBuilder {
 	default:
 		log.Panicf("CUs per GPU must be 1-3 or a multiple of 4, not %d", n)
 	}
+	return b
+}
+
+// WithLinkBandwidth gives GPU-to-GPU (RDMA) traffic its own network with the
+// given bandwidth per direction, in bytes per second, instead of sharing the
+// PCIe network with the host. 0 keeps the shared PCIe network.
+func (b R9NanoPlatformBuilder) WithLinkBandwidth(bytesPerSec float64) R9NanoPlatformBuilder {
+	b.linkBW = bytesPerSec
+	return b
+}
+
+// WithLinkLatency gives GPU-to-GPU (RDMA) traffic its own network with the
+// given one-way latency in ns, the switch latency between two GPUs. A
+// negative value keeps the shared PCIe network.
+func (b R9NanoPlatformBuilder) WithLinkLatency(ns float64) R9NanoPlatformBuilder {
+	b.linkLatencyNS = ns
 	return b
 }
 
@@ -239,6 +259,7 @@ func (b R9NanoPlatformBuilder) Build() *Platform {
 		rdmaAddressTable, pmcAddressTable)
 
 	pcieConnector.EstablishRoute()
+	b.createPeerFabric()
 
 	return &Platform{
 		Engine: b.engine,
@@ -513,7 +534,11 @@ func (b *R9NanoPlatformBuilder) createGPU(
 	b.configRDMAEngine(gpu, rdmaAddressTable)
 	b.configPMC(gpu, gpuDriver, pmcAddressTable)
 
-	pcieConnector.PlugInDevice(pcieSwitchID, gpu.Domain.Ports())
+	ports := gpu.Domain.Ports()
+	if b.usePeerFabric() {
+		ports = withoutPort(ports, gpu.RDMAEngine.ToOutside)
+	}
+	pcieConnector.PlugInDevice(pcieSwitchID, ports)
 
 	b.gpus = append(b.gpus, gpu)
 
@@ -541,4 +566,75 @@ func (b *R9NanoPlatformBuilder) configPMC(
 		gpu.PMC.GetPortByName("Remote"))
 	gpuDriver.RemotePMCPorts = append(
 		gpuDriver.RemotePMCPorts, gpu.PMC.GetPortByName("Remote"))
+}
+
+func (b *R9NanoPlatformBuilder) usePeerFabric() bool {
+	return b.linkBW > 0 || b.linkLatencyNS >= 0
+}
+
+func withoutPort(ports []sim.Port, drop sim.Port) []sim.Port {
+	var out []sim.Port
+	for _, p := range ports {
+		if p != drop {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// peerFabricFlitBytes is the flit size of the GPU-to-GPU fabric. Akita moves
+// one flit per network cycle, so the fabric's clock is the bandwidth divided
+// by this, which realizes any bandwidth exactly.
+const peerFabricFlitBytes = 16
+
+// createPeerFabric connects every GPU's RDMA engine to one switch of a
+// separate network, so peer traffic has its own bandwidth and latency and
+// no longer shares links with host traffic. Two GPUs are then one switch
+// apart, and a flit crosses one switch input pipeline of the latency.
+func (b *R9NanoPlatformBuilder) createPeerFabric() {
+	if !b.usePeerFabric() {
+		return
+	}
+
+	bw := b.linkBW
+	freq := 1 * sim.GHz
+	if bw > 0 {
+		freq = sim.Freq(bw / peerFabricFlitBytes)
+	}
+	latencyNS := b.linkLatencyNS
+	if latencyNS < 0 {
+		latencyNS = 140 // the PCIe switch latency, 140 cycles at 1 GHz
+	}
+	cycles := max(1, int(math.Round(latencyNS*float64(freq)/1e9)))
+
+	fabric := pcie.NewConnector().
+		WithEngine(b.engine).
+		WithFrequency(freq).
+		WithSwitchLatency(cycles)
+	if bw > 0 {
+		fabric = fabric.WithBandwidth(uint64(math.Round(bw)))
+	}
+	fabric.CreateNetwork("PeerFabric")
+
+	switchID := -1
+	for _, gpu := range b.gpus {
+		port := []sim.Port{gpu.RDMAEngine.ToOutside}
+		if switchID < 0 {
+			switchID = fabric.AddRootComplex(port)
+			continue
+		}
+		fabric.PlugInDevice(switchID, port)
+	}
+	fabric.EstablishRoute()
+
+	// Without a bandwidth the fabric keeps PCIe 4.0 x16's: 34 B flits at
+	// 1 GHz (32 GiB/s rounded to whole bytes per cycle).
+	flit, realized := 34, 34e9
+	if bw > 0 {
+		flit, realized = peerFabricFlitBytes, float64(freq)*peerFabricFlitBytes
+	}
+	log.Printf("peer fabric: clock %.3f MHz, flit %d B, %.3f GB/s per "+
+		"direction, latency %d cycles = %.1f ns",
+		float64(freq)/1e6, flit, realized/1e9,
+		cycles, float64(cycles)/float64(freq)*1e9)
 }
