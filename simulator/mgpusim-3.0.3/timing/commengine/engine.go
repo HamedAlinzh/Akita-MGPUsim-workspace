@@ -92,7 +92,10 @@ func Owner(group, numGPU int) int {
 type Config struct {
 	GPU    int        // this engine's index among the participants
 	NumGPU int        // number of participants
-	Peers  []sim.Port // every participant's fabric port, by index
+	Peers  []sim.Port // the port each participant receives on from us
+	// Out gives, by participant, the port to send through (default
+	// ToFabric).
+	Out []sim.Port
 
 	// C is a row-major matrix of 4-byte elements at virtual address VBase,
 	// cut into TileRows x TileCols tiles. VToP translates its addresses.
@@ -168,6 +171,10 @@ type Engine struct {
 
 	ToMem    sim.Port
 	ToFabric sim.Port
+
+	// Links, if set, gives the port of a dedicated link to each other
+	// engine; messages to that engine leave through it instead of ToFabric.
+	Links map[*Engine]sim.Port
 
 	memFinder           mem.LowModuleFinder
 	msgOverhead         sim.VTimeInSec
@@ -508,7 +515,7 @@ func (e *Engine) enqueueSend(
 	msg := &TileMsg{Group: g, Reduced: reduced, From: e.cfg.GPU, Data: data,
 		record: rec, onSent: onSent}
 	msg.ID = sim.GetIDGenerator().Generate()
-	msg.Src = e.ToFabric
+	msg.Src = e.outPort(to)
 	msg.Dst = e.cfg.Peers[to]
 	msg.TrafficBytes = rec.TrafficBytes
 	e.sendQ = append(e.sendQ, msg)
@@ -529,8 +536,23 @@ func (e *Engine) Tick(now sim.VTimeInSec) bool {
 	return madeProgress
 }
 
+func (e *Engine) outPort(to int) sim.Port {
+	if to < len(e.cfg.Out) && e.cfg.Out[to] != nil {
+		return e.cfg.Out[to]
+	}
+	return e.ToFabric
+}
+
 func (e *Engine) recvFabric(now sim.VTimeInSec) bool {
-	item := e.ToFabric.Retrieve(now)
+	madeProgress := e.recvFrom(now, e.ToFabric)
+	for _, p := range e.Links {
+		madeProgress = e.recvFrom(now, p) || madeProgress
+	}
+	return madeProgress
+}
+
+func (e *Engine) recvFrom(now sim.VTimeInSec, port sim.Port) bool {
+	item := port.Retrieve(now)
 	if item == nil {
 		return false
 	}
@@ -667,7 +689,7 @@ func (e *Engine) send(now sim.VTimeInSec) bool {
 
 	msg := e.sendQ[0]
 	msg.SendTime = now
-	if err := e.ToFabric.Send(msg); err != nil {
+	if err := msg.Src.Send(msg); err != nil {
 		return false
 	}
 

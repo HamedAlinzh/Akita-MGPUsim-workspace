@@ -26,6 +26,9 @@ func (a *roundRobinAlgorithm) RegisterCU(cu resource.DispatchableCU) {
 func (a *roundRobinAlgorithm) StartNewKernel(info kernels.KernelLaunchInfo) {
 	a.numDispatchedWGs = 0
 	a.gridBuilder.SetKernel(info)
+	if p, ok := a.cuPool.(interface{ StartKernel() }); ok {
+		p.StartKernel()
+	}
 }
 
 // NumWG returns the number of work-groups in the currently-dispatching

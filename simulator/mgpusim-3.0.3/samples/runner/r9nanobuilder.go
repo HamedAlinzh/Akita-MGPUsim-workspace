@@ -40,6 +40,7 @@ type R9NanoGPUBuilder struct {
 	ldsOccupancy                   bool
 	commEngine                     bool
 	valuCyclesScale                float64
+	wgCap, wgRamp                  int
 	msgOverhead                    sim.VTimeInSec
 	l2CacheSize                    uint64
 	log2PageSize                   uint64
@@ -227,6 +228,12 @@ func (b R9NanoGPUBuilder) WithL1CacheSize(size uint64) R9NanoGPUBuilder {
 // a kernel can read data that another GPU has since overwritten remotely.
 func (b R9NanoGPUBuilder) WithL1AcquireOnLaunch(on bool) R9NanoGPUBuilder {
 	b.l1AcquireOnLaunch = on
+	return b
+}
+
+// WithWGShaping shapes work-group dispatch; see cp.Builder.WithWGShaping.
+func (b R9NanoGPUBuilder) WithWGShaping(cap, ramp int) R9NanoGPUBuilder {
+	b.wgCap, b.wgRamp = cap, ramp
 	return b
 }
 
@@ -885,7 +892,8 @@ func (b *R9NanoGPUBuilder) buildCP() {
 		WithFreq(b.freq).
 		WithMonitor(b.monitor).
 		WithPerfAnalyzer(b.perfAnalyzer).
-		WithLDSOccupancy(b.ldsOccupancy)
+		WithLDSOccupancy(b.ldsOccupancy).
+		WithWGShaping(b.wgCap, b.wgRamp)
 
 	if b.enableVisTracing {
 		builder = builder.WithVisTracer(b.visTracer)

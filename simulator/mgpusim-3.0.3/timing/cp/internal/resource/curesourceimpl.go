@@ -32,6 +32,13 @@ type CUResourceImpl struct {
 	// rather than only the code object's static group segment.
 	countDynamicLDS bool
 
+	// Dispatch shaping (0 = off): wgCap caps the work-groups in flight on
+	// the CU; with rampStart the cap starts there and grows by one for every
+	// work-group the CU completes in the current kernel.
+	wgCap     int
+	rampStart int
+	completed int
+
 	nextSIMD    int
 	reservedWGs map[*kernels.WorkGroup][]WfLocation
 }
@@ -48,6 +55,10 @@ func (r *CUResourceImpl) ReserveResourceForWG(wg *kernels.WorkGroup) (
 	locations []WfLocation,
 	ok bool,
 ) {
+	if limit := r.wgLimit(); limit > 0 && len(r.reservedWGs) >= limit {
+		return nil, false
+	}
+
 	ok = true
 	locations = make([]WfLocation, len(wg.Wavefronts))
 
@@ -167,6 +178,18 @@ func (r *CUResourceImpl) matchWfWithSIMDs(
 	return true
 }
 
+// wgLimit returns the current cap on work-groups in flight, 0 for none.
+func (r *CUResourceImpl) wgLimit() int {
+	limit := r.wgCap
+	if r.rampStart > 0 {
+		ramp := r.rampStart + r.completed
+		if limit == 0 || ramp < limit {
+			limit = ramp
+		}
+	}
+	return limit
+}
+
 // ldsBytesOf returns the LDS bytes a work-group occupies.
 func (r *CUResourceImpl) ldsBytesOf(wg *kernels.WorkGroup) int {
 	if r.countDynamicLDS && wg.Packet != nil {
@@ -240,4 +263,5 @@ func (r *CUResourceImpl) FreeResourcesForWG(wg *kernels.WorkGroup) {
 	}
 
 	delete(r.reservedWGs, wg)
+	r.completed++
 }

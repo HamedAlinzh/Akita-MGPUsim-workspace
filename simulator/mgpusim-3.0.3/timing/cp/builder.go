@@ -22,6 +22,7 @@ type Builder struct {
 	perfAnalyzer   *analysis.PerfAnalyzer
 	numDispatchers int
 	ldsOccupancy   bool
+	wgCap, wgRamp  int
 }
 
 // MakeBuilder creates a new builder with default configuration values.
@@ -45,6 +46,14 @@ func (b Builder) WithVisTracer(tracer tracing.Tracer) Builder {
 // CU can hold. Off by default: then only the code object's static LDS counts.
 func (b Builder) WithLDSOccupancy(on bool) Builder {
 	b.ldsOccupancy = on
+	return b
+}
+
+// WithWGShaping caps the work-groups in flight per CU (cap) and/or starts the
+// cap at ramp and raises it by one per completed work-group. 0 turns each
+// off.
+func (b Builder) WithWGShaping(cap, ramp int) Builder {
+	b.wgCap, b.wgRamp = cap, ramp
 	return b
 }
 
@@ -150,6 +159,8 @@ func (Builder) createPorts(cp *CommandProcessor, name string) {
 func (b *Builder) buildDispatchers(cp *CommandProcessor) {
 	cuResourcePool := resource.NewCUResourcePool()
 	cuResourcePool.CountDynamicLDS = b.ldsOccupancy
+	cuResourcePool.WGCap = b.wgCap
+	cuResourcePool.WGRampStart = b.wgRamp
 	builder := dispatching.MakeBuilder().
 		WithCP(cp).
 		WithAlg("round-robin").

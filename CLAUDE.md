@@ -217,6 +217,14 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   (= real 256×256), from HipKittens MI355X data (α = 1.47); flatter 0.451 (2.0×), steeper
   0.96 (4.0×). Natively tileSize 4 is 4.18× slower (16-thread work-groups leave 48 of 64
   lanes idle), tileSize 16 0.97×.
+- **Dispatch shaping** (`-wg-cap K`, `-wg-ramp c`, default off; `CUResourceImpl`): cap a CU's
+  work-groups in flight, or start the cap at c and raise it by one per completed work-group
+  (reset per kernel). Finding: 12 resident GEMM work-groups per CU over-subscribe it; capping
+  at 4–8 makes the 384×256 GEMM 19–23% faster as well as finishing the first tile earlier.
+- **Per-pair peer mesh** (`-peer-mesh`, default off): one two-GPU network (same as the shared
+  switch, `-link-bw`, `-link-latency`) per GPU pair; RDMA gets `PeerRoutes` (a port per peer,
+  replies on the arrival port) and the engine `Links`. A single switch with one endpoint per
+  GPU serializes a GPU's links (head-of-line blocking), so 4-GPU runs need `-peer-mesh`.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -254,6 +262,7 @@ unchanged.
 | 1 | Tracker spike: 1 GPU, every tile completes exactly once after its last L2-acknowledged store (tileSize 4/8/16, 128×128×256) | Done: go. `timing/tiletracker`, test `benchmarks/allreducegemm/tiletracker_test.go`, `results/step1_tracker/` |
 | 2 | Send engine, per-tile reduce-scatter + all-gather, `-tiles-per-msg N`; verify at N = 1, 2, 4 | Done: `timing/commengine`, `results/step2_engine/` |
 | 3 | Reduction placement: (a) owner reduces via engine, (b) T3-style near memory; tile size × N with GCN3-native and matrix-core compute curves | Done: `results/step3_tiles/` |
+| 3b | Dispatch-shaping spike (`-wg-cap`, `-wg-ramp`) and the 4-GPU per-pair mesh | Done: `results/step4a_shaping/` |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
 | 5 | MoE all-to-all extension (design note section only) | Not started |
 

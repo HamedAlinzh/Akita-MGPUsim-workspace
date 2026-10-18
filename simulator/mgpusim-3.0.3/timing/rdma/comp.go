@@ -15,6 +15,10 @@ type transaction struct {
 	fromOutside sim.Msg
 	toInside    sim.Msg
 	toOutside   sim.Msg
+
+	// outsidePort is the port a request from outside arrived on, which its
+	// response leaves through.
+	outsidePort sim.Port
 }
 
 // An Comp is a component that helps one GPU to access the memory on
@@ -36,8 +40,28 @@ type Comp struct {
 	localModules           mem.LowModuleFinder
 	RemoteRDMAAddressTable mem.LowModuleFinder
 
+	// PeerRoutes, if set, gives each remote RDMA engine (keyed by its
+	// ToOutside port, as RemoteRDMAAddressTable returns it) a dedicated
+	// link: requests to it leave through Local and are addressed to Remote,
+	// that engine's port on the same link.
+	PeerRoutes map[sim.Port]PeerRoute
+
 	transactionsFromOutside []transaction
 	transactionsFromInside  []transaction
+}
+
+// PeerRoute is a dedicated link to one remote RDMA engine.
+type PeerRoute struct {
+	Local, Remote sim.Port
+}
+
+// outsidePorts lists the ports that face other GPUs.
+func (c *Comp) outsidePorts() []sim.Port {
+	ports := []sim.Port{c.ToOutside}
+	for _, r := range c.PeerRoutes {
+		ports = append(ports, r.Local)
+	}
+	return ports
 }
 
 // SetLocalModuleFinder sets the table to lookup for local data.
@@ -170,20 +194,28 @@ func (c *Comp) processFromL2(now sim.VTimeInSec) bool {
 
 func (c *Comp) processFromOutside(now sim.VTimeInSec) bool {
 	madeProgress := false
+	for _, port := range c.outsidePorts() {
+		madeProgress = c.processFromOutsidePort(now, port) || madeProgress
+	}
+	return madeProgress
+}
+
+func (c *Comp) processFromOutsidePort(now sim.VTimeInSec, port sim.Port) bool {
+	madeProgress := false
 	for {
-		req := c.ToOutside.Peek()
+		req := port.Peek()
 		if req == nil {
 			return madeProgress
 		}
 		switch req := req.(type) {
 		case mem.AccessReq:
-			ret := c.processReqFromOutside(now, req)
+			ret := c.processReqFromOutside(now, port, req)
 			if !ret {
 				return madeProgress
 			}
 			madeProgress = true
 		case mem.AccessRsp:
-			ret := c.processRspFromOutside(now, req)
+			ret := c.processRspFromOutside(now, port, req)
 			if !ret {
 				return madeProgress
 			}
@@ -205,12 +237,17 @@ func (c *Comp) processReqFromL1(
 		panic("RDMA loop back detected")
 	}
 
+	out := c.ToOutside
+	if r, ok := c.PeerRoutes[dst]; ok {
+		out, dst = r.Local, r.Remote
+	}
+
 	cloned := c.cloneReq(req)
-	cloned.Meta().Src = c.ToOutside
+	cloned.Meta().Src = out
 	cloned.Meta().Dst = dst
 	cloned.Meta().SendTime = now
 
-	err := c.ToOutside.Send(cloned)
+	err := out.Send(cloned)
 	if err == nil {
 		c.ToL1.Retrieve(now)
 
@@ -233,6 +270,7 @@ func (c *Comp) processReqFromL1(
 
 func (c *Comp) processReqFromOutside(
 	now sim.VTimeInSec,
+	port sim.Port,
 	req mem.AccessReq,
 ) bool {
 	dst := c.localModules.Find(req.GetAddress())
@@ -244,7 +282,7 @@ func (c *Comp) processReqFromOutside(
 
 	err := c.ToL2.Send(cloned)
 	if err == nil {
-		c.ToOutside.Retrieve(now)
+		port.Retrieve(now)
 
 		c.traceOutsideInStart(req, cloned)
 
@@ -254,6 +292,7 @@ func (c *Comp) processReqFromOutside(
 		trans := transaction{
 			fromOutside: req,
 			toInside:    cloned,
+			outsidePort: port,
 		}
 		c.transactionsFromOutside =
 			append(c.transactionsFromOutside, trans)
@@ -270,12 +309,17 @@ func (c *Comp) processRspFromL2(
 		rsp.GetRspTo(), c.transactionsFromOutside)
 	trans := c.transactionsFromOutside[transactionIndex]
 
+	// Reply through the port the request arrived on.
+	out := trans.outsidePort
+	if out == nil {
+		out = c.ToOutside
+	}
 	rspToOutside := c.cloneRsp(rsp, trans.fromOutside.Meta().ID)
 	rspToOutside.Meta().SendTime = now
-	rspToOutside.Meta().Src = c.ToOutside
+	rspToOutside.Meta().Src = out
 	rspToOutside.Meta().Dst = trans.fromOutside.Meta().Src
 
-	err := c.ToOutside.Send(rspToOutside)
+	err := out.Send(rspToOutside)
 	if err == nil {
 		c.ToL2.Retrieve(now)
 
@@ -294,6 +338,7 @@ func (c *Comp) processRspFromL2(
 
 func (c *Comp) processRspFromOutside(
 	now sim.VTimeInSec,
+	port sim.Port,
 	rsp mem.AccessRsp,
 ) bool {
 	transactionIndex := c.findTransactionByRspToID(
@@ -307,7 +352,7 @@ func (c *Comp) processRspFromOutside(
 
 	err := c.ToL1.Send(rspToInside)
 	if err == nil {
-		c.ToOutside.Retrieve(now)
+		port.Retrieve(now)
 
 		c.traceInsideOutEnd(trans)
 

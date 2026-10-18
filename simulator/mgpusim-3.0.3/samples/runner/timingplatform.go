@@ -17,6 +17,8 @@ import (
 	"github.com/sarchlab/akita/v3/sim"
 	"github.com/sarchlab/akita/v3/tracing"
 	"github.com/sarchlab/mgpusim/v3/driver"
+	"github.com/sarchlab/mgpusim/v3/timing/commengine"
+	"github.com/sarchlab/mgpusim/v3/timing/rdma"
 )
 
 // R9NanoPlatformBuilder can build a platform that equips R9Nano GPU.
@@ -36,8 +38,10 @@ type R9NanoPlatformBuilder struct {
 	ldsOccupancy                       bool
 	linkBW                             float64 // bytes/s; 0 = shared PCIe
 	linkLatencyNS                      float64 // < 0 = shared PCIe
+	peerMesh                           bool
 	commEngine                         bool
 	valuCyclesScale                    float64
+	wgCap, wgRamp                      int
 	msgOverheadNS                      float64
 	h2dCycles                          int
 	l2CacheSize                        uint64
@@ -118,11 +122,27 @@ func (b R9NanoPlatformBuilder) WithLinkBandwidth(bytesPerSec float64) R9NanoPlat
 	return b
 }
 
+// WithPeerMesh builds the peer fabric as a full mesh: every pair of GPUs gets
+// a dedicated link with the -link-bw bandwidth and -link-latency latency, as
+// MI300X's Infinity Fabric gives every GPU pair its own link. Without it, all
+// GPUs share one switch through one link each.
+func (b R9NanoPlatformBuilder) WithPeerMesh(on bool) R9NanoPlatformBuilder {
+	b.peerMesh = on
+	return b
+}
+
 // WithLinkLatency gives GPU-to-GPU (RDMA) traffic its own network with the
 // given one-way latency in ns, the switch latency between two GPUs. A
 // negative value keeps the shared PCIe network.
 func (b R9NanoPlatformBuilder) WithLinkLatency(ns float64) R9NanoPlatformBuilder {
 	b.linkLatencyNS = ns
+	return b
+}
+
+// WithWGShaping caps work-groups in flight per CU and/or ramps the cap up
+// from a start value; see cp.Builder.WithWGShaping.
+func (b R9NanoPlatformBuilder) WithWGShaping(cap, ramp int) R9NanoPlatformBuilder {
+	b.wgCap, b.wgRamp = cap, ramp
 	return b
 }
 
@@ -483,6 +503,7 @@ func (b *R9NanoPlatformBuilder) createGPUBuilder(
 		WithLDSOccupancy(b.ldsOccupancy).
 		WithCommEngine(b.commEngine, sim.VTimeInSec(b.msgOverheadNS*1e-9)).
 		WithVALUCyclesScale(b.valuCyclesScale).
+		WithWGShaping(b.wgCap, b.wgRamp).
 		WithL2CacheSize(b.l2CacheSize).
 		WithDRAMSize(b.dramSize)
 
@@ -631,6 +652,101 @@ func (b *R9NanoPlatformBuilder) createPeerFabric() {
 	}
 	cycles := max(1, int(math.Round(latencyNS*float64(freq)/1e9)))
 
+	// Without a bandwidth the fabric keeps PCIe 4.0 x16's: 34 B flits at
+	// 1 GHz (32 GiB/s rounded to whole bytes per cycle).
+	flit, realized := 34, 34e9
+	if bw > 0 {
+		flit, realized = peerFabricFlitBytes, float64(freq)*peerFabricFlitBytes
+	}
+	topology := "one shared switch"
+	if b.peerMesh {
+		b.createPeerMesh(bw, freq, cycles)
+		topology = "full mesh, one link per GPU pair"
+	} else {
+		b.createPeerSwitch(bw, freq, cycles)
+	}
+
+	log.Printf("peer fabric (%s): clock %.3f MHz, flit %d B, %.3f GB/s per "+
+		"direction per link, latency %d cycles = %.1f ns", topology,
+		float64(freq)/1e6, flit, realized/1e9,
+		cycles, float64(cycles)/float64(freq)*1e9)
+}
+
+func (b *R9NanoPlatformBuilder) peerPorts(gpu *GPU) []sim.Port {
+	ports := []sim.Port{gpu.RDMAEngine.ToOutside}
+	if gpu.CommEngine != nil {
+		ports = append(ports, gpu.CommEngine.ToFabric)
+	}
+	return ports
+}
+
+// createPeerMesh gives every pair of GPUs a dedicated link: a two-GPU
+// network of the same kind as the shared switch (one switch, 16 B flits,
+// the -link-bw bandwidth, the -link-latency switch latency), carrying that
+// pair's RDMA and engine traffic. Each GPU gets one RDMA port and one engine
+// port per peer, so its links run in parallel, as MI300X's Infinity Fabric
+// links do.
+func (b *R9NanoPlatformBuilder) createPeerMesh(bw float64, freq sim.Freq, cycles int) {
+	for i, gi := range b.gpus {
+		for j := i + 1; j < len(b.gpus); j++ {
+			gj := b.gpus[j]
+			ri, rj := b.rdmaLink(gi, gj, j+1), b.rdmaLink(gj, gi, i+1)
+			ei, ej := []sim.Port{ri}, []sim.Port{rj}
+			if gi.CommEngine != nil && gj.CommEngine != nil {
+				ei = append(ei, engineLink(gi, gj, j+1))
+				ej = append(ej, engineLink(gj, gi, i+1))
+			}
+
+			link := pcie.NewConnector().
+				WithEngine(b.engine).
+				WithFrequency(freq).
+				WithSwitchLatency(cycles)
+			if bw > 0 {
+				link = link.WithBandwidth(uint64(math.Round(bw)))
+			}
+			link.CreateNetwork(fmt.Sprintf("PeerLink%dto%d", i+1, j+1))
+			sw := link.AddRootComplex(ei)
+			link.PlugInDevice(sw, ej)
+			link.EstablishRoute()
+		}
+	}
+}
+
+// rdmaLink creates from's RDMA port toward to, and routes from's requests for
+// to through it.
+func (b *R9NanoPlatformBuilder) rdmaLink(from, to *GPU, toID int) sim.Port {
+	r := from.RDMAEngine
+	port := sim.NewLimitNumMsgPort(r, 64,
+		fmt.Sprintf("%s.ToGPU[%d]", r.Name(), toID))
+	if r.PeerRoutes == nil {
+		r.PeerRoutes = map[sim.Port]rdma.PeerRoute{}
+	}
+	route := r.PeerRoutes[to.RDMAEngine.ToOutside]
+	route.Local = port
+	r.PeerRoutes[to.RDMAEngine.ToOutside] = route
+	// The remote end is filled in when to's port toward from is created.
+	if back, ok := to.RDMAEngine.PeerRoutes[r.ToOutside]; ok {
+		back.Remote = port
+		to.RDMAEngine.PeerRoutes[r.ToOutside] = back
+		route.Remote = back.Local
+		r.PeerRoutes[to.RDMAEngine.ToOutside] = route
+	}
+	return port
+}
+
+func engineLink(from, to *GPU, toID int) sim.Port {
+	e := from.CommEngine
+	port := sim.NewLimitNumMsgPort(e, 16,
+		fmt.Sprintf("%s.ToGPU[%d]", e.Name(), toID))
+	if e.Links == nil {
+		e.Links = map[*commengine.Engine]sim.Port{}
+	}
+	e.Links[to.CommEngine] = port
+	return port
+}
+
+// createPeerSwitch puts every GPU on one switch, one link each.
+func (b *R9NanoPlatformBuilder) createPeerSwitch(bw float64, freq sim.Freq, cycles int) {
 	fabric := pcie.NewConnector().
 		WithEngine(b.engine).
 		WithFrequency(freq).
@@ -642,10 +758,7 @@ func (b *R9NanoPlatformBuilder) createPeerFabric() {
 
 	switchID := -1
 	for _, gpu := range b.gpus {
-		port := []sim.Port{gpu.RDMAEngine.ToOutside}
-		if gpu.CommEngine != nil {
-			port = append(port, gpu.CommEngine.ToFabric)
-		}
+		port := b.peerPorts(gpu)
 		if switchID < 0 {
 			switchID = fabric.AddRootComplex(port)
 			continue
@@ -653,15 +766,4 @@ func (b *R9NanoPlatformBuilder) createPeerFabric() {
 		fabric.PlugInDevice(switchID, port)
 	}
 	fabric.EstablishRoute()
-
-	// Without a bandwidth the fabric keeps PCIe 4.0 x16's: 34 B flits at
-	// 1 GHz (32 GiB/s rounded to whole bytes per cycle).
-	flit, realized := 34, 34e9
-	if bw > 0 {
-		flit, realized = peerFabricFlitBytes, float64(freq)*peerFabricFlitBytes
-	}
-	log.Printf("peer fabric: clock %.3f MHz, flit %d B, %.3f GB/s per "+
-		"direction, latency %d cycles = %.1f ns",
-		float64(freq)/1e6, flit, realized/1e9,
-		cycles, float64(cycles)/float64(freq)*1e9)
 }

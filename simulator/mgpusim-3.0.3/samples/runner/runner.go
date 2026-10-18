@@ -64,6 +64,8 @@ type Runner struct {
 	LinkLatencyNS     float64
 	EngineMode        string
 	VALUCyclesScale   float64
+	WGCap, WGRamp     int
+	PeerMesh          bool
 	MsgOverheadNS     float64
 	L2CacheSize       uint64
 	DRAMSize          uint64
@@ -135,6 +137,8 @@ func (r *Runner) buildTimingPlatform() {
 		WithLinkLatency(r.LinkLatencyNS).
 		WithCommEngine(r.EngineMode != "", r.MsgOverheadNS).
 		WithVALUCyclesScale(r.VALUCyclesScale).
+		WithWGShaping(r.WGCap, r.WGRamp).
+		WithPeerMesh(r.PeerMesh).
 		WithL2CacheSize(r.L2CacheSize).
 		WithDRAMSize(r.DRAMSize)
 

@@ -57,12 +57,18 @@ func (s *Session) Arm(
 	s.done = make(chan struct{})
 	s.mu.Unlock()
 
-	peers := make([]sim.Port, len(s.parts))
 	for i, p := range s.parts {
-		peers[i] = p.Engine.ToFabric
-	}
+		// With dedicated links, send through our link to each peer and
+		// address the peer's end of it; otherwise both are ToFabric.
+		peers := make([]sim.Port, len(s.parts))
+		out := make([]sim.Port, len(s.parts))
+		for j, q := range s.parts {
+			peers[j], out[j] = q.Engine.ToFabric, p.Engine.ToFabric
+			if l, ok := p.Engine.Links[q.Engine]; ok {
+				out[j], peers[j] = l, q.Engine.Links[p.Engine]
+			}
+		}
 
-	for i, p := range s.parts {
 		region := s.region(ctx, uint64(cs[i]), rows, cols, tileEdge)
 		if opt.Placement == NearMemory {
 			gpu, numGPU, n := i, len(s.parts), opt.TilesPerMsg
@@ -86,7 +92,7 @@ func (s *Session) Arm(
 		p.Tracker.IgnoreSrc(p.Engine.ToMem)
 
 		p.Engine.Arm(Config{
-			GPU: i, NumGPU: len(s.parts), Peers: peers,
+			GPU: i, NumGPU: len(s.parts), Peers: peers, Out: out,
 			VBase: uint64(cs[i]), Rows: rows, Cols: cols,
 			TileRows: tileEdge, TileCols: tileEdge,
 			VToP: func(v uint64) uint64 {

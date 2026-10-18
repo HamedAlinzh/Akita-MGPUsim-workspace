@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sarchlab/mgpusim/v3/benchmarks/allreducegemm"
@@ -29,14 +30,18 @@ func trackTilesOnCUs(t *testing.T, numCU int, m, k, n, tileSize uint32) {
 
 func trackTilesWith(
 	t *testing.T, ldsOccupancy bool, numCU int, m, k, n, tileSize uint32,
+	opts ...func(runner.R9NanoPlatformBuilder) runner.R9NanoPlatformBuilder,
 ) {
 	t.Helper()
 
-	platform := runner.MakeR9NanoBuilder().
+	builder := runner.MakeR9NanoBuilder().
 		WithNumGPU(1).
 		WithNumCUPerGPU(numCU).
-		WithLDSOccupancy(ldsOccupancy).
-		Build()
+		WithLDSOccupancy(ldsOccupancy)
+	for _, o := range opts {
+		builder = o(builder)
+	}
+	platform := builder.Build()
 	d := platform.Driver
 	d.Run()
 	defer d.Terminate()
@@ -206,4 +211,34 @@ func TestTileTrackerRepresentative(t *testing.T) {
 // waves and should complete tiles with a similar spread.
 func TestTileTrackerScaleCheck(t *testing.T) {
 	trackTilesWith(t, true, 16, 768, 256, 512, 8) // 384 tiles, 2.0 waves
+}
+
+// TestTileTrackerShaping runs the f~0.5 shape (4 CUs, 384x256, K 256,
+// tileSize 8) with dispatch shaping. TILETRACKER_SHAPING lists cap:ramp
+// pairs (for example "4:0,0:1"); each writes its CSV under
+// $TILETRACKER_OUT/cap<cap>_ramp<ramp>/.
+func TestTileTrackerShaping(t *testing.T) {
+	settings := os.Getenv("TILETRACKER_SHAPING")
+	if settings == "" {
+		t.Skip("TILETRACKER_SHAPING not set")
+	}
+	out := os.Getenv("TILETRACKER_OUT")
+	for _, setting := range strings.Split(settings, ",") {
+		var wgCap, ramp int
+		if _, err := fmt.Sscanf(setting, "%d:%d", &wgCap, &ramp); err != nil {
+			t.Fatalf("bad setting %q", setting)
+		}
+		if out != "" {
+			dir := filepath.Join(out, fmt.Sprintf("cap%d_ramp%d", wgCap, ramp))
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TILETRACKER_OUT", dir)
+		}
+		t.Logf("dispatch shaping cap=%d ramp=%d", wgCap, ramp)
+		trackTilesWith(t, true, 4, 384, 256, 256, 8,
+			func(b runner.R9NanoPlatformBuilder) runner.R9NanoPlatformBuilder {
+				return b.WithWGShaping(wgCap, ramp)
+			})
+	}
 }

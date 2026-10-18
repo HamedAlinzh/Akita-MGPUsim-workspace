@@ -82,3 +82,57 @@ func TestGEMMResidency(t *testing.T) {
 		}
 	}
 }
+
+func shapedCU(cap, ramp int) CUResource {
+	pool := NewCUResourcePool()
+	pool.WGCap, pool.WGRampStart = cap, ramp
+	pool.RegisterCU(timingCU{})
+	return pool.GetCU(0)
+}
+
+func oneWaveWG() *kernels.WorkGroup {
+	co := insts.NewHsaCo()
+	co.WFSgprCount, co.WIVgprCount = 16, 4
+	wg := kernels.NewWorkGroup()
+	wg.CodeObject = co
+	wg.Packet = &kernels.HsaKernelDispatchPacket{}
+	wg.Wavefronts = append(wg.Wavefronts, kernels.NewWavefront())
+	return wg
+}
+
+func TestWGCapLimitsWorkGroupsInFlight(t *testing.T) {
+	cu := shapedCU(2, 0)
+	a, b := oneWaveWG(), oneWaveWG()
+	for _, wg := range []*kernels.WorkGroup{a, b} {
+		if _, ok := cu.ReserveResourceForWG(wg); !ok {
+			t.Fatal("a work-group under the cap was refused")
+		}
+	}
+	if _, ok := cu.ReserveResourceForWG(oneWaveWG()); ok {
+		t.Fatal("a third work-group fit under a cap of 2")
+	}
+	cu.FreeResourcesForWG(a)
+	if _, ok := cu.ReserveResourceForWG(oneWaveWG()); !ok {
+		t.Fatal("no room after a work-group finished")
+	}
+}
+
+func TestWGRampGrowsWithCompletions(t *testing.T) {
+	cu := shapedCU(0, 1)
+	first := oneWaveWG()
+	if _, ok := cu.ReserveResourceForWG(first); !ok {
+		t.Fatal("the first work-group was refused")
+	}
+	if _, ok := cu.ReserveResourceForWG(oneWaveWG()); ok {
+		t.Fatal("a second work-group fit before any completed")
+	}
+	cu.FreeResourcesForWG(first) // the cap is now 2
+	for i := 0; i < 2; i++ {
+		if _, ok := cu.ReserveResourceForWG(oneWaveWG()); !ok {
+			t.Fatalf("work-group %d refused after the ramp grew", i)
+		}
+	}
+	if _, ok := cu.ReserveResourceForWG(oneWaveWG()); ok {
+		t.Fatal("a third work-group fit under a ramped cap of 2")
+	}
+}

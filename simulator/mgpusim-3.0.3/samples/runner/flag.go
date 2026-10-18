@@ -78,6 +78,14 @@ var msgOverheadFlag = flag.Float64("msg-overhead", 0,
 var valuCyclesScaleFlag = flag.Float64("valu-cycles-scale", 1,
 	"Multiply the cycles of every vector ALU instruction (compute speed "+
 		"only; memory, LDS and scalar timing unchanged).")
+var wgCapFlag = flag.Int("wg-cap", 0,
+	"Cap the work-groups in flight per CU (dispatch shaping; 0 = off).")
+var wgRampFlag = flag.Int("wg-ramp", 0,
+	"Start each CU's work-group cap at this value and raise it by one per "+
+		"completed work-group (dispatch shaping; 0 = off).")
+var peerMeshFlag = flag.Bool("peer-mesh", false,
+	"Build the peer fabric as a full mesh with one link per GPU pair "+
+		"(MI300X-like) instead of one shared switch.")
 var cusPerGPUFlag = flag.Int("cus-per-gpu", 64,
 	"Compute units per GPU: 1-3 or a multiple of 4 (shader arrays of 4 CUs).")
 
@@ -166,6 +174,8 @@ func (r *Runner) ParseFlag() *Runner {
 	r.LinkLatencyNS = *linkLatencyFlag
 	r.EngineMode = *engineModeFlag
 	r.VALUCyclesScale = *valuCyclesScaleFlag
+	r.WGCap, r.WGRamp = *wgCapFlag, *wgRampFlag
+	r.PeerMesh = *peerMeshFlag
 	r.MsgOverheadNS = *msgOverheadFlag
 	r.L2CacheSize = *l2CacheSizeFlag
 	r.DRAMSize = *dramSizeFlag

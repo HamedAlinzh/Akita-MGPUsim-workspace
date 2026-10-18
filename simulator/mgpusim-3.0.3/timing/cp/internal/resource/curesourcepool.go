@@ -42,6 +42,18 @@ type CUResourcePoolImpl struct {
 	// CountDynamicLDS makes CUs registered afterwards count a work-group's
 	// dynamic LDS (local pointer arguments) against the CU's LDS.
 	CountDynamicLDS bool
+
+	// WGCap and WGRampStart shape dispatch on CUs registered afterwards; see
+	// CUResourceImpl. 0 turns each off.
+	WGCap       int
+	WGRampStart int
+}
+
+// StartKernel restarts the dispatch ramp of every CU for a new kernel.
+func (p *CUResourcePoolImpl) StartKernel() {
+	for _, cu := range p.cus {
+		cu.(*CUResourceImpl).completed = 0
+	}
 }
 
 // NewCUResourcePool returns a CUResourcePoll
@@ -71,6 +83,8 @@ func (p *CUResourcePoolImpl) RegisterCU(cu DispatchableCU) {
 	r := &CUResourceImpl{
 		reservedWGs:     make(map[*kernels.WorkGroup][]WfLocation),
 		countDynamicLDS: p.CountDynamicLDS,
+		wgCap:           p.WGCap,
+		rampStart:       p.WGRampStart,
 	}
 
 	r.port = cu.DispatchingPort()

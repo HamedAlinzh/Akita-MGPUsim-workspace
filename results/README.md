@@ -64,6 +64,12 @@ Layout: one subfolder per experiment.
   `reports/fused-gemm-comm-design.md` ("Reduction placements and T3"). Caveat: the
   matrix-core curve is extrapolated from MI355X data (HipKittens), and tileSize 4 has 8
   sim waves vs 3.37 real, so its readiness is finer than reality.
+- `step4a_shaping/`: dispatch-shaping spike. `tracker/` (1 GPU, f≈0.5 shape,
+  `TestTileTrackerShaping`, `spread_summary.txt`): `-wg-cap` 4/6/8 and `-wg-ramp` 1/4.
+  `runs/` (`scripts/step4a_runs.sh`, `summary.txt` from `scripts/step4a_summary.py`): 2-GPU
+  tile mode N=1 at f≈0.5 and f≈0.8 with `-wg-ramp 1` and `-wg-cap 4`, the f≈0.8 baseline,
+  tileSize 4 at f≈0.8 (matrix-core curve), 4-GPU mccl/bulk/tile on the per-pair mesh
+  (`-peer-mesh`), and the default 433 us check (window 432.742 us).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
