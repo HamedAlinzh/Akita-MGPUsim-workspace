@@ -34,7 +34,10 @@ Layout: one subfolder per experiment.
   0.15 or below, so the win there is removing launch latency, not overlap.
 - `stepD_knobs/`: before/after check of `-link-bw`/`-link-latency` (`run.sh`). Defaults
   reproduce the 433 us baseline exactly (window 432.742 us); the peer fabric at PCIe-like
-  values (34 GB/s, 140 ns) gives 430.195 us.
+  values (34 GB/s, 140 ns) gives 430.195 us. `defaults_after_step2/` and `repeat_a/b/` rerun
+  the defaults with the Step 2 binary: window 432.742 us every time; total_time varies by
+  4 ns between identical runs (589.961 or 589.965 us), a pre-existing nondeterminism in the
+  copy-back after the window.
 - `step1_tracker/`: Step 1 tile-tracker spike, produced by
   `TILETRACKER_OUT=<this dir> go test -run TestTileTracker -v ./benchmarks/allreducegemm/`.
   `test_output.txt` is the summary; `tiles_cu<CUs>_M_N_K_t<tileSize>.csv` lists every tile
