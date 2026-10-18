@@ -75,6 +75,9 @@ over the peer fabric: "tile" sends tiles as they finish, "bulk" only after
 the whole GEMM. Empty (default) builds no engine.`)
 var msgOverheadFlag = flag.Float64("msg-overhead", 0,
 	"Fixed cost of every communication-engine message, in ns.")
+var valuCyclesScaleFlag = flag.Float64("valu-cycles-scale", 1,
+	"Multiply the cycles of every vector ALU instruction (compute speed "+
+		"only; memory, LDS and scalar timing unchanged).")
 var cusPerGPUFlag = flag.Int("cus-per-gpu", 64,
 	"Compute units per GPU: 1-3 or a multiple of 4 (shader arrays of 4 CUs).")
 
@@ -162,6 +165,7 @@ func (r *Runner) ParseFlag() *Runner {
 	r.LinkBW = *linkBWFlag * 1e9
 	r.LinkLatencyNS = *linkLatencyFlag
 	r.EngineMode = *engineModeFlag
+	r.VALUCyclesScale = *valuCyclesScaleFlag
 	r.MsgOverheadNS = *msgOverheadFlag
 	r.L2CacheSize = *l2CacheSizeFlag
 	r.DRAMSize = *dramSizeFlag

@@ -39,6 +39,7 @@ type R9NanoGPUBuilder struct {
 	l1AcquireOnLaunch              bool
 	ldsOccupancy                   bool
 	commEngine                     bool
+	valuCyclesScale                float64
 	msgOverhead                    sim.VTimeInSec
 	l2CacheSize                    uint64
 	log2PageSize                   uint64
@@ -100,6 +101,7 @@ func MakeR9NanoGPUBuilder() R9NanoGPUBuilder {
 		log2MemoryBankInterleavingSize: 12,
 		l1CacheSize:                    16 * mem.KB,
 		l1AcquireOnLaunch:              true,
+		valuCyclesScale:                1,
 		l2CacheSize:                    2 * mem.MB,
 		dramSize:                       4 * mem.GB,
 	}
@@ -225,6 +227,13 @@ func (b R9NanoGPUBuilder) WithL1CacheSize(size uint64) R9NanoGPUBuilder {
 // a kernel can read data that another GPU has since overwritten remotely.
 func (b R9NanoGPUBuilder) WithL1AcquireOnLaunch(on bool) R9NanoGPUBuilder {
 	b.l1AcquireOnLaunch = on
+	return b
+}
+
+// WithVALUCyclesScale multiplies the cycles of every vector ALU instruction
+// in every CU, to model a different compute throughput.
+func (b R9NanoGPUBuilder) WithVALUCyclesScale(s float64) R9NanoGPUBuilder {
+	b.valuCyclesScale = s
 	return b
 }
 
@@ -551,7 +560,8 @@ func (b *R9NanoGPUBuilder) buildSAs() {
 		withLog2CachelineSize(b.log2CacheLineSize).
 		withLog2PageSize(b.log2PageSize).
 		withNumCU(b.numCUPerShaderArray).
-		withL1CacheSize(b.l1CacheSize)
+		withL1CacheSize(b.l1CacheSize).
+		withVALUCyclesScale(b.valuCyclesScale)
 
 	if b.enableISADebugging {
 		saBuilder = saBuilder.withIsaDebugging()

@@ -267,6 +267,103 @@ def derive_knobs(pt: Point, f: float, latency_ns: float = REAL_MSG_LATENCY_NS):
 
 
 # ---------------------------------------------------------------------------
+# Tile-size mapping and the matrix-core compute curve (Step 3).
+# ---------------------------------------------------------------------------
+# Real GEMM efficiency vs output tile. The only measured AMD matrix-core tile
+# comparison found: HipKittens (arXiv 2511.08083, Table 2), BF16 8192^3 on
+# MI355X (CDNA4, not MI300X): 256x256 -> 1610 TFLOPS, 192x256 -> 1281,
+# 128x256 -> 893 (different producer/consumer split). Efficiency relative to
+# 256x256 follows the tile's arithmetic intensity I = MT*NT/(MT+NT) as
+# (I / I_256)^alpha with alpha = 1.48 and 1.45 from the two points; we use
+# 1.47. 128x128 is an extrapolation, so the curve counts as assumed and is
+# bracketed by alpha = 1 (flatter) and 2 (steeper).
+HK_POINTS = [((192, 256), 1281 / 1610), ((128, 256), 893 / 1610)]
+CURVE_ALPHAS = {"flatter": 1.0, "matrix-core": 1.47, "steeper": 2.0}
+
+
+def intensity(mt: int, nt: int) -> float:
+    return mt * nt / (mt + nt)
+
+
+def fitted_alphas():
+    ref = intensity(256, 256)
+    return [math.log(eff) / math.log(intensity(*t) / ref) for t, eff in HK_POINTS]
+
+
+def rel_time(edge: int, alpha: float) -> float:
+    """GEMM time with edge x edge tiles over time with 256x256 tiles."""
+    return (intensity(256, 256) / intensity(edge, edge)) ** alpha
+
+
+# Sim tileSize -> real tile edge. tileSize 8 = 256x256 is the matched point;
+# tileSize 4 = 128x128 halves the edge in both. tileSize 16 would be 512x512,
+# whose FP32 accumulators (1 MiB) exceed the CU's 512 KiB VGPR file, so no
+# MI300X kernel uses it; tileSize 2 = 64x64 runs about 16x slower than
+# tileSize 8 natively (4 of 64 lanes busy), beyond the run budget.
+TILE_MAP = {4: 128, 8: 256}
+# Real resident work-groups per CU (estimate, as for 256x256 above): a
+# 128x128 tile has 64 KiB of accumulators and stages 2 x 128x64 BF16 = 32 KiB
+# in LDS, so LDS allows 2.
+REAL_RESIDENT_BY_EDGE = {128: 2, 256: 1}
+# Measured simulated GEMM times (1 GPU, 384x256, K 256, 4 CUs,
+# -lds-occupancy; results/step3_tiles/calib/): tileSize -> {valu scale: us}.
+SIM_GEMM_US = {4: {1.0: 2700.3, 0.9: 2430.4, 0.6: 1643.3, 0.4: 1183.8},
+               8: {1.0: 646.3}, 16: {1.0: 624.0}}
+
+
+def valu_scale_for(tile_size: int, target_us: float) -> float:
+    """Linear fit of measured GEMM time against -valu-cycles-scale."""
+    pts = sorted(SIM_GEMM_US[tile_size].items())
+    n = len(pts)
+    mx = sum(x for x, _ in pts) / n
+    my = sum(y for _, y in pts) / n
+    slope = sum((x - mx) * (y - my) for x, y in pts) / sum((x - mx) ** 2 for x, _ in pts)
+    return (target_us - (my - slope * mx)) / slope
+
+
+def waves_at_edge(m: int, n: int, edge: int) -> float:
+    tiles = math.ceil(m / edge) * math.ceil(n / edge)
+    return tiles / (REAL_CUS * REAL_RESIDENT_BY_EDGE[edge])
+
+
+def tile_rows(tokens: int, pt: "Point"):
+    """Per mapped tile size and curve: waves, one-tile L/X and f, real vs
+    simulated, with the f~0.5 point's link knobs held fixed (they describe
+    the network, not the tile)."""
+    k = derive_knobs(pt, pt.layer.frac())
+    lat_ns = k["link_latency_ns"] + k["msg_overhead_ns"]
+    bw_eff = k["link_bw_gbps"] * 1e9 * SIM_FABRIC_EFF
+    rows = []
+    for ts, edge in TILE_MAP.items():
+        real_x = edge * edge * BF16 / (REAL_LINK_BW * REAL_LINK_EFF) * 1e9
+        sim_x = ((4 * ts) ** 2 * FP32 + 16) / bw_eff * 1e9
+        tiles_sim = (pt.m // (4 * ts)) * (pt.n // (4 * ts))
+        msgs = tiles_sim  # per direction at N=1 (all-reduce, 2 GPUs)
+        comm_us = msgs * max(sim_x, k["msg_overhead_ns"]) / 1e3
+        for curve in ("native",) + tuple(CURVE_ALPHAS):
+            if curve == "native":
+                scale, rel = 1.0, SIM_GEMM_US[ts][1.0] / SIM_GEMM_US[8][1.0]
+            else:
+                rel = rel_time(edge, CURVE_ALPHAS[curve])
+                scale = 1.0 if ts == 8 else valu_scale_for(ts, rel * SIM_GEMM_US[8][1.0])
+            alpha = CURVE_ALPHAS.get(curve, CURVE_ALPHAS["matrix-core"])
+            g_real = pt.layer.t_gemm() * rel_time(edge, alpha)
+            c_real = pt.layer.t_comm()
+            g_sim = rel * SIM_GEMM_US[8][1.0] - SIM_LAUNCH_US
+            rows.append(dict(
+                sim_tile_size=ts, real_tile=f"{edge}x{edge}", curve=curve,
+                valu_scale=round(scale, 3), sim_gemm_rel=round(rel, 2),
+                real_waves=round(waves_at_edge(pt.layer.tokens, pt.layer.model.hidden,
+                                               edge), 2),
+                sim_waves=round(sim_waves(pt.m, pt.n, pt.cus, ts), 2),
+                real_LX=round(REAL_MSG_LATENCY_NS / real_x, 2),
+                sim_LX=round(lat_ns / sim_x, 2),
+                real_f=round(c_real / (g_real + c_real), 3) if curve != "native" else "",
+                sim_f_n1=round(comm_us / (g_sim + comm_us), 3)))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # MoE all-to-all (analysis only).
 # ---------------------------------------------------------------------------
 # Expert parallel over 8 GPUs, Mixtral 8x7B: one expert per GPU. Each GPU
@@ -424,6 +521,17 @@ def main():
           f"{REAL_WIRE_NS:.0f} ns real)")
     print(table(lat, ["point", "real_latency_ns", "LX", "link_latency_ns",
                       "msg_overhead_ns"]))
+
+    # 3c. Tile-size mapping (Step 3).
+    a1, a2 = fitted_alphas()
+    print(f"\n3c. Tile-size mapping at the f~0.5 point (link knobs fixed). "
+          f"Matrix-core curve: alpha fitted {a1:.2f} and {a2:.2f} from HipKittens "
+          f"MI355X data, used {CURVE_ALPHAS['matrix-core']}")
+    trows = tile_rows(args.tokens, points(args.tokens)[1])
+    write_csv(os.path.join(args.outdir, "tile_mapping.csv"), trows)
+    print(table(trows, ["sim_tile_size", "real_tile", "curve", "valu_scale",
+                        "sim_gemm_rel", "real_waves", "sim_waves", "real_LX",
+                        "sim_LX", "real_f", "sim_f_n1"]))
 
     # 4. MoE.
     moe = moe_rows()

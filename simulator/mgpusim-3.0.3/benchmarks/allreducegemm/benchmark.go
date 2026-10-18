@@ -349,7 +349,8 @@ func (b *Benchmark) execFused(
 	window := max(doneAt, windowStart+gemmWait) - windowStart
 
 	log.Printf("allreducegemm fused phases: window=%.9f gemm_wait=%.9f "+
-		"comm_tail=%.9f", window, gemmWait, window-gemmWait)
+		"comm_tail=%.9f first_ready=%.9f", window, gemmWait, window-gemmWait,
+		b.Comm.FirstReady()-windowStart)
 	b.logMessages()
 
 	b.collectFused(partialC, tileEdge)

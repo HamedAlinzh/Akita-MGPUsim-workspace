@@ -37,6 +37,7 @@ type R9NanoPlatformBuilder struct {
 	linkBW                             float64 // bytes/s; 0 = shared PCIe
 	linkLatencyNS                      float64 // < 0 = shared PCIe
 	commEngine                         bool
+	valuCyclesScale                    float64
 	msgOverheadNS                      float64
 	h2dCycles                          int
 	l2CacheSize                        uint64
@@ -63,6 +64,7 @@ func MakeR9NanoBuilder() R9NanoPlatformBuilder {
 		log2PageSize:      12,
 		l1CacheSize:       16 * mem.KB,
 		l1AcquireOnLaunch: true,
+		valuCyclesScale:   1,
 		h2dCycles:         14500,
 		linkLatencyNS:     -1,
 		l2CacheSize:       2 * mem.MB,
@@ -121,6 +123,13 @@ func (b R9NanoPlatformBuilder) WithLinkBandwidth(bytesPerSec float64) R9NanoPlat
 // negative value keeps the shared PCIe network.
 func (b R9NanoPlatformBuilder) WithLinkLatency(ns float64) R9NanoPlatformBuilder {
 	b.linkLatencyNS = ns
+	return b
+}
+
+// WithVALUCyclesScale multiplies the cycles of every vector ALU instruction
+// in every CU (see cu.SIMDUnit.CyclesScale).
+func (b R9NanoPlatformBuilder) WithVALUCyclesScale(s float64) R9NanoPlatformBuilder {
+	b.valuCyclesScale = s
 	return b
 }
 
@@ -473,6 +482,7 @@ func (b *R9NanoPlatformBuilder) createGPUBuilder(
 		WithL1AcquireOnLaunch(b.l1AcquireOnLaunch).
 		WithLDSOccupancy(b.ldsOccupancy).
 		WithCommEngine(b.commEngine, sim.VTimeInSec(b.msgOverheadNS*1e-9)).
+		WithVALUCyclesScale(b.valuCyclesScale).
 		WithL2CacheSize(b.l2CacheSize).
 		WithDRAMSize(b.dramSize)
 

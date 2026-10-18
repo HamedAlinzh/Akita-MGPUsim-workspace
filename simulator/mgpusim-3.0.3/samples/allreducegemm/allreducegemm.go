@@ -31,6 +31,10 @@ var tilesPerMsgFlag = flag.Int("tiles-per-msg", 1,
 var reduceScatterFlag = flag.Bool("reduce-scatter", false,
 	"Reduce-scatter instead of all-reduce: with -engine-mode in the engines, "+
 		"otherwise a ring reduce-scatter (one band only).")
+var placementFlag = flag.String("placement", "owner",
+	`With -engine-mode: where tiles are reduced, "owner" (the owner's engine
+adds the partials) or "near-memory" (T3-style op-and-store at the owner's
+memory side).`)
 var tileSizeFlag = flag.Uint("tile-size", 0,
 	"Work-group edge T; each work-group computes a 4T x 4T tile (0 = 8).")
 var perBandScratchFlag = flag.Bool("per-band-scratch", false,
@@ -87,6 +91,15 @@ func fusedComm(r *runner.Runner) (*commengine.Session, commengine.Options) {
 	}
 	if *reduceScatterFlag {
 		opt.Collective = commengine.ReduceScatter
+	}
+	switch *placementFlag {
+	case "owner":
+		opt.Placement = commengine.OwnerEngine
+	case "near-memory":
+		opt.Placement = commengine.NearMemory
+	default:
+		log.Panicf(`-placement must be "owner" or "near-memory", got %q`,
+			*placementFlag)
 	}
 
 	var parts []commengine.Participant

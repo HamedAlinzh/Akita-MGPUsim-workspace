@@ -23,6 +23,13 @@ type SIMDUnit struct {
 
 	NumSinglePrecisionUnit int
 
+	// CyclesScale multiplies the cycles of every VALU instruction (default
+	// 1). Fractional cycles carry over to the next instruction, so the
+	// average cost is exact. It stands in for a different compute
+	// throughput without touching memory timing.
+	CyclesScale float64
+	carry       float64
+
 	isIdle bool
 }
 
@@ -41,6 +48,7 @@ func NewSIMDUnit(
 	u.alu = alu
 
 	u.NumSinglePrecisionUnit = 16
+	u.CyclesScale = 1
 
 	return u
 }
@@ -60,8 +68,19 @@ func (u *SIMDUnit) IsIdle() bool {
 func (u *SIMDUnit) AcceptWave(wave *wavefront.Wavefront, now sim.VTimeInSec) {
 	u.toExec = wave
 
-	u.cycleLeft = 64 / u.NumSinglePrecisionUnit
+	u.cycleLeft = u.execCycles()
 	u.logPipelineTask(now, u.toExec.DynamicInst(), false)
+}
+
+func (u *SIMDUnit) execCycles() int {
+	base := 64 / u.NumSinglePrecisionUnit
+	if u.CyclesScale == 1 {
+		return base
+	}
+	exact := float64(base)*u.CyclesScale + u.carry
+	cycles := max(1, int(exact))
+	u.carry = exact - float64(cycles)
+	return cycles
 }
 
 // Run executes three pipeline stages that are controlled by the SIMDUnit

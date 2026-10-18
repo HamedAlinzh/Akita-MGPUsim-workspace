@@ -15,7 +15,9 @@
 package tiletracker
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"sync"
 
 	"github.com/sarchlab/akita/v3/mem/mem"
@@ -38,9 +40,28 @@ type Region struct {
 	// addresses.
 	PageMap      map[uint64]uint64
 	Log2PageSize uint64
+
+	// Expected, if set, gives how many times every byte of a tile is
+	// written before the tile is complete (default 1). With near-memory
+	// reduction the owner's tiles expect one GEMM store plus one update per
+	// other GPU.
+	Expected func(tile int) int
+	// Accumulate, if set, marks tiles whose stores add to what the tile
+	// holds instead of overwriting it (op-and-store), in any order.
+	Accumulate func(tile int) bool
 }
 
 const elemBytes = 4
+
+// Update tags a WriteReq (in its Info) as an update from a peer GPU: it
+// counts toward its tile even when its source port is ignored, and it is
+// not part of the local GEMM's output.
+type Update struct{}
+
+func isUpdate(w *mem.WriteReq) bool {
+	_, ok := w.Info.(Update)
+	return ok
+}
 
 // TileEvent reports that a tile completed.
 type TileEvent struct {
@@ -57,12 +78,18 @@ type segment struct {
 	tile     int
 	tileByte int
 	value    byte
+	update   bool
 }
 
 type tileState struct {
-	written    []bool
+	written    []uint8
 	data       []byte
+	sum        []float32 // running sums of an accumulating tile
+	expected   int
+	accumulate bool
 	count      int
+	localCount int
+	localDone  bool
 	numStores  int
 	firstStore sim.VTimeInSec
 	lastStore  sim.VTimeInSec
@@ -89,8 +116,18 @@ type Tracker struct {
 	// bytes as L2 holds them.
 	OnComplete func(ev TileEvent, data []byte)
 
-	listeners []func(ev TileEvent)
-	ignored   map[sim.Port]bool
+	listeners      []func(ev TileEvent)
+	localListeners []func(ev TileEvent)
+	ignored        map[sim.Port]bool
+}
+
+// AddLocalListener registers a function called when all of a tile's bytes
+// from the local GEMM (stores that are not updates) are acknowledged. For a
+// tile that expects one write per byte this is when it completes.
+func (t *Tracker) AddLocalListener(f func(ev TileEvent)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.localListeners = append(t.localListeners, f)
 }
 
 // AddListener registers a function called, inside the simulation, every
@@ -106,6 +143,7 @@ func (t *Tracker) ClearListeners() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.listeners = nil
+	t.localListeners = nil
 }
 
 // IgnoreSrc makes the tracker ignore stores sent from the given port, such
@@ -151,8 +189,17 @@ func (t *Tracker) Arm(r Region) {
 	numTiles := int((r.Rows / r.TileRows) * t.tilesX)
 	t.tiles = make([]tileState, numTiles)
 	for i := range t.tiles {
-		t.tiles[i].written = make([]bool, t.tileSize)
-		t.tiles[i].data = make([]byte, t.tileSize)
+		ts := &t.tiles[i]
+		ts.written = make([]uint8, t.tileSize)
+		ts.data = make([]byte, t.tileSize)
+		ts.expected = 1
+		if r.Expected != nil {
+			ts.expected = r.Expected(i)
+		}
+		if r.Accumulate != nil && r.Accumulate(i) {
+			ts.accumulate = true
+			ts.sum = make([]float32, t.tileSize/elemBytes)
+		}
 	}
 	t.pending = make(map[string][]segment)
 	t.events = nil
@@ -246,12 +293,13 @@ func (t *Tracker) storeReceived(w *mem.WriteReq) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if !t.armed || t.ignored[w.Src] {
+	update := isUpdate(w)
+	if !t.armed || t.ignored[w.Src] && !update {
 		return
 	}
 
 	var segs []segment
-	for i := range w.Data {
+	for i := 0; i < len(w.Data); i++ {
 		if w.DirtyMask != nil && !w.DirtyMask[i] {
 			continue
 		}
@@ -263,7 +311,11 @@ func (t *Tracker) storeReceived(w *mem.WriteReq) {
 		if !ok {
 			continue
 		}
-		segs = append(segs, segment{tile: tile, tileByte: tileByte, value: w.Data[i]})
+		if t.tiles[tile].accumulate {
+			t.accumulate(w, i, tile, tileByte)
+		}
+		segs = append(segs, segment{tile: tile, tileByte: tileByte,
+			value: w.Data[i], update: update})
 	}
 	if len(segs) == 0 {
 		return
@@ -292,6 +344,26 @@ func (t *Tracker) storeReceived(w *mem.WriteReq) {
 	t.pending[w.ID] = segs
 }
 
+// accumulate turns the store of a whole element, starting at byte i of the
+// request, into an add: the tile's running sum gains the stored value, and the
+// request carries the new sum to L2. L2 handles writes to a line in arrival
+// order, so the last write leaves the full sum whatever the order of the
+// GEMM's store and the peers' updates. This stands in for an op-and-store
+// ALU in front of the L2 bank.
+func (t *Tracker) accumulate(w *mem.WriteReq, i, tile, tileByte int) {
+	if tileByte%elemBytes != 0 {
+		return // a later byte of an element already handled
+	}
+	if i+elemBytes > len(w.Data) || w.DirtyMask != nil &&
+		!(w.DirtyMask[i+1] && w.DirtyMask[i+2] && w.DirtyMask[i+3]) {
+		panic("tiletracker: accumulating store does not cover whole elements")
+	}
+	ts := &t.tiles[tile]
+	e := tileByte / elemBytes
+	ts.sum[e] += math.Float32frombits(binary.LittleEndian.Uint32(w.Data[i:]))
+	binary.LittleEndian.PutUint32(w.Data[i:], math.Float32bits(ts.sum[e]))
+}
+
 func (t *Tracker) storeAcked(rsp *mem.WriteDoneRsp) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -309,21 +381,31 @@ func (t *Tracker) storeAcked(rsp *mem.WriteDoneRsp) {
 	}
 	for _, s := range segs {
 		ts := &t.tiles[s.tile]
-		if ts.written[s.tileByte] {
+		if int(ts.written[s.tileByte]) >= ts.expected {
 			t.errors = append(t.errors, fmt.Sprintf(
-				"%.12f: byte %d of tile %d written twice",
-				now, s.tileByte, s.tile))
+				"%.12f: byte %d of tile %d written more than %d times",
+				now, s.tileByte, s.tile, ts.expected))
 			continue
 		}
-		ts.written[s.tileByte] = true
+		ts.written[s.tileByte]++
 		ts.data[s.tileByte] = s.value
 		ts.count++
+		if !s.update {
+			ts.localCount++
+		}
 	}
 
 	for _, tile := range touched {
 		ts := &t.tiles[tile]
 		ts.pending--
-		if ts.count < t.tileSize || ts.complete {
+		if ts.localCount == t.tileSize && !ts.localDone {
+			ts.localDone = true
+			ev := t.event(tile, now)
+			for _, f := range t.localListeners {
+				f(ev)
+			}
+		}
+		if ts.count < t.tileSize*ts.expected || ts.complete {
 			continue
 		}
 		if ts.pending != 0 {
@@ -332,15 +414,7 @@ func (t *Tracker) storeAcked(rsp *mem.WriteDoneRsp) {
 				now, tile, ts.pending))
 		}
 		ts.complete = true
-		ev := TileEvent{
-			Tile:       tile,
-			Row:        uint32(tile) / t.tilesX,
-			Col:        uint32(tile) % t.tilesX,
-			FirstStore: ts.firstStore,
-			LastStore:  ts.lastStore,
-			Complete:   now,
-			NumStores:  ts.numStores,
-		}
+		ev := t.event(tile, now)
 		t.events = append(t.events, ev)
 		if t.OnComplete != nil {
 			t.OnComplete(ev, append([]byte(nil), ts.data...))
@@ -348,6 +422,19 @@ func (t *Tracker) storeAcked(rsp *mem.WriteDoneRsp) {
 		for _, f := range t.listeners {
 			f(ev)
 		}
+	}
+}
+
+func (t *Tracker) event(tile int, now sim.VTimeInSec) TileEvent {
+	ts := &t.tiles[tile]
+	return TileEvent{
+		Tile:       tile,
+		Row:        uint32(tile) / t.tilesX,
+		Col:        uint32(tile) % t.tilesX,
+		FirstStore: ts.firstStore,
+		LastStore:  ts.lastStore,
+		Complete:   now,
+		NumStores:  ts.numStores,
 	}
 }
 

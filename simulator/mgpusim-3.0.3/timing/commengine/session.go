@@ -19,6 +19,7 @@ type Options struct {
 	TilesPerMsg int
 	Mode        Mode
 	Collective  Collective
+	Placement   Placement
 }
 
 // Session drives the engines of a set of GPUs from the host: arm them before
@@ -27,10 +28,11 @@ type Session struct {
 	driver *driver.Driver
 	parts  []Participant
 
-	mu       sync.Mutex
-	numDone  int
-	done     chan struct{}
-	doneTime sim.VTimeInSec
+	mu         sync.Mutex
+	numDone    int
+	done       chan struct{}
+	doneTime   sim.VTimeInSec
+	firstReady sim.VTimeInSec
 }
 
 // NewSession creates a session over the participants, in GPU order.
@@ -51,6 +53,7 @@ func (s *Session) Arm(
 ) {
 	s.mu.Lock()
 	s.numDone = 0
+	s.firstReady = -1
 	s.done = make(chan struct{})
 	s.mu.Unlock()
 
@@ -61,11 +64,24 @@ func (s *Session) Arm(
 
 	for i, p := range s.parts {
 		region := s.region(ctx, uint64(cs[i]), rows, cols, tileEdge)
+		if opt.Placement == NearMemory {
+			gpu, numGPU, n := i, len(s.parts), opt.TilesPerMsg
+			owned := func(tile int) bool { return Owner(tile/n, numGPU) == gpu }
+			region.Accumulate = owned
+			region.Expected = func(tile int) int {
+				if owned(tile) {
+					return numGPU
+				}
+				return 1
+			}
+		}
 		vToP := invert(region.PageMap)
 		mask := uint64(1)<<region.Log2PageSize - 1
 
 		p.Tracker.Arm(region)
 		p.Tracker.ClearListeners()
+		p.Tracker.AddLocalListener(p.Engine.OnTileLocal)
+		p.Tracker.AddLocalListener(s.tileReady)
 		p.Tracker.AddListener(p.Engine.OnTileComplete)
 		p.Tracker.IgnoreSrc(p.Engine.ToMem)
 
@@ -83,6 +99,7 @@ func (s *Session) Arm(
 			TilesPerMsg: opt.TilesPerMsg,
 			Mode:        opt.Mode,
 			Collective:  opt.Collective,
+			Placement:   opt.Placement,
 			OnDone:      s.engineDone,
 		})
 	}
@@ -114,6 +131,22 @@ func invert(m map[uint64]uint64) map[uint64]uint64 {
 		out[v] = k
 	}
 	return out
+}
+
+func (s *Session) tileReady(ev tiletracker.TileEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.firstReady < 0 {
+		s.firstReady = ev.Complete
+	}
+}
+
+// FirstReady returns when the first tile of the last collective was
+// complete in L2 on any GPU.
+func (s *Session) FirstReady() sim.VTimeInSec {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.firstReady
 }
 
 func (s *Session) engineDone(_ int, now sim.VTimeInSec) {

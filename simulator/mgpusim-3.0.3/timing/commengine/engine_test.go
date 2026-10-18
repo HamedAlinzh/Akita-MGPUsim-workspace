@@ -106,7 +106,7 @@ func (r *rig) run(
 			e, tile := e, tile
 			at := completeAt(tile)
 			r.engine.Schedule(sim.NewEventBase(at, callback(func() {
-				e.OnTileComplete(tiletracker.TileEvent{Tile: tile, Complete: at})
+				e.OnTileLocal(tiletracker.TileEvent{Tile: tile, Complete: at})
 			})))
 		}
 	}

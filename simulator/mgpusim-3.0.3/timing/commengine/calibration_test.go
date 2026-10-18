@@ -55,7 +55,7 @@ func calibrate(
 		for tile := 0; tile < tiles; tile++ {
 			e, ev := p.Engine, tiletracker.TileEvent{Tile: tile, Complete: now}
 			d.Engine.Schedule(sim.NewEventBase(now, handler(func() {
-				e.OnTileComplete(ev)
+				e.OnTileLocal(ev)
 			})))
 		}
 	}
@@ -71,7 +71,7 @@ func (h handler) Handle(sim.Event) error { h(); return nil }
 
 // The three representative points' knobs (results/step0_ratio/points.csv).
 var calibrationPoints = []struct {
-	name                         string
+	name                          string
 	bwGBps, latencyNS, overheadNS float64
 }{
 	{"f~0.8", 0.1807, 1904, 9163},

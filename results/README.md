@@ -53,6 +53,17 @@ Layout: one subfolder per experiment.
   verifies and message/byte counts equal the expected values. `timing/` (from
   `scripts/step2_timing.sh`): mccl ring all-reduce at f≈0.5 and ring reduce-scatter at
   f≈0.25. `calibration.csv` from `TestCalibration` in `timing/commengine`.
+- `step3_tiles/`: Step 3 (`scripts/step3_sweep.sh main|variants`, summary
+  `summary.txt` from `scripts/step3_summary.py`). `calib/`: 1-GPU GEMM times at tileSize
+  4/8/16 and the `-valu-cycles-scale` fit for tileSize 4. `runs/`: near-memory placement
+  (all-reduce tile/bulk, reduce-scatter), tileSize 4 x N = 1/2/4 under the native and
+  matrix-core curves (owner tile, bulk N=1/4, mccl ring, near-memory N=1), tileSize 8 owner
+  tile reruns with first-ready logging, flatter/steeper curve variants at N=2, and 4-GPU
+  mccl ring / engine bulk. Mapping: sim tileSize 4 = real 128x128, 8 = 256x256; link
+  knobs held at the f≈0.5 point. The T3/CAIS comparison is in
+  `reports/fused-gemm-comm-design.md` ("Reduction placements and T3"). Caveat: the
+  matrix-core curve is extrapolated from MI355X data (HipKittens), and tileSize 4 has 8
+  sim waves vs 3.37 real, so its readiness is finer than reality.
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

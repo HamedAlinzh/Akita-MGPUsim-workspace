@@ -218,11 +218,68 @@ Differences from the proposal above:
 - **Modes**: `tile` (send as groups finish) and `bulk` (same engine, after the whole GEMM);
   `-reduce-scatter` stops after the owner's sum.
 
+## Reduction placements and T3 (Step 3)
+
+**What T3 does** (Pati et al., ASPLOS 2024, arXiv 2401.16677, §4). A small Tracker *at the
+memory controller* follows the producer GEMM's output per wavefront (start address plus
+an access counter), counting local, remote and DMA updates; when a region's count reaches
+its threshold (output size × updates expected per element, 2 for a ring reduce-scatter
+step) the last write triggers a DMA command pre-programmed by the driver (§4.2). Reduction
+happens *near memory*: the GEMM output is marked uncached so every store reaches DRAM, and
+stores tagged as updates become op-and-store commands executed by ALUs near the HBM banks,
+so local and remote contributions accumulate in place in any order (§4.3). The first ring
+stage is written remotely by the GEMM itself, later stages by DMA (§4.4). A
+memory-controller arbitration policy favours the compute stream and throttles
+communication by DRAM queue occupancy (§4.5). The DMA engine itself is not modelled
+(§5.1.1).
+
+**Our two placements** (`-placement`):
+- `owner`: the owner's engine reads its own copy from L2, adds every peer's partial in the
+  engine (1 cycle per 64-byte line per partial) and writes the sum back.
+- `near-memory`: T3-style. Non-owners send partials; the owner's engine writes them into C
+  as update stores (`tiletracker.Update`); the owner's tiles expect p writes per byte, and
+  every store into them (the GEMM's and the updates) is an add. The tracker reports the
+  tile once all p contributions are acknowledged, and only then does the owner's engine read
+  it, to send it back (all-reduce) or stop (reduce-scatter).
+
+**What we copy from T3:** triggering from the producer's own stores with no kernel change;
+counting expected writes per element (local plus updates) to know when a region is
+reduced; transfers pre-programmed by the host before the launch, using no CU; op-and-store
+reduction at the owner's memory side, in any order with the GEMM's stores, so the engine
+never reads the owner's copy in order to reduce it.
+
+**What differs:**
+- *Where tracking and the add happen.* Our L2 is write-back and C stays in it, so DRAM does
+  not see the stores in time; we track at the L2 top ports and apply the add at the L2
+  input (the tracker rewrites each store's data to the running sum, with the timing of a
+  plain L2 write). T3 makes C uncached and adds in HBM near-bank ALUs; neither its DRAM
+  read-modify-write cost nor its arbitration policy is modelled here.
+- *Granularity:* per output tile (work-group) rather than per wavefront.
+- *Data flow:* every partial goes straight to the tile's owner over a direct link
+  (reduce-scatter + all-gather by ownership), not T3's ring stages with the first stage
+  written remotely by the GEMM.
+- *DMA cost:* we model the engine (per-message overhead, link bandwidth and latency); T3
+  assumes pre-queued DMA commands with negligible trigger cost.
+
+**CAIS** (Zhang et al., "Towards Compute-Aware In-Switch Computing for LLMs
+Tensor-Parallelism on Multi-GPU Systems", HPCA 2026, arXiv 2605.05628) reduces in the
+switch, extending NVLink SHARP-style in-switch computing with compute-aware operations.
+Its merging-aware thread-block coordination aligns when thread blocks issue their
+requests so the switch can merge them; that is the closest relative of our
+`-tiles-per-msg`, which merges finished tiles into one message at the sender. CAIS needs an
+NVLink-style switch that can compute; our target, like MI300X's fully connected Infinity
+Fabric, has none, so in-switch reduction is outside this study. CAIS reports 1.38× over an
+NVLS baseline and 1.61× over T3.
+
 ## Sources
 
 - T3: S. Pati, S. Aga, M. Islam, N. Jayasena, M. D. Sinclair, "T3: Transparent Tracking
   & Triggering for Fine-grained Overlap of Compute & Collectives," ASPLOS 2024.
   <https://arxiv.org/abs/2401.16677>
+- CAIS: C. Zhang et al., "Towards Compute-Aware In-Switch Computing for LLMs
+  Tensor-Parallelism on Multi-GPU Systems," HPCA 2026. <https://arxiv.org/abs/2605.05628>
+- HipKittens (tile-size data for the matrix-core curve): arXiv 2511.08083, Table 2.
+  <https://arxiv.org/html/2511.08083v1>
 - Removal of code object v2 from LLVM ("[AMDGPU] Remove Code Object V2", PR #65715,
   September 2023, LLVM 17 series).
   <https://repo.hca.bsc.es/gitlab/rferrer/llvm-epi/-/commit/fe2f67e4ba62ce9f0c3a9adcff592a77606e5228>

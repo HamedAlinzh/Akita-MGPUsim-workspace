@@ -41,9 +41,10 @@ type shaderArray struct {
 }
 
 type shaderArrayBuilder struct {
-	gpuID uint64
-	name  string
-	numCU int
+	valuCyclesScale float64
+	gpuID           uint64
+	name            string
+	numCU           int
 
 	engine            sim.Engine
 	freq              sim.Freq
@@ -60,6 +61,7 @@ type shaderArrayBuilder struct {
 
 func makeShaderArrayBuilder() shaderArrayBuilder {
 	b := shaderArrayBuilder{
+		valuCyclesScale:   1,
 		gpuID:             0,
 		name:              "SA",
 		numCU:             4,
@@ -83,6 +85,11 @@ func (b shaderArrayBuilder) withFreq(f sim.Freq) shaderArrayBuilder {
 
 func (b shaderArrayBuilder) withGPUID(id uint64) shaderArrayBuilder {
 	b.gpuID = id
+	return b
+}
+
+func (b shaderArrayBuilder) withVALUCyclesScale(s float64) shaderArrayBuilder {
+	b.valuCyclesScale = s
 	return b
 }
 
@@ -282,7 +289,8 @@ func (b *shaderArrayBuilder) buildCUs(sa *shaderArray) {
 	cuBuilder := cu.MakeBuilder().
 		WithEngine(b.engine).
 		WithFreq(b.freq).
-		WithLog2CachelineSize(b.log2CacheLineSize)
+		WithLog2CachelineSize(b.log2CacheLineSize).
+		WithVALUCyclesScale(b.valuCyclesScale)
 
 	for i := 0; i < b.numCU; i++ {
 		cuName := fmt.Sprintf("%s.CU[%d]", b.name, i)

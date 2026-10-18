@@ -49,6 +49,21 @@ const (
 	ModeBulk
 )
 
+// Placement selects where the reduction happens.
+type Placement int
+
+const (
+	// OwnerEngine: the owner's engine reads its own copy from L2, adds the
+	// partials in the engine, and writes the sum back.
+	OwnerEngine Placement = iota
+	// NearMemory: T3-style. Partials are written into the owner's C as
+	// update stores, which the memory side adds in place (op-and-store),
+	// in any order with the owner's own GEMM stores; the tile tracker
+	// counts both and reports the tile reduced. The owner's engine only
+	// reads the reduced tile to send it back (all-reduce).
+	NearMemory
+)
+
 // Collective selects what the engines compute.
 type Collective int
 
@@ -89,6 +104,7 @@ type Config struct {
 	TilesPerMsg int
 	Mode        Mode
 	Collective  Collective
+	Placement   Placement
 
 	// OnDone is called, inside the simulation, when this engine has
 	// finished all its work.
@@ -133,6 +149,7 @@ type segment struct {
 
 type memJob struct {
 	write       bool
+	update      bool
 	segs        []segment
 	data        []byte
 	next        int
@@ -170,6 +187,8 @@ type Engine struct {
 	own       map[int][]byte
 	partials  map[int]map[int][]byte
 	reduced   map[int]bool
+	nearDone  []int  // near memory: tiles reported reduced, per group
+	gathered  []bool // near memory: reduced group read for the all-gather
 
 	memJobs  []*memJob
 	inflight map[string]*memJob
@@ -230,6 +249,8 @@ func (e *Engine) Arm(cfg Config) {
 	e.own = map[int][]byte{}
 	e.partials = map[int]map[int][]byte{}
 	e.reduced = map[int]bool{}
+	e.nearDone = make([]int, e.numGroups)
+	e.gathered = make([]bool, e.numGroups)
 	e.memJobs = nil
 	e.inflight = map[string]*memJob{}
 	e.offsets = map[string]int{}
@@ -251,8 +272,9 @@ func (e *Engine) Arm(cfg Config) {
 	}
 }
 
-// OnTileComplete is the tile tracker listener.
-func (e *Engine) OnTileComplete(ev tiletracker.TileEvent) {
+// OnTileLocal is the tile tracker's listener for a tile whose local GEMM
+// output is complete in L2.
+func (e *Engine) OnTileLocal(ev tiletracker.TileEvent) {
 	if !e.armed {
 		return
 	}
@@ -270,11 +292,59 @@ func (e *Engine) OnTileComplete(ev tiletracker.TileEvent) {
 		if e.localAll == e.numTiles {
 			for g := 0; g < e.numGroups; g++ {
 				e.release(g)
+				e.tryGather(ev.Complete, g)
 			}
 		}
 	}
 
 	e.TickLater(ev.Complete)
+}
+
+// OnTileComplete is the tile tracker's listener for a tile that has all its
+// expected writes. With near-memory reduction that is an owned tile with
+// every peer's update added; otherwise it is the same as OnTileLocal and is
+// ignored.
+func (e *Engine) OnTileComplete(ev tiletracker.TileEvent) {
+	if !e.armed || e.cfg.Placement != NearMemory {
+		return
+	}
+
+	g := ev.Tile / e.cfg.TilesPerMsg
+	if Owner(g, e.cfg.NumGPU) != e.cfg.GPU {
+		return
+	}
+	e.nearDone[g]++
+	e.tryGather(ev.Complete, g)
+	e.TickLater(ev.Complete)
+}
+
+// tryGather finishes a near-memory owned group once all its tiles are
+// reduced (and, in bulk mode, the local GEMM is done): a reduce-scatter is
+// then complete; an all-reduce reads the sum and sends it to every peer.
+func (e *Engine) tryGather(now sim.VTimeInSec, g int) {
+	if e.cfg.Placement != NearMemory || Owner(g, e.cfg.NumGPU) != e.cfg.GPU ||
+		e.gathered[g] || e.nearDone[g] < e.cfg.TilesPerMsg ||
+		e.cfg.Mode == ModeBulk && e.localAll < e.numTiles {
+		return
+	}
+	e.gathered[g] = true
+
+	if e.cfg.Collective == ReduceScatter {
+		e.ownedDone++
+		e.checkFinished(now)
+		return
+	}
+
+	e.ownedPending[g] = e.cfg.NumGPU - 1
+	e.enqueueMem(false, g, nil, func(now sim.VTimeInSec, sum []byte) {
+		for p := 0; p < e.cfg.NumGPU; p++ {
+			if p == e.cfg.GPU {
+				continue
+			}
+			e.enqueueSend(now, g, true, p, append([]byte(nil), sum...),
+				func(now sim.VTimeInSec) { e.ownedItemDone(now, g) })
+		}
+	})
 }
 
 func (e *Engine) release(g int) {
@@ -284,6 +354,9 @@ func (e *Engine) release(g int) {
 	e.released[g] = true
 
 	if Owner(g, e.cfg.NumGPU) == e.cfg.GPU {
+		if e.cfg.Placement == NearMemory {
+			return // the memory side reduces; see tryGather
+		}
 		e.enqueueMem(false, g, nil, func(now sim.VTimeInSec, data []byte) {
 			e.own[g] = data
 			e.tryReduce(g)
@@ -414,6 +487,14 @@ func (e *Engine) enqueueMem(
 	e.memJobs = append(e.memJobs, job)
 }
 
+// enqueueUpdate writes a peer's partial into this GPU's C as update stores,
+// which the memory side adds to what the tile holds.
+func (e *Engine) enqueueUpdate(g int, data []byte) {
+	job := &memJob{write: true, update: true, segs: e.groupSegments(g), data: data,
+		onDone: func(sim.VTimeInSec, []byte) {}}
+	e.memJobs = append(e.memJobs, job)
+}
+
 func (e *Engine) enqueueSend(
 	now sim.VTimeInSec, g int, reduced bool, to int, data []byte,
 	onSent func(now sim.VTimeInSec),
@@ -456,6 +537,11 @@ func (e *Engine) recvFabric(now sim.VTimeInSec) bool {
 
 	msg := item.(*TileMsg)
 	msg.record.Received = now
+
+	if !msg.Reduced && e.cfg.Placement == NearMemory {
+		e.enqueueUpdate(msg.Group, msg.Data)
+		return true
+	}
 
 	if !msg.Reduced {
 		if e.partials[msg.Group] == nil {
@@ -512,7 +598,7 @@ func (e *Engine) issueMem(now sim.VTimeInSec) bool {
 
 	var req sim.Msg
 	if job.write {
-		req = mem.WriteReqBuilder{}.
+		w := mem.WriteReqBuilder{}.
 			WithSendTime(now).
 			WithSrc(e.ToMem).
 			WithDst(dst).
@@ -520,6 +606,10 @@ func (e *Engine) issueMem(now sim.VTimeInSec) bool {
 			WithPID(physicalPID).
 			WithData(job.data[seg.offset : seg.offset+seg.size]).
 			Build()
+		if job.update {
+			w.Info = tiletracker.Update{}
+		}
+		req = w
 	} else {
 		req = mem.ReadReqBuilder{}.
 			WithSendTime(now).

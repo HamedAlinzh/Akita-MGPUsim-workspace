@@ -19,6 +19,7 @@ type Builder struct {
 	vgprCount         []int
 	sgprCount         int
 	log2CachelineSize uint64
+	valuCyclesScale   float64
 
 	decoder            emu.Decoder
 	scratchpadPreparer ScratchpadPreparer
@@ -36,6 +37,7 @@ func MakeBuilder() Builder {
 	b.sgprCount = 3200
 	b.vgprCount = []int{16384, 16384, 16384, 16384}
 	b.log2CachelineSize = 6
+	b.valuCyclesScale = 1
 
 	return b
 }
@@ -49,6 +51,13 @@ func (b Builder) WithEngine(engine sim.Engine) Builder {
 // WithFreq sets the frequency.
 func (b Builder) WithFreq(f sim.Freq) Builder {
 	b.freq = f
+	return b
+}
+
+// WithVALUCyclesScale multiplies the cycles of every vector ALU
+// instruction; see SIMDUnit.CyclesScale.
+func (b Builder) WithVALUCyclesScale(s float64) Builder {
+	b.valuCyclesScale = s
 	return b
 }
 
@@ -141,6 +150,7 @@ func (b *Builder) equipSIMDUnits(cu *ComputeUnit) {
 	for i := 0; i < b.simdCount; i++ {
 		name := fmt.Sprintf(b.name+".SIMD%d", i)
 		simdUnit := NewSIMDUnit(cu, name, b.scratchpadPreparer, b.alu)
+		simdUnit.CyclesScale = b.valuCyclesScale
 		if b.enableVisTracing {
 			tracing.CollectTrace(simdUnit, b.visTracer)
 		}
