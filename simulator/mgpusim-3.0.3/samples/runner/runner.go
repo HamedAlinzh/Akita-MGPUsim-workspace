@@ -67,6 +67,7 @@ type Runner struct {
 	WGCap, WGRamp     int
 	CPDispatchers     int
 	OrderedDispatch   bool
+	EnginePeerQueues  bool
 	PeerMesh          bool
 	MsgOverheadNS     float64
 	L2CacheSize       uint64
@@ -142,6 +143,7 @@ func (r *Runner) buildTimingPlatform() {
 		WithWGShaping(r.WGCap, r.WGRamp).
 		WithNumDispatchers(r.CPDispatchers).
 		WithOrderedDispatch(r.OrderedDispatch).
+		WithEnginePeerQueues(r.EnginePeerQueues).
 		WithPeerMesh(r.PeerMesh).
 		WithL2CacheSize(r.L2CacheSize).
 		WithDRAMSize(r.DRAMSize)

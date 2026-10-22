@@ -21,6 +21,11 @@ type HsaCo struct {
 	// as the collectives' kernels.
 	WGCap           int
 	VALUCyclesScale float64
+
+	// UnorderedDispatch exempts the kernel from ordered dispatch (the CP's
+	// OrderedDispatch): it is never held behind earlier kernels and never
+	// holds later ones, like a high-priority communication stream.
+	UnorderedDispatch bool
 }
 
 // HsaCoHeader contains the header information of an HSACO

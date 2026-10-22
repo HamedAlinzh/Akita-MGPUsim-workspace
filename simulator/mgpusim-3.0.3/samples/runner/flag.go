@@ -89,6 +89,9 @@ var orderedDispatchFlag = flag.Bool("ordered-dispatch", false,
 	"Send each GPU's kernel launches in enqueue order, and dispatch work-groups "+
 		"in launch order: a kernel waits until every earlier kernel has "+
 		"dispatched all of its work-groups.")
+var enginePeerQueuesFlag = flag.Bool("engine-peer-queues", false,
+	"Give every communication engine one send queue per peer, each paying "+
+		"-msg-overhead on its own messages (a DMA queue per link).")
 var peerMeshFlag = flag.Bool("peer-mesh", false,
 	"Build the peer fabric as a full mesh with one link per GPU pair "+
 		"(MI300X-like) instead of one shared switch.")
@@ -183,6 +186,7 @@ func (r *Runner) ParseFlag() *Runner {
 	r.WGCap, r.WGRamp = *wgCapFlag, *wgRampFlag
 	r.CPDispatchers = *cpDispatchersFlag
 	r.OrderedDispatch = *orderedDispatchFlag
+	r.EnginePeerQueues = *enginePeerQueuesFlag
 	r.PeerMesh = *peerMeshFlag
 	r.MsgOverheadNS = *msgOverheadFlag
 	r.L2CacheSize = *l2CacheSizeFlag

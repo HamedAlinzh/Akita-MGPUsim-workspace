@@ -44,6 +44,7 @@ type R9NanoPlatformBuilder struct {
 	wgCap, wgRamp                      int
 	numDispatchers                     int
 	orderedDispatch                    bool
+	enginePeerQueues                   bool
 	msgOverheadNS                      float64
 	h2dCycles                          int
 	l2CacheSize                        uint64
@@ -151,6 +152,13 @@ func (b R9NanoPlatformBuilder) WithWGShaping(cap, ramp int) R9NanoPlatformBuilde
 // WithNumDispatchers sets each CP's kernel dispatchers (0 = 8).
 func (b R9NanoPlatformBuilder) WithNumDispatchers(n int) R9NanoPlatformBuilder {
 	b.numDispatchers = n
+	return b
+}
+
+// WithEnginePeerQueues gives every communication engine one send queue per
+// peer (see commengine.Engine.PerPeerQueues).
+func (b R9NanoPlatformBuilder) WithEnginePeerQueues(on bool) R9NanoPlatformBuilder {
+	b.enginePeerQueues = on
 	return b
 }
 
@@ -318,6 +326,11 @@ func (b R9NanoPlatformBuilder) Build() *Platform {
 
 	pcieConnector.EstablishRoute()
 	b.createPeerFabric()
+	for _, gpu := range b.gpus {
+		if gpu.CommEngine != nil {
+			gpu.CommEngine.PerPeerQueues = b.enginePeerQueues
+		}
+	}
 
 	return &Platform{
 		Engine: b.engine,

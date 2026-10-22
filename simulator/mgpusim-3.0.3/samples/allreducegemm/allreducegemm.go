@@ -19,7 +19,7 @@ var kFlag = flag.Uint("k", 128,
 var nFlag = flag.Uint("n", 128, "Number of columns of matrix B and C.")
 var algorithmFlag = flag.String("algorithm", "ring",
 	`Which All-Reduce algorithm combines the per-GPU partial products:
-"ring" or "naive".`)
+"ring", "naive" or "direct" (reduce-scatter + all-gather straight to each peer).`)
 var bandRowsFlag = flag.Uint("band-rows", 0,
 	`Split the M output rows into bands of this many rows, each computed and
 all-reduced separately (0 = one band covering all of M).`)
@@ -58,6 +58,10 @@ var splitKRowsFlag = flag.Uint("splitk-rows", 0,
 var splitKPlanFlag = flag.String("splitk-plan", "",
 	`With -engine-mode: a split factor per row of tiles, top to bottom, e.g.
 "4,4,4,4,1,1,2,2" (replaces -splitk-ways and -splitk-rows).`)
+var swOverlapFlag = flag.String("sw-overlap", "",
+	`Software-overlap baseline (no -engine-mode): rows per band, top to bottom,
+e.g. "32,32,32,32,64,32,32"; every band's GEMM is launched up front (split per
+-splitk-plan) and each band is all-reduced with mccl once it is done.`)
 var splitKPresumFlag = flag.String("splitk-presum", "on",
 	`"on": the engine adds a tile's split-K partials before sending it; "off":
 it sends each partial and the owner adds them.`)
@@ -95,6 +99,15 @@ func main() {
 	benchmark.SplitKWays = *splitKWaysFlag
 	benchmark.SplitKRows = uint32(*splitKRowsFlag)
 	benchmark.Warmup = *warmupFlag
+	if *swOverlapFlag != "" {
+		for _, f := range strings.Split(*swOverlapFlag, ",") {
+			rows, err := strconv.Atoi(strings.TrimSpace(f))
+			if err != nil {
+				log.Panicf("bad -sw-overlap %q: %v", *swOverlapFlag, err)
+			}
+			benchmark.SWBands = append(benchmark.SWBands, uint32(rows))
+		}
+	}
 	if *splitKPlanFlag != "" {
 		for _, f := range strings.Split(*splitKPlanFlag, ",") {
 			s, err := strconv.Atoi(strings.TrimSpace(f))
@@ -117,8 +130,10 @@ func main() {
 		benchmark.Algorithm = allreducegemm.AlgorithmRing
 	case "naive":
 		benchmark.Algorithm = allreducegemm.AlgorithmNaive
+	case "direct":
+		benchmark.Algorithm = allreducegemm.AlgorithmDirect
 	default:
-		log.Panicf(`-algorithm must be "ring" or "naive", got %q`,
+		log.Panicf(`-algorithm must be "ring", "naive" or "direct", got %q`,
 			*algorithmFlag)
 	}
 

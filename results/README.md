@@ -144,6 +144,38 @@ Layout: one subfolder per experiment.
   shape is 5.0 waves at cap 8 (the real layer 3.37). MI300X projection (model only, split
   costs assumed from the simulator): -8.4% at f≈0.8, -22.6% at f≈0.5, -11.6% at f≈0.25, the
   last mostly from a shorter GEMM tail (wave quantization), not overlap.
+- `step7_baselines/`: fair baselines and model validation (batch 1 of 3). `model.txt` from
+  `scripts/step7_model.py`, `sensitivity.txt` from `scripts/step7_sensitivity.py` (model
+  only), `runs/` from `scripts/step7_runs.sh`, `summary.txt` from `scripts/step7_summary.py`.
+  f≈0.5 shape (256x256, K/GPU 256, 4 CUs, tileSize 8, `-gemm-wg-cap 8`); split runs and
+  their s = 1 baselines use `-ordered-dispatch` and enough `-cp-dispatchers`; every run
+  verifies. Runs:
+  1. `sw_s1`, `sw_plan`: software overlap on 2 GPUs (`-sw-overlap`, mccl ring per band,
+     `-collective-threads 16384`), bands 128,128 at s = 1 and bands 128,64,64 with the plan
+     4,4,4,4,1,1,2,2 (the model's best layouts with at least 2 bands).
+  2. `x4_bulk`, `x4_direct`: 4 GPUs on the per-pair mesh, engine bulk vs mccl's new direct
+     reduce-scatter + all-gather after the GEMM (`-algorithm direct`), Step 6 4-GPU knobs.
+  3. `x8_tile_s1`, `x8_tile_plan`, `x8_direct`: 8 GPUs (`-peer-mesh`, K/GPU 256), knobs
+     "f~0.5 8 GPUs" in `points_step6.csv`, engine runs with `-engine-peer-queues`; engine tile
+     s = 1, plan 4,4,4,4,1,1,2,2 (tied best in the 8-GPU search), direct collective.
+  4. `rank_2nd`, `rank_10th`, `rank_median`, `rank_worst`: 2 GPUs, engine tile, plans
+     4,4,4,4,4,4,4,1 / 1,2,4,1,1,1,1,1 / 4,1,4,4,2,1,2,4 / 1,1,1,1,4,4,4,4 (2nd and 10th best
+     distinct predicted windows, median and worst of the 6,561-plan search).
+  5. `defaults_433`: default flags, expect 432.742 us.
+
+  Result (all 12 verify; defaults 432.742 us). Software overlap: s = 1 1,281.9 us, plan
+  1,735.1 us (+35.4%; the engine's plan is -17.0%), so none of the gain survives; mccl after
+  the GEMM without overlap is 1,306.4 us. The model, with F = 277 us per all-reduce call and
+  50% link efficiency fitted to the capped mccl runs, read 10-12% high but predicted the
+  plan's loss (+469 vs +453 us). The collectives' 256 work-groups sit on the GEMM's CUs
+  (about 20 resident per CU) and slow its work-groups about 2x. 4 GPUs: engine bulk 797.0 us,
+  direct software 1,298.9 us (engine tile s = 1 669.0, plan 559.2 from Step 6). 8 GPUs: engine
+  tile s = 1 655.1 us, plan 567.9 us (-13.3%), direct software 1,824.0 us (plan -68.9%);
+  model +10.3% / +5.5%. Rank test over 8 measured plans: Spearman 0.970; the model's chosen
+  plan 4,4,4,4,1,1,2,2 is the best measured (524.9 us; 4,4,4,4,4,4,4,1 526.4 us). MI300X
+  split-cost sensitivity: the f≈0.5 gain stays above 10% when either split keeps its
+  measured cost (the search uses the other), and falls below 10% at 1.63x when both cost
+  the same; no published per-split cost exists for MI300X or MI250.
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

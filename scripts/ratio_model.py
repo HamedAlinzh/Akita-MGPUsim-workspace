@@ -413,6 +413,10 @@ def step6_points(tokens: int):
     for pt in capped_points(tokens):
         if pt.label == "f~0.5":
             out.append(("f~0.5 4 GPUs", pt, 4, capped_measured()))
+            # Step 7: 8 GPUs, the same scaling (2C/p per link). One engine
+            # queue would then spend 1.75 messages' overhead per tile against
+            # 0.25 messages per link, so these runs use -engine-peer-queues.
+            out.append(("f~0.5 8 GPUs", pt, 8, capped_measured()))
     return out
 
 
@@ -633,7 +637,7 @@ def main():
             msg_overhead_ns=round(k["msg_overhead_ns"]),
             latency_cycles=k["latency_cycles"]))
     write_csv(os.path.join(args.outdir, "points_step6.csv"), s6)
-    print(f"\n2c. Step 6 points (-gemm-wg-cap {CAP}, tileSize 8, 4 CUs; f~0.25 GEMM "
+    print(f"\n2c. Step 6-7 points (-gemm-wg-cap {CAP}, tileSize 8, 4 CUs; f~0.25 GEMM "
           "time estimated)")
     print(table(s6, ["point", "collective", "gpus", "real_f", "sim_f", "real_LX", "sim_LX",
                      "real_waves", "sim_waves"]))

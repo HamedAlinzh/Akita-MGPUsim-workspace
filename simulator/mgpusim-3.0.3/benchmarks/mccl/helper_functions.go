@@ -39,6 +39,9 @@ func collectiveThreads() int {
 func init() {
 	coPush = loadKernel(broadcastHsaCoFile, "pushData")
 	coReduce = loadKernel(reduceHsaCoFile, "reduceData")
+	// Collectives run beside ordered GEMM kernels, not behind them.
+	coPush.UnorderedDispatch = true
+	coReduce.UnorderedDispatch = true
 }
 
 func loadKernel(fileContent []byte, kernelName string) *insts.HsaCo {

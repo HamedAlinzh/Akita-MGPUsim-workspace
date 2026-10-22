@@ -169,20 +169,23 @@ func (p *CommandProcessor) tickDispatchers(
 type holdableDispatcher interface {
 	SetHold(hold bool)
 	HasWGsToDispatch() bool
+	Unordered() bool
 }
 
 // holdLaterKernels lets only the earliest kernel with work-groups left
-// dispatch.
+// dispatch, apart from kernels exempt from the order.
 func (p *CommandProcessor) holdLaterKernels() {
 	first := -1
 	for _, d := range p.Dispatchers {
 		h := d.(holdableDispatcher)
-		if h.HasWGsToDispatch() && (first < 0 || p.launchSeq[d] < first) {
+		if h.HasWGsToDispatch() && !h.Unordered() &&
+			(first < 0 || p.launchSeq[d] < first) {
 			first = p.launchSeq[d]
 		}
 	}
 	for _, d := range p.Dispatchers {
-		d.(holdableDispatcher).SetHold(first >= 0 && p.launchSeq[d] > first)
+		h := d.(holdableDispatcher)
+		h.SetHold(first >= 0 && p.launchSeq[d] > first && !h.Unordered())
 	}
 }
 

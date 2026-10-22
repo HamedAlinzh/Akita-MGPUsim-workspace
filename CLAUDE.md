@@ -253,6 +253,17 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   GPU need more dispatchers, or the extra kernel takes a freed low-index dispatcher.
   `-ordered-dispatch` also makes the driver send each GPU's launches in enqueue order
   (`Driver.OrderedLaunch`): queues race otherwise (see the flush gotcha below).
+- **Software baselines** (Step 7). `mccl.AllReduceDirect` (`-algorithm direct`): direct
+  reduce-scatter + all-gather, each GPU sends each peer its share once, pushes to different
+  peers on their own queues; the fair software collective on the per-pair mesh.
+  `mccl.Accumulate` adds buffers on every GPU (split-K pre-sum). `-sw-overlap BANDS`
+  (no engines): every band's GEMM launched up front (split per `-splitk-plan`), and the
+  host all-reduces each band with mccl once it is done. mccl's kernels carry
+  `insts.HsaCo.UnorderedDispatch`, so under `-ordered-dispatch` they run beside the GEMM
+  instead of behind it.
+- **`-engine-peer-queues`** (default off): one engine send queue per peer, each paying
+  `-msg-overhead` (a DMA queue per link). Needed at 8 GPUs, where one queue would spend 1.75
+  messages' overhead per tile against 0.25 messages per link.
 - **`-wg-trace file`** (`samples/allreducegemm`): CSV of every work-group's dispatch and
   completion time; `scripts/step5_wgs.py` summarizes it per kernel.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
@@ -302,6 +313,7 @@ unchanged.
 | 5 | Split-K first and last bands (no new kernel), s = 2 and 4 | Done: `results/step5_splitk/`. f≈0.5: s = 2 578 us (-8.6%), s = 4 612 (-3.2%), no pre-sum 658 (+4.0%); f≈0.8: -4.8% / -6.5% |
 | 5b | Queue-model bounds, cold vs warm first round, per-row split plan | Done: `results/step5b_bounds/`. Even-stream bound 490 us at f≈0.5 (-15% vs 578), 1,591 at f≈0.8 (+0.4%); plan 4,4,4,4,1,1,2,2: 524.9 us at f≈0.5 (-9.2%), f≈0.8 unchanged; slow first round is mostly cold caches |
 | 6 | Paper-ready split plan: warm/cold, f≈0.25, 4 GPUs, MI300X projection | Done: `results/step6_paper/`. Plan vs s = 1: f≈0.25 -3.7%, f≈0.5 -17.0% cold / -15.5% warm, 4 GPUs -16.4%, f≈0.8 -6.4%; model within 0.5-4.3% |
+| 7 | Baselines and model validation (batch 1 of 3) | Done: `results/step7_baselines/`. Software overlap: plan +35% vs s = 1 (gain does not survive). 8 GPUs: plan -13.3% vs s = 1, -68.9% vs direct software. Rank test Spearman 0.97, chosen plan = best measured. MI300X f≈0.5 gain < 10% only at 1.63x split cost |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
 | 6 | MoE all-to-all extension (design note section only) | Not started |
 
@@ -355,6 +367,8 @@ reduce-scatter, `-link-bw 1.632 -link-latency 211 -msg-overhead 1015` (GEMM time
 achieved f 0.246); f≈0.5 on 4 GPUs (`-peer-mesh`, K/GPU 256), `-link-bw 0.3903 -link-latency
 881 -msg-overhead 4243` (the direct reduce-scatter + all-gather puts 2C/p on each link, so
 half the bandwidth keeps the link time; latency and overhead double to keep the ratio).
+f≈0.5 on 8 GPUs, same scaling: `-link-bw 0.1952 -link-latency 1763 -msg-overhead 8485`,
+with `-engine-peer-queues`.
 
 Latency/transfer for a 1-tile message is matched to the real 0.39 (1 µs DMA copy = 172 ns wire
 + 828 ns engine, MI300A data; 128 KiB tile at 51.2 GB/s); the sensitivity range is 0.27–0.78.

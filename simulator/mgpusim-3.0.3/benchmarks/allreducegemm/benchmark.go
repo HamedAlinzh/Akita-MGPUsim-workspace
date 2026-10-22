@@ -47,6 +47,9 @@ const (
 	AlgorithmRing Algorithm = "ring"
 	// AlgorithmNaive uses mccl.AllReduceNaive.
 	AlgorithmNaive Algorithm = "naive"
+	// AlgorithmDirect uses mccl.AllReduceDirect (direct reduce-scatter +
+	// all-gather, for fully connected fabrics).
+	AlgorithmDirect Algorithm = "direct"
 )
 
 // Benchmark is the distributed GEMM benchmark.
@@ -131,6 +134,15 @@ type Benchmark struct {
 	// row as its own K chunks, consecutive unsplit rows as one launch.
 	SplitKPlan []int
 
+	// SWBands, if set, runs the software-overlap baseline instead of the
+	// engines: C is cut into bands of these many rows, every band's GEMM is
+	// launched up front (split per SplitKPlan, which must be uniform within a
+	// band), and the host waits for each band in turn, adds its split-K
+	// partials with mccl.Accumulate and all-reduces it with mccl while later
+	// bands compute. Needs ordered dispatch, under which the collectives'
+	// kernels run beside the GEMM's.
+	SWBands []uint32
+
 	// Warmup runs the GEMM (with Comm) once, untimed and without the
 	// engines, before the measured launch, so it starts with warm caches
 	// and TLBs.
@@ -142,6 +154,7 @@ type Benchmark struct {
 
 	kernel      *insts.HsaCo
 	smallKernel *insts.HsaCo
+	mainQueues  []*driver.CommandQueue
 
 	comms []*mccl.Communicator
 	bufs  [][]driver.Ptr // [scratch set][GPU]
@@ -256,6 +269,7 @@ func (b *Benchmark) exec() {
 			splits[g] = b.newSplitK(aSlice, bSlice, gB)
 		}
 		cmdQs[g] = b.driver.CreateCommandQueue(b.context)
+		b.mainQueues = cmdQs
 		if b.splitKOn() {
 			splits[g].createLaterQueues(b)
 		}
@@ -351,6 +365,11 @@ func (b *Benchmark) exec() {
 		})
 	}
 
+	if len(b.SWBands) > 0 {
+		b.execSWOverlap(partialC, launchBand, splits, timed)
+		return
+	}
+
 	if b.Comm != nil {
 		if b.splitKOn() {
 			b.CommOptions.Partials = make([][]tiletracker.Partial, numGPU)
@@ -390,6 +409,54 @@ func (b *Benchmark) exec() {
 		b.collectReduceScatter(partialC)
 		return
 	}
+	b.collectResult(partialC[0])
+}
+
+// execSWOverlap launches every band's GEMM, then for each band in turn waits
+// for it, sums its split-K partials into C and all-reduces its rows with
+// mccl, on mccl's own queues, while later bands compute. The window runs
+// from the launch to the last all-reduce.
+func (b *Benchmark) execSWOverlap(
+	partialC []driver.Ptr,
+	launch func(rowStart uint32),
+	splits []*splitK,
+	timed func(acc *sim.VTimeInSec, f func()),
+) {
+	var gemmWait, presum, allReduceTime sim.VTimeInSec
+	windowStart := b.driver.Engine.CurrentTime()
+	launch(0)
+	for i, band := range splits[0].bands {
+		timed(&gemmWait, func() {
+			for g, sk := range splits {
+				qs := sk.queues[i]
+				if qs == nil {
+					qs = []*driver.CommandQueue{b.mainQueues[g]}
+				}
+				for _, q := range qs {
+					b.driver.DrainCommandQueue(q)
+				}
+			}
+		})
+		offset := driver.Ptr(uint64(band.row) * uint64(b.N) * 4)
+		for j := 1; j < band.s; j++ {
+			dst := make([]driver.Ptr, len(splits))
+			src := make([]driver.Ptr, len(splits))
+			for g, sk := range splits {
+				dst[g] = partialC[g] + offset
+				src[g] = driver.Ptr(sk.bandPart[i][j-1].VBase)
+			}
+			timed(&presum, func() {
+				mccl.Accumulate(b.driver, b.comms, dst, src, int(band.rows*b.N))
+			})
+		}
+		timed(&allReduceTime, func() {
+			b.allReduce(partialC, band.row, band.rows)
+		})
+	}
+	window := b.driver.Engine.CurrentTime() - windowStart
+
+	log.Printf("allreducegemm phases: window=%.9f gemm_wait=%.9f "+
+		"allreduce=%.9f presum=%.9f", window, gemmWait, allReduceTime, presum)
 	b.collectResult(partialC[0])
 }
 
@@ -517,16 +584,34 @@ type splitBand struct {
 }
 
 func (b *Benchmark) splitKOn() bool {
-	return b.SplitKWays > 1 || len(b.SplitKPlan) > 0
+	return b.SplitKWays > 1 || len(b.SplitKPlan) > 0 || len(b.SWBands) > 0
 }
 
 // splitBands lists the bands in launch order.
 func (b *Benchmark) splitBands() []splitBand {
+	edge := 4 * b.tileSize()
+	if len(b.SWBands) > 0 {
+		var bands []splitBand
+		row := uint32(0)
+		for _, rows := range b.SWBands {
+			s := 1
+			if len(b.SplitKPlan) > 0 {
+				s = b.SplitKPlan[row/edge]
+				for r := row; r < row+rows; r += edge {
+					if b.SplitKPlan[r/edge] != s {
+						log.Panicf("SplitKPlan must be uniform within each SWBands band")
+					}
+				}
+			}
+			bands = append(bands, splitBand{row, rows, s})
+			row += rows
+		}
+		return bands
+	}
 	if len(b.SplitKPlan) == 0 {
 		r, s := b.SplitKRows, b.SplitKWays
 		return []splitBand{{0, r, s}, {r, b.M - 2*r, 1}, {b.M - r, r, s}}
 	}
-	edge := 4 * b.tileSize()
 	var bands []splitBand
 	for i, s := range b.SplitKPlan {
 		row := uint32(i) * edge
@@ -744,7 +829,26 @@ func (b *Benchmark) bandRows() uint32 {
 // kernel's internal loop counts silently truncate and produce wrong
 // results rather than erroring.
 func (b *Benchmark) validateDimensions(numGPU uint32) {
-	if b.splitKOn() {
+	if len(b.SWBands) > 0 {
+		tile := 4 * b.tileSize()
+		total := uint32(0)
+		bad := b.Comm != nil || b.SmallRows > 0 || b.SplitKWays > 1 ||
+			b.BandRows != 0 || b.Overlap || b.ReduceScatter ||
+			len(b.SplitKPlan) > 0 && uint32(len(b.SplitKPlan))*tile != b.M
+		for _, rows := range b.SWBands {
+			bad = bad || rows == 0 || rows%tile != 0
+			total += rows
+		}
+		if bad || total != b.M {
+			log.Panicf("SWBands needs mccl (no engines), bands of multiples of %d rows "+
+				"adding up to M, and at most a per-row SplitKPlan", tile)
+		}
+		for _, s := range b.SplitKPlan {
+			if (b.K/numGPU)%(uint32(s)*tile) != 0 {
+				log.Panicf("K/GPU must be a multiple of %d x every split factor", tile)
+			}
+		}
+	} else if b.splitKOn() {
 		tile := 4 * b.tileSize()
 		bad := b.Comm == nil || b.SmallRows > 0 ||
 			b.CommOptions.Placement != commengine.OwnerEngine
@@ -866,9 +970,12 @@ func (b *Benchmark) allReduce(
 		return
 	}
 
-	if b.Algorithm == AlgorithmNaive {
+	switch b.Algorithm {
+	case AlgorithmNaive:
 		mccl.AllReduceNaive(b.driver, b.comms, data, dataSize, bufs, bufSize)
-	} else {
+	case AlgorithmDirect:
+		mccl.AllReduceDirect(b.driver, b.comms, data, dataSize, bufs, bufSize)
+	default:
 		mccl.AllReduceRing(b.driver, b.comms, data, dataSize, bufs, bufSize)
 	}
 }

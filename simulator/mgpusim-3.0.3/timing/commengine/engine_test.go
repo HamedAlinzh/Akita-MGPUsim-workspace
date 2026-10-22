@@ -298,3 +298,32 @@ func TestSplitKPartials(t *testing.T) {
 		})
 	}
 }
+
+func TestPerPeerQueuesOverlapOverheadAcrossPeers(t *testing.T) {
+	const overhead = 5e-6
+	r := newRig(t, 4, overhead)
+	for _, e := range r.engines {
+		e.PerPeerQueues = true
+	}
+	r.run(t, 1, ModeTile, AllReduce, func(int) sim.VTimeInSec { return 1e-6 })
+	r.expectC(t, func(int, int) bool { return true })
+	for _, e := range r.engines {
+		last := map[int]sim.VTimeInSec{}
+		overlapped := false
+		var prev sim.VTimeInSec = -1
+		for _, rec := range e.Records() {
+			if l, ok := last[rec.To]; ok && rec.Sent-l < overhead*0.999 {
+				t.Errorf("two messages to GPU %d sent %g apart, less than the overhead",
+					rec.To, rec.Sent-l)
+			}
+			last[rec.To] = rec.Sent
+			if prev >= 0 && rec.Sent-prev < overhead*0.999 {
+				overlapped = true
+			}
+			prev = rec.Sent
+		}
+		if !overlapped {
+			t.Errorf("engine %d never overlapped overheads of different peers", e.cfg.GPU)
+		}
+	}
+}

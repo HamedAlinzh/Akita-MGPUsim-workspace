@@ -241,9 +241,11 @@ type Engine struct {
 	offsets  map[string]int
 	reduceQ  []*reduceJob
 
-	sendQ       []*TileMsg
-	sendStarted bool
-	sendReadyAt sim.VTimeInSec
+	// PerPeerQueues gives every destination its own send queue, each
+	// spending the per-message overhead on its own messages (a DMA queue
+	// per peer link); otherwise one queue serializes all of them.
+	PerPeerQueues bool
+	lanes         []*sendLane
 
 	ownedTotal, ownedDone       int
 	nonOwnedTotal, nonOwnedDone int
@@ -338,8 +340,10 @@ func (e *Engine) Arm(cfg Config) {
 	e.inflight = map[string]*memJob{}
 	e.offsets = map[string]int{}
 	e.reduceQ = nil
-	e.sendQ = nil
-	e.sendStarted = false
+	e.lanes = make([]*sendLane, cfg.NumGPU)
+	for i := range e.lanes {
+		e.lanes[i] = &sendLane{}
+	}
 	e.ownedPending = map[int]int{}
 	e.sendsLeft = map[int]int{}
 	e.records = nil
@@ -670,7 +674,19 @@ func (e *Engine) enqueueSend(
 	msg.Src = e.outPort(to)
 	msg.Dst = e.cfg.Peers[to]
 	msg.TrafficBytes = rec.TrafficBytes
-	e.sendQ = append(e.sendQ, msg)
+	lane := e.lanes[0]
+	if e.PerPeerQueues {
+		lane = e.lanes[to]
+	}
+	lane.q = append(lane.q, msg)
+}
+
+// sendLane is a queue of messages waiting for the engine's per-message
+// overhead and the network.
+type sendLane struct {
+	q       []*TileMsg
+	started bool
+	readyAt sim.VTimeInSec
 }
 
 // Tick advances the engine by one cycle.
@@ -823,30 +839,39 @@ func (e *Engine) doReduce(now sim.VTimeInSec) bool {
 	return true
 }
 
-// send hands the head message to the network once the engine has spent the
-// per-message overhead on it. The overhead of the next message starts when
-// the previous one is handed over, so it overlaps that one's transmission.
+// send hands each lane's head message to the network once the engine has
+// spent the per-message overhead on it. The overhead of a lane's next
+// message starts when the previous one is handed over, so it overlaps that
+// one's transmission.
 func (e *Engine) send(now sim.VTimeInSec) bool {
-	if len(e.sendQ) == 0 {
+	madeProgress := false
+	for _, lane := range e.lanes {
+		madeProgress = e.sendFrom(now, lane) || madeProgress
+	}
+	return madeProgress
+}
+
+func (e *Engine) sendFrom(now sim.VTimeInSec, lane *sendLane) bool {
+	if len(lane.q) == 0 {
 		return false
 	}
 
-	if !e.sendStarted {
-		e.sendStarted = true
-		e.sendReadyAt = now + e.msgOverhead
+	if !lane.started {
+		lane.started = true
+		lane.readyAt = now + e.msgOverhead
 	}
-	if now < e.sendReadyAt {
+	if now < lane.readyAt {
 		return true // busy with the message's setup
 	}
 
-	msg := e.sendQ[0]
+	msg := lane.q[0]
 	msg.SendTime = now
 	if err := msg.Src.Send(msg); err != nil {
 		return false
 	}
 
-	e.sendQ = e.sendQ[1:]
-	e.sendStarted = false
+	lane.q = lane.q[1:]
+	lane.started = false
 	msg.record.Sent = now
 	msg.onSent(now)
 	return true

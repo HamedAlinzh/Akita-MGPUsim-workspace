@@ -147,7 +147,8 @@ def knobs():
     k = lambda r: (float(r["link_bw_gbps"]) * 1e9, float(r["link_latency_ns"]),
                    float(r["msg_overhead_ns"]))
     return {"f05": k(rows["f~0.5"]), "f08": k(rows["f~0.8"]),
-            "f025": k(rows["f~0.25 capped"]), "f05_4gpu": k(rows["f~0.5 4 GPUs"])}
+            "f025": k(rows["f~0.25 capped"]), "f05_4gpu": k(rows["f~0.5 4 GPUs"]),
+            "f05_8gpu": k(rows["f~0.5 8 GPUs"])}
 
 
 def calibrate_rounds(run, slots=32):

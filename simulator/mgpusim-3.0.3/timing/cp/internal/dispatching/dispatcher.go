@@ -53,6 +53,13 @@ func (d *DispatcherImpl) SetHold(hold bool) {
 	d.hold = hold
 }
 
+// Unordered tells whether the kernel is exempt from ordered dispatch
+// (insts.HsaCo.UnorderedDispatch).
+func (d *DispatcherImpl) Unordered() bool {
+	return d.dispatching != nil && d.dispatching.HsaCo != nil &&
+		d.dispatching.HsaCo.UnorderedDispatch
+}
+
 // HasWGsToDispatch tells whether the kernel has work-groups not yet
 // dispatched.
 func (d *DispatcherImpl) HasWGsToDispatch() bool {

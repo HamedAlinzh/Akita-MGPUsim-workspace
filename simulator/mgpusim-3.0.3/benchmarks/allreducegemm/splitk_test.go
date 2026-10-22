@@ -80,3 +80,36 @@ func TestSplitK(t *testing.T) {
 	}
 	t.Run("plan=4,1,1,2", func(t *testing.T) { runSplitK(t, 0, false, 4, 1, 1, 2) })
 }
+
+// TestSWOverlap runs the software-overlap baseline on 2 GPUs (128x128, K/GPU
+// 128): s = 1 bands and a split plan, verified against the CPU.
+func TestSWOverlap(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		bands []uint32
+		plan  []int
+	}{
+		{"s=1", []uint32{32, 32, 64}, nil},
+		{"plan=4,1,2,2", []uint32{32, 32, 32, 32}, []int{4, 1, 2, 2}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			platform := runner.MakeR9NanoBuilder().
+				WithNumGPU(2).
+				WithNumCUPerGPU(4).
+				WithNumDispatchers(16).
+				WithOrderedDispatch(true).
+				Build()
+			d := platform.Driver
+			d.Run()
+			defer d.Terminate()
+
+			b := allreducegemm.NewBenchmark(d)
+			b.M, b.K, b.N = 128, 256, 128
+			b.SWBands, b.SplitKPlan = c.bands, c.plan
+			b.SelectGPU([]int{1, 2})
+			b.EnableVerification()
+			b.Run()
+			b.Verify()
+		})
+	}
+}
