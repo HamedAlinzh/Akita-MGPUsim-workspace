@@ -266,6 +266,23 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   messages' overhead per tile against 0.25 messages per link.
 - **`-wg-trace file`** (`samples/allreducegemm`): CSV of every work-group's dispatch and
   completion time; `scripts/step5_wgs.py` summarizes it per kernel.
+- **Device-side signals and the FlashOverlap-style baseline** (Step 9). `timing/signal.Board`
+  is shared by every CP: a launch whose code object has `insts.HsaCo.WaitSignals` is held at
+  the CP (no dispatcher) until those signals are raised, and raises `Signal` (after
+  `SignalDelay` s) when it completes; such launches are exempt from ordered launch.
+  `HsaCo.CommCUs` restricts a kernel to the CP's comm CUs (`CommandProcessor.SetCommCUs`),
+  which other kernels cannot take from the comm kernel's arrival at the CP until it ends.
+  `-sw-flash ROWS,...` (no engines): the trackers count the GEMM's tiles in row groups and
+  raise a group signal; pre-enqueued mccl kernels (`mccl.AllReduceDirectOnSignal`,
+  `AccumulateOnSignal`: pre-sum, direct reduce-scatter, chained reduces, all-gather, one
+  queue per kernel) run on `-sw-comm-cus` CUs; `-sw-signal-cost` ns per signal (+ link
+  latency to a peer). `tiletracker.Region.IgnoreLate` ignores stores into completed tiles;
+  `commengine.TrackRegion` builds a region; `Driver.WaitIdle` lets the host wait for the
+  engine to go idle. `-warmup-skip-b`: the warm-up reads a dummy B (A and C warm).
+- **L1 invalidate fix** (Step 9, Akita `mem/cache/writearound`): the vector L1's invalidate
+  marks its blocks invalid in place; replacing the directory (`Reset`) under an in-flight
+  fill let another miss take the block, and hits returned other lines' data.
+  `allreducegemm` seeds its own `rand` source.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -281,6 +298,12 @@ Gotchas that cost time before:
   copies flush fall behind, so launches on different queues can reach the CP out of order.
 - Don't edit a shell script while a service is running it: bash reads it as it goes, and the
   edit broke the Step 5 batch mid-run.
+- The vector L1 is Akita's `writearound` cache, not `writethrough` (that one is the scalar
+  and instruction L1). L1s and L2s see physical addresses.
+- `rand.Seed` is a no-op since Go 1.24; use `rand.New(rand.NewSource(seed))`.
+- mgpusim's host goroutine runs beside the engine: after `WaitFor` or a drain returns, the
+  engine may still be running, so the next host enqueue lands at a racy simulated time.
+  Call `Driver.WaitIdle` first when that matters.
 
 ## Running experiments
 
@@ -315,7 +338,7 @@ unchanged.
 | 6 | Paper-ready split plan: warm/cold, f≈0.25, 4 GPUs, MI300X projection | Done, `fab2f71`: `results/step6_paper/`. Plan vs s = 1: f≈0.25 -3.7%, f≈0.5 -17.0% cold / -15.5% warm, 4 GPUs -16.4%, f≈0.8 -6.4%; model within 0.5-4.3% |
 | 7 | Baselines and model validation (batch 1 of 3) | Done, `dee876c`: `results/step7_baselines/`. Software overlap: plan +35% vs s = 1 (gain does not survive). 8 GPUs: plan -13.3% vs s = 1, -68.9% vs direct software. Rank test Spearman 0.97, chosen plan = best measured. MI300X f≈0.5 gain < 10% only at 1.63x split cost |
 | 8 | Realistic software baseline and edge cases (batch 2 of 3) | Done, `aaa48da` + `706d7b1`: `results/step8_edges/`. Event-driven model (mean error 1.5%); splits help software overlap only below ~20 us per call (published RCCL minimum ~20 us); f sweep -14% / -13% / -3% at f 0.35 / 0.65 / 0.9; shapes, K 128/512, 9 rows, reduce-scatter all keep the gain (-6.5% to -20.2%), model within -3.2% to +1.5% |
-| 9 | Other layer patterns (batch 3 of 3) | Not started |
+| 9 | Fair software baseline, gain split, caches, all-gather design (batch 3 of 3) | Done: `results/step9_baselines/`. FlashOverlap-style (1 comm CU) vs engine, f≈0.5 2 GPUs: s = 1 979 / plan 1009 vs 632 / 525 us; 8 GPUs 3758 / 3919 vs 655 / 575. Plan gain is all overlap (GEMM 1-4% longer). A+C-warm plan -17.1%. L1 invalidate bug fixed. All-gather: design note, worth building |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Mostly covered by the capped baseline (`results/step4b_capped/`: mccl ring, engine bulk, engine tile) and Steps 5-8; near-memory (b) not rerun at the cap |
 | 10 | MoE all-to-all extension (design note section only) | Not started |
 
@@ -391,7 +414,10 @@ Modelling tools (Python, `scripts/`; run from the repo root, no simulations):
 - `step6_model.py`: work-group list schedule (`Gemm`: 32 slots, per-split work-group times
   from the Step 5 traces, optional cold first round) and per-row plan search helpers;
   `knobs()` reads every point's link knobs from `results/step0_ratio/`.
-- `step8_model.py`: the current model. `Comm` is event-driven (an owner's sum waits for every
+- `step9_model.py`: FlashOverlap-style path (GEMM on the CUs comm leaves, per-group direct
+  all-reduce at the calibrated link efficiency, contention when several groups overlap) and the
+  Step 9 run list; `step9_allgather.py`: all-gather-before-GEMM queue model.
+- `step8_model.py`: the engine model. `Comm` is event-driven (an owner's sum waits for every
   partial; per-engine or per-peer lanes; wire latency calibrated as 1.07 x (overhead +
   latency) - overhead); `PSGemm` time-shares each CU among up to 8 resident work-groups, for
   partial last rounds. `step8_validate.py` checks it on 22 engine runs (-4.9% to +1.5%).
@@ -417,6 +443,17 @@ Findings from Steps 5-8:
 - Model rank order matches measurement (Spearman 0.97); its chosen plan was the best measured.
 - MI300X projection (model only): f≈0.5 gain stays above 10% unless both split costs exceed
   about 1.63x; no published per-split cost exists for MI300X or MI250.
+
+Findings from Step 9:
+- A FlashOverlap-style software path (signals from the tracker, comm kernels pre-launched on a
+  reserved CU) loses to the engine: the engine plan's window is 48% shorter at 2 GPUs and 85% at
+  8. CU-driven stores move at most 0.50 of the link here (0.11 at 8 GPUs with one comm CU), and
+  the held CU slows the GEMM by about 40%.
+  Split plans make it worse (pre-sums queue on the comm CU), so the plan is an engine result.
+- The plan's GEMM is never faster (+1% to +4% at 2 waves); the whole gain is overlap.
+- With A and C warm and B cold (streamed weights) the plan still gains 17.1%.
+- `step9_model.py` covers the software path (calibrated on cal_one / cal_rows); it misses the
+  8-GPU CU limit (-74%) and the plan's pre-sum contention (about -10%).
 
 Earlier findings (details in `reports/gemm-allreduce-overlap.html`):
 - Banding a GEMM to overlap All-Reduce never beat one launch: extra launches, low-occupancy

@@ -39,6 +39,9 @@ type CUResourceImpl struct {
 	rampStart int
 	completed int
 
+	pool  *CUResourcePoolImpl
+	index int
+
 	nextSIMD    int
 	reservedWGs map[*kernels.WorkGroup][]WfLocation
 }
@@ -56,6 +59,9 @@ func (r *CUResourceImpl) ReserveResourceForWG(wg *kernels.WorkGroup) (
 	ok bool,
 ) {
 	if limit := r.wgLimit(wg); limit > 0 && len(r.reservedWGs) >= limit {
+		return nil, false
+	}
+	if r.pool != nil && !r.pool.allows(r.index, wg) {
 		return nil, false
 	}
 

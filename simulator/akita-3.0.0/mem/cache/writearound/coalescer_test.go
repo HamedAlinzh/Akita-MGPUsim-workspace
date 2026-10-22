@@ -4,6 +4,7 @@ import (
 	gomock "github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	akitacache "github.com/sarchlab/akita/v3/mem/cache"
 	"github.com/sarchlab/akita/v3/mem/mem"
 	"github.com/sarchlab/akita/v3/mem/vm"
 	"github.com/sarchlab/akita/v3/sim"
@@ -41,6 +42,24 @@ var _ = Describe("Coalescer", func() {
 		topPort.EXPECT().Peek().Return(nil)
 		madeProgress := c.Tick(10)
 		Expect(madeProgress).To(BeFalse())
+	})
+
+	It("should invalidate blocks in place, keeping in-flight ones locked", func() {
+		dir := akitacache.NewDirectory(1, 2, 64, akitacache.NewLRUVictimFinder())
+		block := dir.GetSets()[0].Blocks[0]
+		block.IsValid, block.IsLocked, block.Tag = true, true, 0x40
+		cache.directory = dir
+		inv := mem.GL0InvalidateReqBuilder{}.WithSendTime(10).Build()
+		topPort.EXPECT().Peek().Return(inv)
+		topPort.EXPECT().Send(gomock.Any()).Return(nil)
+		topPort.EXPECT().Retrieve(gomock.Any())
+
+		madeProgress := c.Tick(10)
+
+		Expect(madeProgress).To(BeTrue())
+		Expect(dir.GetSets()[0].Blocks[0]).To(BeIdenticalTo(block))
+		Expect(block.IsValid).To(BeFalse())
+		Expect(block.IsLocked).To(BeTrue())
 	})
 
 	Context("read", func() {

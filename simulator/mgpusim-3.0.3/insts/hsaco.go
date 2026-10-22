@@ -26,6 +26,19 @@ type HsaCo struct {
 	// OrderedDispatch): it is never held behind earlier kernels and never
 	// holds later ones, like a high-priority communication stream.
 	UnorderedDispatch bool
+
+	// Device-side signalling (FlashOverlap-style software overlap; needs a
+	// CP with a signal board). The CP holds the launch until every signal
+	// in WaitSignals is raised; when the kernel completes it raises Signal
+	// SignalDelay seconds later. Such a launch is exempt from the driver's
+	// ordered launch, since it may wait on kernels enqueued after it.
+	// CommCUs restricts the kernel to the CUs reserved for communication
+	// (the CP's comm CUs), which other kernels cannot take from when it
+	// reaches the CP (held or not) until it completes.
+	WaitSignals []string
+	Signal      string
+	SignalDelay float64
+	CommCUs     bool
 }
 
 // HsaCoHeader contains the header information of an HSACO

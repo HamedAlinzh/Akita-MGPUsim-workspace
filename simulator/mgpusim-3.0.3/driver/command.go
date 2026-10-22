@@ -87,7 +87,7 @@ type LaunchKernelCommand struct {
 	DPacket    Ptr
 	Reqs       []sim.Msg
 
-	seq int // enqueue order on its GPU, for Driver.OrderedLaunch
+	seq int // enqueue order on its GPU, for Driver.OrderedLaunch (-1: exempt)
 }
 
 // GetID returns the ID of the command

@@ -57,7 +57,16 @@ func (c *coalescer) processGL0InvalidateReq(
 	req *mem.GL0InvalidateReq,
 	now sim.VTimeInSec,
 ) bool {
-	c.cache.directory.Reset()
+	// Invalidate in place. Reset replaced every block, so a block with a
+	// fill or a hit still in flight could be taken by a new miss and the old
+	// fill landed under the new tag. A block stays locked until its fill or
+	// write is in storage and keeps its ReadCount while read, so no location
+	// is reused while in use.
+	for _, set := range c.cache.directory.GetSets() {
+		for _, block := range set.Blocks {
+			block.IsValid = false
+		}
+	}
 
 	rsp := mem.GL0InvalidateRspBuilder{}.
 		WithPID(req.GetPID()).

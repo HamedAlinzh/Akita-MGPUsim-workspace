@@ -14,6 +14,7 @@ import (
 	"github.com/sarchlab/mgpusim/v3/timing/cp/internal/resource"
 	"github.com/sarchlab/mgpusim/v3/timing/pagemigrationcontroller"
 	"github.com/sarchlab/mgpusim/v3/timing/rdma"
+	"github.com/sarchlab/mgpusim/v3/timing/signal"
 )
 
 // CommandProcessor is an Akita component that is responsible for receiving
@@ -57,6 +58,13 @@ type CommandProcessor struct {
 	OrderedDispatch bool
 	launchSeq       map[dispatching.Dispatcher]int
 	numLaunched     int
+
+	// Signals, if set, lets kernels wait for named signals and raise them
+	// (insts.HsaCo.WaitSignals and Signal): the CP holds such a launch,
+	// without taking a dispatcher, until its signals are raised.
+	Signals *signal.Board
+	held    []*protocol.LaunchKernelReq
+	cuPool  *resource.CUResourcePoolImpl
 
 	ToDriver                   sim.Port
 	toDriverSender             sim.BufferedSender
@@ -115,6 +123,7 @@ func (p *CommandProcessor) Tick(now sim.VTimeInSec) bool {
 
 	madeProgress = p.sendMsgsOut(now) || madeProgress
 	madeProgress = p.tickDispatchers(now) || madeProgress
+	madeProgress = p.releaseHeld(now) || madeProgress
 	madeProgress = p.processReqFromDriver(now) || madeProgress
 	madeProgress = p.processRspFromInternal(now) || madeProgress
 	madeProgress = p.processL1InvalidateRsps(now) || madeProgress
@@ -344,26 +353,26 @@ func (p *CommandProcessor) processLaunchKernelReq(
 	now sim.VTimeInSec,
 	req *protocol.LaunchKernelReq,
 ) bool {
-	d := p.findAvailableDispatcher()
+	if p.Signals != nil && req.HsaCo != nil && len(req.HsaCo.WaitSignals) > 0 {
+		// A held communication kernel already holds its CUs, like a
+		// FlashOverlap waiting kernel spinning on them.
+		if req.HsaCo.CommCUs && p.cuPool != nil {
+			p.cuPool.CommStart()
+		}
+		p.held = append(p.held, req)
+		p.Signals.Held(now, req.HsaCo.Signal)
+		p.ToDriver.Retrieve(now)
+		tracing.TraceReqReceive(req, p)
+		return true
+	}
 
-	if d == nil {
+	if p.acquireFor != nil && p.acquireFor != req {
 		return false
 	}
 
-	if p.AcquireOnLaunch && len(p.L1VInvalidatePorts) > 0 {
-		madeProgress := p.acquire(now, req)
-		if p.acquireAcks < len(p.L1VInvalidatePorts) {
-			return madeProgress
-		}
-		p.acquireFor = nil
+	if started, progress := p.startKernel(now, req); !started {
+		return progress
 	}
-
-	d.StartDispatching(req)
-	if p.launchSeq == nil {
-		p.launchSeq = map[dispatching.Dispatcher]int{}
-	}
-	p.numLaunched++
-	p.launchSeq[d] = p.numLaunched
 	p.ToDriver.Retrieve(now)
 
 	tracing.TraceReqReceive(req, p)
@@ -371,6 +380,86 @@ func (p *CommandProcessor) processLaunchKernelReq(
 	// 	tracing.MsgIDAtReceiver(req, p))
 
 	return true
+}
+
+// releaseHeld starts held kernels whose signals are all raised, in the
+// order they arrived.
+func (p *CommandProcessor) releaseHeld(now sim.VTimeInSec) (madeProgress bool) {
+	for i := 0; i < len(p.held); i++ {
+		req := p.held[i]
+		if p.acquireFor != nil && p.acquireFor != req ||
+			!p.Signals.AllRaised(req.HsaCo.WaitSignals) {
+			continue
+		}
+		if started, progress := p.startKernel(now, req); !started {
+			return madeProgress || progress
+		}
+		p.Signals.Released(now, req.HsaCo.Signal)
+		p.held = append(p.held[:i], p.held[i+1:]...)
+		i--
+		madeProgress = true
+	}
+	return madeProgress
+}
+
+// startKernel gives the kernel a dispatcher, after the L1 acquire if on.
+// If it has to try again later, started is false and progress tells whether
+// the acquire made progress.
+func (p *CommandProcessor) startKernel(
+	now sim.VTimeInSec,
+	req *protocol.LaunchKernelReq,
+) (started, progress bool) {
+	d := p.findAvailableDispatcher()
+
+	if d == nil {
+		return false, false
+	}
+
+	if p.AcquireOnLaunch && len(p.L1VInvalidatePorts) > 0 {
+		progress = p.acquire(now, req)
+		if p.acquireAcks < len(p.L1VInvalidatePorts) {
+			return false, progress
+		}
+		p.acquireFor = nil
+	}
+
+	d.StartDispatching(req)
+	if co := req.HsaCo; co != nil && co.CommCUs && p.cuPool != nil &&
+		len(co.WaitSignals) == 0 {
+		p.cuPool.CommStart()
+	}
+	if p.launchSeq == nil {
+		p.launchSeq = map[dispatching.Dispatcher]int{}
+	}
+	p.numLaunched++
+	p.launchSeq[d] = p.numLaunched
+
+	return true, true
+}
+
+// kernelDone ends a communication kernel's CU reservation and raises the
+// kernel's signal.
+func (p *CommandProcessor) kernelDone(
+	now sim.VTimeInSec,
+	req *protocol.LaunchKernelReq,
+) {
+	co := req.HsaCo
+	if co == nil {
+		return
+	}
+	if co.CommCUs && p.cuPool != nil {
+		p.cuPool.CommEnd()
+	}
+	if p.Signals != nil && co.Signal != "" {
+		p.Signals.Done(now, co.Signal)
+		p.Signals.Raise(now, co.Signal, co.SignalDelay)
+	}
+}
+
+// SetCommCUs reserves the last n CUs for communication kernels; see
+// resource.CUResourcePoolImpl.CommCUs.
+func (p *CommandProcessor) SetCommCUs(n int) {
+	p.cuPool.CommCUs = n
 }
 
 // acquire invalidates every L1 vector cache on behalf of req. It sends one

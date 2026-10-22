@@ -10,6 +10,8 @@ import (
 	"github.com/sarchlab/mgpusim/v3/benchmarks/mccl"
 	"github.com/sarchlab/mgpusim/v3/samples/runner"
 	"github.com/sarchlab/mgpusim/v3/timing/commengine"
+	"github.com/sarchlab/mgpusim/v3/timing/signal"
+	"github.com/sarchlab/mgpusim/v3/timing/tiletracker"
 	"github.com/tebeka/atexit"
 )
 
@@ -62,6 +64,20 @@ var swOverlapFlag = flag.String("sw-overlap", "",
 	`Software-overlap baseline (no -engine-mode): rows per band, top to bottom,
 e.g. "32,32,32,32,64,32,32"; every band's GEMM is launched up front (split per
 -splitk-plan) and each band is all-reduced with mccl once it is done.`)
+var swFlashFlag = flag.String("sw-flash", "",
+	`FlashOverlap-style software baseline (no -engine-mode): rows per tile
+group, top to bottom, e.g. "64,64,128". The GEMM runs as with the engines
+(split per -splitk-plan); when a group's tiles are all in L2 on a GPU, a
+signal releases communication kernels enqueued before the GEMM and held at
+the CP, which all-reduce the group with mccl's direct algorithm on the
+-sw-comm-cus CUs.`)
+var swCommCUsFlag = flag.Int("sw-comm-cus", 1,
+	"With -sw-flash: CUs per GPU reserved for the communication kernels; "+
+		"the GEMM cannot take them from the kernels' launch until they finish.")
+var swSignalCostFlag = flag.Float64("sw-signal-cost", 0,
+	"With -sw-flash: ns from a tile group (or a communication kernel) "+
+		"completing to the kernels waiting for it being released; a signal to "+
+		"another GPU also takes -link-latency.")
 var splitKPresumFlag = flag.String("splitk-presum", "on",
 	`"on": the engine adds a tile's split-K partials before sending it; "off":
 it sends each partial and the owner adds them.`)
@@ -70,7 +86,11 @@ var wgTraceFlag = flag.String("wg-trace", "",
 var memTimelineFlag = flag.String("mem-timeline", "",
 	"Write cache hits and misses, TLB misses and DRAM bytes per 10 us to this CSV.")
 var warmupFlag = flag.Bool("warmup", false,
-	"With -engine-mode: run the GEMM once, untimed, before the measured launch.")
+	"With -engine-mode or -sw-flash: run the GEMM once, untimed, before the "+
+		"measured launch.")
+var warmupSkipBFlag = flag.Bool("warmup-skip-b", false,
+	"With -warmup: the warm-up run reads a dummy buffer in place of B, so A "+
+		"and C start warm and B cold.")
 var tileSizeFlag = flag.Uint("tile-size", 0,
 	"Work-group edge T; each work-group computes a 4T x 4T tile (0 = 8).")
 var perBandScratchFlag = flag.Bool("per-band-scratch", false,
@@ -99,6 +119,17 @@ func main() {
 	benchmark.SplitKWays = *splitKWaysFlag
 	benchmark.SplitKRows = uint32(*splitKRowsFlag)
 	benchmark.Warmup = *warmupFlag
+	benchmark.WarmupSkipB = *warmupSkipBFlag
+	if *swFlashFlag != "" {
+		for _, f := range strings.Split(*swFlashFlag, ",") {
+			rows, err := strconv.Atoi(strings.TrimSpace(f))
+			if err != nil {
+				log.Panicf("bad -sw-flash %q: %v", *swFlashFlag, err)
+			}
+			benchmark.FlashGroups = append(benchmark.FlashGroups, uint32(rows))
+		}
+		benchmark.Flash = flashSetup(runner)
+	}
 	if *swOverlapFlag != "" {
 		for _, f := range strings.Split(*swOverlapFlag, ",") {
 			rows, err := strconv.Atoi(strings.TrimSpace(f))
@@ -190,4 +221,22 @@ func fusedComm(r *runner.Runner) (*commengine.Session, commengine.Options) {
 			Tracker: gpu.TileTracker, Engine: gpu.CommEngine})
 	}
 	return commengine.NewSession(r.Driver(), parts), opt
+}
+
+// flashSetup gives every CP one signal board and reserves -sw-comm-cus CUs
+// for communication, for the FlashOverlap-style baseline.
+func flashSetup(r *runner.Runner) *allreducegemm.FlashSetup {
+	board := signal.NewBoard(r.Platform().Engine)
+	var trackers []*tiletracker.Tracker
+	for _, id := range r.GPUIDs {
+		gpu := r.Platform().GPUs[id-1]
+		gpu.CommandProcessor.Signals = board
+		gpu.CommandProcessor.SetCommCUs(*swCommCUsFlag)
+		board.AddWaker(gpu.CommandProcessor)
+		trackers = append(trackers, gpu.TileTracker)
+	}
+	local := *swSignalCostFlag * 1e-9
+	peer := local + max(0, r.LinkLatencyNS)*1e-9
+	return &allreducegemm.FlashSetup{Trackers: trackers, Signals: board,
+		Delays: mccl.SignalDelays{Local: local, Peer: peer}}
 }

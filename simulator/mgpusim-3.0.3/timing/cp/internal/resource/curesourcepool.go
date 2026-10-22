@@ -47,6 +47,30 @@ type CUResourcePoolImpl struct {
 	// CUResourceImpl. 0 turns each off.
 	WGCap       int
 	WGRampStart int
+
+	// CommCUs reserves the last CommCUs CUs for kernels marked
+	// insts.HsaCo.CommCUs, which run only there; other kernels cannot take
+	// them while any such kernel is at the CP (0 = no reservation).
+	CommCUs    int
+	activeComm int
+}
+
+// CommStart counts one more communication kernel running.
+func (p *CUResourcePoolImpl) CommStart() { p.activeComm++ }
+
+// CommEnd ends one communication kernel.
+func (p *CUResourcePoolImpl) CommEnd() { p.activeComm-- }
+
+// allows tells whether a work-group may be placed on CU i.
+func (p *CUResourcePoolImpl) allows(i int, wg *kernels.WorkGroup) bool {
+	if p.CommCUs <= 0 {
+		return true
+	}
+	commCU := i >= len(p.cus)-p.CommCUs
+	if wg.CodeObject != nil && wg.CodeObject.CommCUs {
+		return commCU
+	}
+	return !commCU || p.activeComm == 0
 }
 
 // StartKernel restarts the dispatch ramp of every CU for a new kernel.
@@ -85,6 +109,8 @@ func (p *CUResourcePoolImpl) RegisterCU(cu DispatchableCU) {
 		countDynamicLDS: p.CountDynamicLDS,
 		wgCap:           p.WGCap,
 		rampStart:       p.WGRampStart,
+		pool:            p,
+		index:           len(p.cus),
 	}
 
 	r.port = cu.DispatchingPort()

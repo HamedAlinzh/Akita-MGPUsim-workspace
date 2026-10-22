@@ -217,6 +217,61 @@ Layout: one subfolder per experiment.
   + event messages) errors -3.2% to +1.5%. Steady split cost per work-group, normalized to
   8 resident: 1.03-1.09 (s = 2) and 1.13-1.25 (s = 4) at K/GPU 256, 1.18 / 1.42 at 128 (a
   32-wide K chunk is mostly fixed cost), 1.12 / 1.14 at 512.
+- `step9_baselines/`: fair software baseline, gain split, realistic caches (batch 3 of 3).
+  `runs/` from `scripts/step9_runs.sh` (run list `runs.txt`, written by
+  `scripts/step9_model.py`); f≈0.5 shape (256x256, K/GPU 256, 4 CUs, tileSize 8, cap 8,
+  `-lds-occupancy`), `-ordered-dispatch -cp-dispatchers 40`, every run verifies, 8-GPU runs
+  use `-peer-mesh`. FlashOverlap-style runs (`-sw-flash`, no engines) use `-sw-comm-cus 1`,
+  `-sw-signal-cost 0`, `-collective-threads 1024`; their group partitions are the model's.
+  1. `cal_one`, `cal_rows`: calibration of the comm kernels on 1 CU at the f≈0.5 link knobs
+     (s = 1; one 256-row group, i.e. no overlap, and eight 32-row groups). They fix the
+     model's per-kernel costs and link efficiency before the runs below are predicted.
+     `cal_one_cus2`: `cal_one` with `-sw-comm-cus 2`, to see whether the comm kernels' link
+     efficiency depends on their CU count. A first pair of calibration runs, with the GEMM
+     shut out of the comm CU only while a comm kernel ran, is in `runs_dynamic/` (a GEMM
+     work-group left on that CU straggled to 687 us); every run here takes the comm CU from
+     the comm kernels' launch, before the GEMM's.
+  2. `fo_f05_s1`, `fo_f05_plan`, `fo_f08_s1`, `fo_f08_plan` (2 GPUs, f≈0.5 / f≈0.8 knobs),
+     `fo_x8_s1`, `fo_x8_plan` (8 GPUs, f≈0.5): FlashOverlap-style, s = 1 and the plan the
+     model picks with its partition.
+  3. `gemm_plan`, `gemm_plan_warm`: GEMM alone with plan 4,4,4,4,1,1,2,2 (`-engine-mode
+     bulk`, so the engines start after the GEMM), cold and `-warmup`, for the gain split.
+  4. `wab_s1`, `wab_plan`: f≈0.5, 2 GPUs, engine tile, s = 1 and plan 4,4,4,4,1,1,2,2 with
+     `-warmup -warmup-skip-b` (A and C warm, B cold); `warm_s1`, `warm_plan`: the same with
+     `-warmup` (all warm), so cold (`eng_f05_*`), A+C warm and warm come from one simulator.
+  5. `eng_f05_s1`, `eng_f05_plan`, `eng_f08_s1`, `eng_f08_plan`, `eng_x8_s1`, `eng_x8_plan`:
+     the engine (tile mode) s = 1 and plan 4,4,4,4,1,1,2,2 runs of Steps 4b/5b/7, rerun with
+     the L1 fix below so the four-way comparison uses one simulator.
+  6. `defaults_433`: default flags, expect 432.742 us.
+  7. `fo_x8_s1_cus2`: `fo_x8_s1` with `-sw-comm-cus 2`, added after the 8-GPU runs reached
+     only 0.11 of the link with one comm CU, to test whether that CU is the limit.
+
+  Result (all 24 verify; defaults 432.742 us; `summary.txt`, `scripts/step9_summary.py`).
+  Four-way, window in us (FlashOverlap-style s = 1 / + plan / engine s = 1 / + plan):
+  f≈0.5, 2 GPUs 979.4 / 1009.0 / 632.4 / 525.1; f≈0.8, 2 GPUs 2721.9 / 3060.8 / 1695.4 /
+  1587.6; f≈0.5, 8 GPUs 3758.2 / 3918.7 / 655.1 / 574.6 (2 comm CUs: 2388.6). The plan helps
+  the engine (-17.0%, -6.4%, -12.3%) and hurts the software path (+3.0%, +12.5%, +4.3%):
+  its pre-sum kernels queue on the one comm CU. The CU-driven path moves 0.50 of the link
+  alone (1 or 2 comm CUs), 0.42-0.48 with several groups in flight at 2 GPUs, and 0.11
+  (0.18 with 2 CUs) at 8 GPUs, where one CU cannot drive 7 links; FlashOverlap reports
+  13% for one 192 KB tile message. Holding a comm CU costs the GEMM 360 -> 490-515 us.
+  Gain split (engine): the plan's GEMM is 1-4% longer at every Step 9 point (no Stream-K
+  tail gain at 2 waves), so the overlap part is -7% to -19% of the s = 1 window, more than
+  the whole gain. Caches, f≈0.5 engine s = 1 / plan: cold 632.4 / 525.1 (-17.0%), A and C
+  warm 623.0 / 516.6 (-17.1%), warm 610.8 / 516.2 (-15.5%). Model: engine runs -5.1% to
+  +1.5%; FlashOverlap-style 2-GPU runs -10.7% to +2.8% after calibration (cal_one,
+  cal_rows), 8 GPUs -74% (it has no CU limit). All-gather before the GEMM: design note
+  `reports/allgather-before-gemm.md` (model: 8 GPUs, split plan -27% vs per-row overlap).
+
+  L1 fix (found here): the write-around L1's invalidate (the CP's acquire at every kernel
+  launch, `-l1-acquire`) reset the tag directory while fills were in flight, so a later
+  hit could return another line's data. FlashOverlap-style `fo_f05_s1` failed to verify
+  this way (a GEMM work-group read two wrong lines of A, 487 us, GPU 2 CU 2); the L1 now
+  invalidates its blocks in place, so a block with a fill or a read in flight keeps its
+  storage until done. Also `rand.Seed` does nothing
+  since Go 1.24, so A and B differed every run (timing does not depend on them); the
+  benchmark now uses its own seeded source. `runs_prefix/` has this step's runs from
+  before both fixes (same names).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
@@ -265,7 +320,22 @@ flags where it would change old results.
    copies flush fall behind, so launches on different queues reach the CP out of order.
    Fix: `-ordered-dispatch` also makes the driver send each GPU's launches in enqueue order
    (`f23ed3f`); the flush itself is unchanged, since fixing it would change every old result.
-9. Smaller ones: Akita's link bandwidth is whole bytes per cycle at the network clock, so
+9. **An L1 invalidate during in-flight fills corrupts the L1.** The vector L1 is Akita's
+   write-around cache; its `GL0InvalidateReq` handler replaced the whole tag directory at
+   once. If a fill was in flight, another miss could take that block and the old fill
+   landed under the new tag, so a later hit returned another line's data. Only kernels
+   that start while other kernels' loads are in flight on the same GPU trigger it (the CP
+   invalidates every L1 at each launch, `-l1-acquire`); the FlashOverlap-style path did, and
+   a GEMM work-group read two wrong lines of A. Fix: invalidate the blocks in place, so a
+   block with a fill or a read in flight keeps its storage until done (Step 9; making the
+   invalidate wait for in-flight transactions instead stalled every CU at every comm
+   launch, +8% on `cal_rows`). Every earlier run verified; the effect on their timing is
+   in Step 9 `summary.txt`, section 5.
+10. **`rand.Seed` does nothing since Go 1.24,** so `allreducegemm`'s A and B came from an
+   unseeded source and differed every run. Timing does not depend on the values, so no
+   window changed, but verification data were not reproducible. Fix: a seeded source of
+   its own (Step 9).
+11. Smaller ones: Akita's link bandwidth is whole bytes per cycle at the network clock, so
    low or fractional bandwidths need a lower network frequency; component name indices must
    be integers; MGPUSim v3 loads only code object v2; `total_time` varies by about 4 ns
    between identical runs (the measured windows are exact).

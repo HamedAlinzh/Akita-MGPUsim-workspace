@@ -303,6 +303,21 @@ func (d *Driver) PhysicalAddress(ctx *Context, vAddr uint64) (uint64, bool) {
 	return page.PAddr + (vAddr - page.VAddr), true
 }
 
+// WaitIdle blocks the host until the engine has run out of events, so that
+// what the host enqueues next starts at a simulated time that does not
+// depend on how far the engine got meanwhile.
+func (d *Driver) WaitIdle() {
+	for {
+		d.engineRunningMutex.Lock()
+		running := d.engineRunning
+		d.engineRunningMutex.Unlock()
+		if !running {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // WaitFor blocks the host until done is closed by a component inside the
 // simulation, such as a communication engine that finished. It panics if the
 // simulation runs out of events first, which would otherwise hang forever.

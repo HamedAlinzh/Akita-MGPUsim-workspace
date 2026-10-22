@@ -10,6 +10,7 @@ package allreducegemm
 import (
 	// embed the compiled GEMM kernel
 	_ "embed"
+	"fmt"
 	"log"
 	"math"
 	"math/rand"
@@ -21,6 +22,7 @@ import (
 	"github.com/sarchlab/mgpusim/v3/insts"
 	"github.com/sarchlab/mgpusim/v3/kernels"
 	"github.com/sarchlab/mgpusim/v3/timing/commengine"
+	"github.com/sarchlab/mgpusim/v3/timing/signal"
 	"github.com/sarchlab/mgpusim/v3/timing/tiletracker"
 )
 
@@ -143,10 +145,25 @@ type Benchmark struct {
 	// kernels run beside the GEMM's.
 	SWBands []uint32
 
-	// Warmup runs the GEMM (with Comm) once, untimed and without the
-	// engines, before the measured launch, so it starts with warm caches
-	// and TLBs.
-	Warmup bool
+	// FlashGroups, with Flash, runs the FlashOverlap-style software baseline
+	// (arXiv 2504.19519) instead of the engines: the GEMM is launched as
+	// with the engines (split per SplitKPlan), and the trackers count its
+	// tiles in groups of these many rows, top to bottom. When a group's
+	// last tile is in L2 on a GPU, its group signal is raised; the
+	// communication kernels, enqueued before the GEMM and held by the CPs
+	// until their signals, add the group's split-K partials and all-reduce
+	// its rows with mccl's direct algorithm, on the CUs reserved for
+	// communication. Needs ordered dispatch.
+	FlashGroups []uint32
+	Flash       *FlashSetup
+
+	// Warmup runs the GEMM (with Comm or Flash) once, untimed and without
+	// the engines, before the measured launch, so it starts with warm
+	// caches and TLBs. WarmupSkipB reads a dummy buffer in place of B in
+	// that run, so A and C are warm and B is not, as for a layer whose
+	// weights stream from memory.
+	Warmup      bool
+	WarmupSkipB bool
 
 	// OnPartialC, if set, is called for each GPU once its partial C is
 	// allocated and A and B are copied, before any GEMM launch.
@@ -162,6 +179,15 @@ type Benchmark struct {
 	matrixA, matrixB, matrixC *matrix
 
 	verify bool
+}
+
+// FlashSetup is what the FlashOverlap-style baseline needs from the
+// platform: every GPU's tile tracker (in SelectGPU order), the CPs' shared
+// signal board, and the signal delays (Local also for the group signals).
+type FlashSetup struct {
+	Trackers []*tiletracker.Tracker
+	Signals  *signal.Board
+	Delays   mccl.SignalDelays
 }
 
 // NewBenchmark creates a new distributed GEMM benchmark using Ring
@@ -216,16 +242,18 @@ func (b *Benchmark) loadKernel() {
 }
 
 func (b *Benchmark) initMem() {
-	rand.Seed(0)
+	// A source of its own: since Go 1.24 rand.Seed does nothing, so the
+	// global source gave different matrices every run.
+	r := rand.New(rand.NewSource(0))
 
 	b.matrixA = newMatrix(b.K, b.M)
 	for i := range b.matrixA.Data {
-		b.matrixA.Data[i] = rand.Float32()
+		b.matrixA.Data[i] = r.Float32()
 	}
 
 	b.matrixB = newMatrix(b.N, b.K)
 	for i := range b.matrixB.Data {
-		b.matrixB.Data[i] = rand.Float32()
+		b.matrixB.Data[i] = r.Float32()
 	}
 }
 
@@ -370,6 +398,22 @@ func (b *Benchmark) exec() {
 		return
 	}
 
+	warm := func() {
+		if !b.Warmup {
+			return
+		}
+		if b.WarmupSkipB {
+			defer b.dummyB(gBs, splits, kSlice)()
+		}
+		launchBand(0)
+		drain()
+	}
+	if len(b.FlashGroups) > 0 {
+		warm()
+		b.execFlash(partialC, launchBand, drain, splits, timed)
+		return
+	}
+
 	if b.Comm != nil {
 		if b.splitKOn() {
 			b.CommOptions.Partials = make([][]tiletracker.Partial, numGPU)
@@ -377,7 +421,7 @@ func (b *Benchmark) exec() {
 				b.CommOptions.Partials[g] = sk.partials
 			}
 		}
-		b.execFused(partialC, launchBand, drain, timed)
+		b.execFused(partialC, launchBand, drain, warm, timed)
 		return
 	}
 
@@ -460,6 +504,157 @@ func (b *Benchmark) execSWOverlap(
 	b.collectResult(partialC[0])
 }
 
+// execFlash runs the FlashOverlap-style baseline (FlashGroups): it arms the
+// trackers to raise each GPU's group signals, enqueues every group's
+// communication kernels (held by the CPs until their signals), waits until
+// all of them are held, then launches the GEMM. The window runs from the
+// launch to the last communication kernel completing.
+func (b *Benchmark) execFlash(
+	partialC []driver.Ptr,
+	launch func(rowStart uint32),
+	drain func(),
+	splits []*splitK,
+	timed func(acc *sim.VTimeInSec, f func()),
+) {
+	fs := b.Flash
+	p := len(b.gpus)
+	edge := 4 * b.tileSize()
+	tilesX := b.N / edge
+	groupOf := make([]int, b.M/edge) // by tile row
+	var groupRow []uint32
+	row := uint32(0)
+	for g, rows := range b.FlashGroups {
+		for r := row; r < row+rows; r += edge {
+			groupOf[r/edge] = g
+		}
+		groupRow = append(groupRow, row)
+		row += rows
+	}
+	grp := func(gpu, g int) string { return fmt.Sprintf("gpu%d/group%d", gpu, g) }
+
+	for i, tr := range fs.Trackers {
+		region := commengine.TrackRegion(b.driver, b.context, uint64(partialC[i]),
+			b.M, b.N, edge, splits[i].partials)
+		region.IgnoreLate = true
+		tr.Arm(region)
+		tr.ClearListeners()
+		gpu, count := i, make([]int, len(b.FlashGroups))
+		tr.AddLocalListener(func(ev tiletracker.TileEvent) {
+			g := groupOf[ev.Row]
+			count[g]++
+			if count[g] == int(b.FlashGroups[g]/edge*tilesX) {
+				fs.Signals.Raise(ev.Complete, grp(gpu, g), fs.Delays.Local)
+			}
+		})
+	}
+
+	// Every group's kernels: split-K pre-sums, then the direct all-reduce.
+	numKernels := len(b.FlashGroups) * 3 * p * (p - 1)
+	for _, band := range splits[0].bands {
+		numKernels += p * (band.s - 1)
+	}
+	allHeld := fs.Signals.ExpectHeld(numKernels)
+	var queues []*driver.CommandQueue
+	for g, rows := range b.FlashGroups {
+		ready := make([]string, p)
+		data := make([]driver.Ptr, p)
+		bufs := make([]driver.Ptr, p)
+		size := int(rows * b.N)
+		for i, gpuID := range b.gpus {
+			ready[i] = grp(i, g)
+			for k, band := range splits[i].bands {
+				if band.s == 1 || groupOf[band.row/edge] != g {
+					continue
+				}
+				for j := 1; j < band.s; j++ {
+					name := fmt.Sprintf("%s/acc%d.%d", grp(i, g), band.row/edge, j)
+					queues = append(queues, mccl.AccumulateOnSignal(b.driver,
+						b.comms[i], partialC[i]+driver.Ptr(uint64(band.row)*uint64(b.N)*4),
+						driver.Ptr(splits[i].bandPart[k][j-1].VBase), int(band.rows*b.N),
+						[]string{ready[i]}, name, fs.Delays.Local))
+					ready[i] = name
+				}
+			}
+			data[i] = partialC[i] + driver.Ptr(uint64(groupRow[g])*uint64(b.N)*4)
+			b.driver.SelectGPU(b.context, gpuID)
+			bufs[i] = b.driver.AllocateMemory(b.context,
+				uint64((p-1)*((size+p-1)/p)*4))
+		}
+		qs, _ := mccl.AllReduceDirectOnSignal(b.driver, b.comms, data, size, bufs,
+			ready, fmt.Sprintf("group%d", g), fs.Delays)
+		queues = append(queues, qs...)
+	}
+	b.driver.WaitFor(allHeld)
+	b.driver.WaitIdle()
+
+	var gemmWait sim.VTimeInSec
+	windowStart := b.driver.Engine.CurrentTime()
+	launch(0)
+	timed(&gemmWait, drain)
+	for _, q := range queues {
+		b.driver.DrainCommandQueue(q)
+	}
+	hostEnd := b.driver.Engine.CurrentTime() - windowStart
+	for _, tr := range fs.Trackers {
+		tr.Disarm()
+	}
+
+	end := windowStart
+	recs := fs.Signals.Records()
+	for _, r := range recs {
+		end = max(end, r.Done)
+	}
+	firstSignal := sim.VTimeInSec(-1)
+	for g := range b.FlashGroups {
+		for i := range b.gpus {
+			t, _ := fs.Signals.RaisedAt(grp(i, g))
+			if firstSignal < 0 || t < firstSignal {
+				firstSignal = t
+			}
+			log.Printf("allreducegemm flash group: group=%d gpu=%d rows=%d raised=%.9f",
+				g, i, b.FlashGroups[g], t-windowStart)
+		}
+	}
+	log.Printf("allreducegemm flash phases: window=%.9f gemm_wait=%.9f "+
+		"host_end=%.9f first_signal=%.9f kernels=%d", end-windowStart, gemmWait,
+		hostEnd, firstSignal-windowStart, len(recs))
+	for _, r := range recs {
+		log.Printf("allreducegemm flash kernel: name=%s released=%.9f done=%.9f",
+			r.Name, r.Released-windowStart, r.Done-windowStart)
+	}
+	b.driver.WaitIdle()
+	b.collectResult(partialC[0])
+}
+
+// dummyB points the GEMM's B (and the split chunks' B) at a fresh buffer of
+// the same size on every GPU, and returns a function that restores them.
+func (b *Benchmark) dummyB(gBs []driver.Ptr, splits []*splitK, kSlice uint32) func() {
+	orig := append([]driver.Ptr(nil), gBs...)
+	saved := make([]map[int][]driver.Ptr, len(splits))
+	for g, gpuID := range b.gpus {
+		b.driver.SelectGPU(b.context, gpuID)
+		dummy := b.driver.AllocateMemory(b.context, uint64(kSlice*b.N*4))
+		gBs[g] = dummy
+		if sk := splits[g]; sk != nil {
+			saved[g] = sk.bChunks
+			sk.bChunks = map[int][]driver.Ptr{}
+			for s, chunks := range saved[g] {
+				for _, c := range chunks {
+					sk.bChunks[s] = append(sk.bChunks[s], dummy+(c-orig[g]))
+				}
+			}
+		}
+	}
+	return func() {
+		copy(gBs, orig)
+		for g, sk := range splits {
+			if sk != nil {
+				sk.bChunks = saved[g]
+			}
+		}
+	}
+}
+
 // collectReduceScatter assembles C from the GPU that holds each element
 // after mccl.ReduceScatterRing, scaling the mean to the sum.
 func (b *Benchmark) collectReduceScatter(partialC []driver.Ptr) {
@@ -485,7 +680,7 @@ func (b *Benchmark) collectReduceScatter(partialC []driver.Ptr) {
 func (b *Benchmark) execFused(
 	partialC []driver.Ptr,
 	launch func(rowStart uint32),
-	drain func(),
+	drain, warm func(),
 	timed func(acc *sim.VTimeInSec, f func()),
 ) {
 	if b.BandRows != 0 && b.BandRows != b.M || b.Overlap {
@@ -493,10 +688,7 @@ func (b *Benchmark) execFused(
 			"do not set BandRows or Overlap")
 	}
 
-	if b.Warmup {
-		launch(0)
-		drain()
-	}
+	warm()
 
 	tileEdge := 4 * b.tileSize()
 	if b.SmallRows > 0 {
@@ -584,7 +776,8 @@ type splitBand struct {
 }
 
 func (b *Benchmark) splitKOn() bool {
-	return b.SplitKWays > 1 || len(b.SplitKPlan) > 0 || len(b.SWBands) > 0
+	return b.SplitKWays > 1 || len(b.SplitKPlan) > 0 || len(b.SWBands) > 0 ||
+		len(b.FlashGroups) > 0
 }
 
 // splitBands lists the bands in launch order.
@@ -607,6 +800,9 @@ func (b *Benchmark) splitBands() []splitBand {
 			row += rows
 		}
 		return bands
+	}
+	if len(b.SplitKPlan) == 0 && len(b.FlashGroups) > 0 {
+		return []splitBand{{0, b.M, 1}}
 	}
 	if len(b.SplitKPlan) == 0 {
 		r, s := b.SplitKRows, b.SplitKWays
@@ -847,6 +1043,24 @@ func (b *Benchmark) validateDimensions(numGPU uint32) {
 			if (b.K/numGPU)%(uint32(s)*tile) != 0 {
 				log.Panicf("K/GPU must be a multiple of %d x every split factor", tile)
 			}
+		}
+	} else if len(b.FlashGroups) > 0 {
+		tile := 4 * b.tileSize()
+		total := uint32(0)
+		bad := b.Flash == nil || len(b.Flash.Trackers) != int(numGPU) ||
+			b.Comm != nil || b.SmallRows > 0 || b.SplitKWays > 1 ||
+			b.BandRows != 0 || b.Overlap || b.ReduceScatter ||
+			len(b.SplitKPlan) > 0 && uint32(len(b.SplitKPlan))*tile != b.M
+		for _, rows := range b.FlashGroups {
+			bad = bad || rows == 0 || rows%tile != 0
+			total += rows
+		}
+		for _, s := range b.SplitKPlan {
+			bad = bad || s < 1 || (b.K/numGPU)%(uint32(s)*tile) != 0
+		}
+		if bad || total != b.M {
+			log.Panicf("FlashGroups needs Flash (no engines), groups of multiples "+
+				"of %d rows adding up to M, and at most a per-row SplitKPlan", tile)
 		}
 	} else if b.splitKOn() {
 		tile := 4 * b.tileSize()

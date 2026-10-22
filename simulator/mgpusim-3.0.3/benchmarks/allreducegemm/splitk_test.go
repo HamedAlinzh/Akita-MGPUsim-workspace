@@ -5,8 +5,10 @@ import (
 	"testing"
 
 	"github.com/sarchlab/mgpusim/v3/benchmarks/allreducegemm"
+	"github.com/sarchlab/mgpusim/v3/benchmarks/mccl"
 	"github.com/sarchlab/mgpusim/v3/samples/runner"
 	"github.com/sarchlab/mgpusim/v3/timing/commengine"
+	"github.com/sarchlab/mgpusim/v3/timing/signal"
 )
 
 // runSplitK all-reduces a 128x128 C (K/GPU 128) on 2 GPUs with the engines,
@@ -110,6 +112,66 @@ func TestSWOverlap(t *testing.T) {
 			b.EnableVerification()
 			b.Run()
 			b.Verify()
+		})
+	}
+}
+
+// TestFlash runs the FlashOverlap-style baseline (128x128, K/GPU 128, one
+// comm CU of 4): s = 1 and a split plan on 2 GPUs, and 4 GPUs, verified
+// against the CPU, with every communication kernel released and done.
+func TestFlash(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		gpus   int
+		groups []uint32
+		plan   []int
+	}{
+		{"s=1", 2, []uint32{32, 32, 64}, nil},
+		{"plan=4,1,2,2", 2, []uint32{32, 96}, []int{4, 1, 2, 2}},
+		{"4gpus", 4, []uint32{64, 64}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			platform := runner.MakeR9NanoBuilder().
+				WithNumGPU(c.gpus).
+				WithNumCUPerGPU(4).
+				WithNumDispatchers(16).
+				WithOrderedDispatch(true).
+				Build()
+			d := platform.Driver
+			d.Run()
+			defer d.Terminate()
+
+			board := signal.NewBoard(platform.Engine)
+			fs := &allreducegemm.FlashSetup{Signals: board,
+				Delays: mccl.SignalDelays{Local: 1e-6, Peer: 2e-6}}
+			var ids []int
+			for i, gpu := range platform.GPUs {
+				gpu.CommandProcessor.Signals = board
+				gpu.CommandProcessor.SetCommCUs(1)
+				board.AddWaker(gpu.CommandProcessor)
+				fs.Trackers = append(fs.Trackers, gpu.TileTracker)
+				ids = append(ids, i+1)
+			}
+
+			b := allreducegemm.NewBenchmark(d)
+			b.M, b.K, b.N = 128, uint32(128*c.gpus), 128
+			b.FlashGroups, b.SplitKPlan, b.Flash = c.groups, c.plan, fs
+			b.SelectGPU(ids)
+			b.EnableVerification()
+			b.Run()
+			b.Verify()
+
+			for _, tr := range fs.Trackers {
+				if errs := tr.Errors(); len(errs) > 0 {
+					t.Fatalf("tracker errors: %v", errs[:min(3, len(errs))])
+				}
+			}
+			for _, r := range board.Records() {
+				if r.Done <= r.Released || r.Released < r.Held {
+					t.Errorf("%s: held %g released %g done %g", r.Name, r.Held,
+						r.Released, r.Done)
+				}
+			}
 		})
 	}
 }

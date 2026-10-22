@@ -45,6 +45,15 @@ type DispatcherImpl struct {
 	progressBar *monitoring.ProgressBar
 
 	hold bool
+
+	onDone func(now sim.VTimeInSec, req *protocol.LaunchKernelReq)
+}
+
+// SetOnKernelDone sets a function called when a kernel completes.
+func (d *DispatcherImpl) SetOnKernelDone(
+	f func(now sim.VTimeInSec, req *protocol.LaunchKernelReq),
+) {
+	d.onDone = f
 }
 
 // SetHold stops (or resumes) dispatching work-groups; a held dispatcher
@@ -207,6 +216,9 @@ func (d *DispatcherImpl) completeKernel(now sim.VTimeInSec) (
 	err := d.respondingPort.Send(rsp)
 	if err == nil {
 		d.dispatching = nil
+		if d.onDone != nil {
+			d.onDone(now, req)
+		}
 
 		if d.monitor != nil {
 			d.monitor.CompleteProgressBar(d.progressBar)

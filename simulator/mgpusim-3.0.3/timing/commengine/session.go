@@ -151,12 +151,22 @@ func (s *Session) region(
 	ctx *driver.Context, c uint64, rows, cols, tileEdge uint32,
 	partials []tiletracker.Partial,
 ) tiletracker.Region {
-	log2 := s.driver.Log2PageSize
+	return TrackRegion(s.driver, ctx, c, rows, cols, tileEdge, partials)
+}
+
+// TrackRegion returns the tracker region of a row-major C of rows x cols
+// floats at c, cut into tileEdge x tileEdge tiles, with its split-K partial
+// buffers and the physical-to-virtual map of every page they touch.
+func TrackRegion(
+	d *driver.Driver, ctx *driver.Context, c uint64, rows, cols, tileEdge uint32,
+	partials []tiletracker.Partial,
+) tiletracker.Region {
+	log2 := d.Log2PageSize
 	pageSize := uint64(1) << log2
 	pages := map[uint64]uint64{}
 	mapPages := func(base uint64, rows uint32) {
 		for v := base &^ (pageSize - 1); v < base+uint64(rows)*uint64(cols)*4; v += pageSize {
-			p, ok := s.driver.PhysicalAddress(ctx, v)
+			p, ok := d.PhysicalAddress(ctx, v)
 			if !ok {
 				panic("commengine: C is not mapped")
 			}

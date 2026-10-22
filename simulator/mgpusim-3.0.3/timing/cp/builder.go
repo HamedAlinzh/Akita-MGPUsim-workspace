@@ -171,6 +171,7 @@ func (b *Builder) buildDispatchers(cp *CommandProcessor) {
 	cuResourcePool.CountDynamicLDS = b.ldsOccupancy
 	cuResourcePool.WGCap = b.wgCap
 	cuResourcePool.WGRampStart = b.wgRamp
+	cp.cuPool = cuResourcePool
 	builder := dispatching.MakeBuilder().
 		WithCP(cp).
 		WithAlg("round-robin").
@@ -181,6 +182,11 @@ func (b *Builder) buildDispatchers(cp *CommandProcessor) {
 
 	for i := 0; i < b.numDispatchers; i++ {
 		disp := builder.Build(fmt.Sprintf("%s.Dispatcher%d", cp.Name(), i))
+		if d, ok := disp.(interface {
+			SetOnKernelDone(func(sim.VTimeInSec, *protocol.LaunchKernelReq))
+		}); ok {
+			d.SetOnKernelDone(cp.kernelDone)
+		}
 
 		if b.visTracer != nil {
 			tracing.CollectTrace(disp, b.visTracer)

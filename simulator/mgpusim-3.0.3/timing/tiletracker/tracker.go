@@ -56,6 +56,11 @@ type Region struct {
 	// into each partial) and is complete only after all k+1 are
 	// acknowledged. Not combined with Expected or Accumulate.
 	Partials []Partial
+
+	// IgnoreLate ignores stores into a tile that already completed instead
+	// of recording an error, for a collective that writes the region after
+	// its producer (a software all-reduce on the CUs).
+	IgnoreLate bool
 }
 
 // Partial is a row-major buffer of Rows x Region.Cols elements at VBase
@@ -363,7 +368,7 @@ func (t *Tracker) storeReceived(w *mem.WriteReq) {
 			continue
 		}
 		tile, tileByte, ok := t.locate(vAddr)
-		if !ok {
+		if !ok || t.region.IgnoreLate && t.tiles[tile].complete {
 			continue
 		}
 		if t.tiles[tile].accumulate {

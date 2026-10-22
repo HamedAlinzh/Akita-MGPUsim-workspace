@@ -123,7 +123,10 @@ func (d *Driver) enqueueLaunchKernelCommand(
 		CodeObject: co,
 		DPacket:    dPacket,
 		Packet:     packet,
-		seq:        d.takeLaunchSeq(queue.GPUID),
+		seq:        -1,
+	}
+	if len(co.WaitSignals) == 0 {
+		cmd.seq = d.takeLaunchSeq(queue.GPUID)
 	}
 	d.Enqueue(queue, cmd)
 }

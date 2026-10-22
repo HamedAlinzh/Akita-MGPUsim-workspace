@@ -308,7 +308,8 @@ func (d *Driver) processOneCommand(
 
 	switch cmd := cmd.(type) {
 	case *LaunchKernelCommand:
-		if d.OrderedLaunch && !d.launchInTurn(cmdQueue.GPUID, cmd.seq) {
+		if d.OrderedLaunch && cmd.seq >= 0 &&
+			!d.launchInTurn(cmdQueue.GPUID, cmd.seq) {
 			return false
 		}
 		d.logCmdStart(cmd, now)
