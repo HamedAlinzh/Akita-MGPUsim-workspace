@@ -26,6 +26,13 @@
 //
 // In bulk mode the engine releases groups only after every tile of the
 // local GEMM is complete: the same engine and network, without overlap.
+//
+// With split-K partials (Config.Partials), a tile is held as k copies, C and
+// k-1 partial buffers, whose sum is the GPU's partial. The engine reads all
+// k once the tracker has seen every one written. By default it adds them
+// before sending (pre-sum), so the messages are the same as without
+// partials; with SplitSend it sends each copy in its own message and the
+// owner adds them all.
 package commengine
 
 import (
@@ -128,6 +135,12 @@ type Config struct {
 	Collective Collective
 	Placement  Placement
 
+	// Partials are split-K partial buffers of C (owner placement only), and
+	// SplitSend sends their copies of a tile without adding them first.
+	// Every tile of a group must be covered by the same partials.
+	Partials  []tiletracker.Partial
+	SplitSend bool
+
 	// OnDone is called, inside the simulation, when this engine has
 	// finished all its work.
 	OnDone func(gpu int, now sim.VTimeInSec)
@@ -139,6 +152,7 @@ type TileMsg struct {
 	Group   int
 	Reduced bool
 	From    int
+	Part    int // which copy of a split-K tile, with SplitSend
 	Data    []byte
 
 	record *MsgRecord
@@ -155,6 +169,7 @@ type MsgRecord struct {
 	Group        int
 	Reduced      bool
 	From, To     int
+	Part         int
 	PayloadBytes int
 	TrafficBytes int
 	// Queued: the data is read and the message waits for the engine.
@@ -180,8 +195,8 @@ type memJob struct {
 }
 
 type reduceJob struct {
-	group      int
 	cyclesLeft int
+	onDone     func(now sim.VTimeInSec)
 }
 
 // Engine is the per-GPU communication engine.
@@ -208,12 +223,15 @@ type Engine struct {
 	numGroups int
 	groups    [][]int
 	tileGroup []int
+	// groupCopies lists, per group, the partial buffers holding further
+	// copies of its tiles, after C itself.
+	groupCopies [][]tiletracker.Partial
 
 	localDone []int
 	localAll  int
 	released  []bool
 	own       map[int][]byte
-	partials  map[int]map[int][]byte
+	partials  map[int]map[int][]byte // by group, then partKey
 	reduced   map[int]bool
 	nearDone  []int  // near memory: tiles reported reduced, per group
 	gathered  []bool // near memory: reduced group read for the all-gather
@@ -230,6 +248,7 @@ type Engine struct {
 	ownedTotal, ownedDone       int
 	nonOwnedTotal, nonOwnedDone int
 	ownedPending                map[int]int
+	sendsLeft                   map[int]int // non-owned group's messages
 	finished                    bool
 
 	records []*MsgRecord
@@ -287,6 +306,25 @@ func (e *Engine) Arm(cfg Config) {
 			panic(fmt.Sprintf("commengine: tile %d in no group", tile))
 		}
 	}
+	if len(cfg.Partials) > 0 && cfg.Placement == NearMemory {
+		panic("commengine: split-K partials need the owner placement")
+	}
+	e.groupCopies = make([][]tiletracker.Partial, e.numGroups)
+	for g, tiles := range e.groups {
+		for i, tile := range tiles {
+			var copies []tiletracker.Partial
+			for _, p := range cfg.Partials {
+				if p.Covers(uint32(tile)/e.tilesX, cfg.TileRows) {
+					copies = append(copies, p)
+				}
+			}
+			if i > 0 && len(copies) != len(e.groupCopies[g]) {
+				panic(fmt.Sprintf("commengine: group %d mixes split and "+
+					"unsplit tiles", g))
+			}
+			e.groupCopies[g] = copies
+		}
+	}
 
 	e.localDone = make([]int, e.numGroups)
 	e.localAll = 0
@@ -303,6 +341,7 @@ func (e *Engine) Arm(cfg Config) {
 	e.sendQ = nil
 	e.sendStarted = false
 	e.ownedPending = map[int]int{}
+	e.sendsLeft = map[int]int{}
 	e.records = nil
 	e.finished = false
 
@@ -386,7 +425,7 @@ func (e *Engine) tryGather(now sim.VTimeInSec, g int) {
 			if p == e.cfg.GPU {
 				continue
 			}
-			e.enqueueSend(now, g, true, p, append([]byte(nil), sum...),
+			e.enqueueSend(now, g, true, p, 0, append([]byte(nil), sum...),
 				func(now sim.VTimeInSec) { e.ownedItemDone(now, g) })
 		}
 	})
@@ -402,45 +441,100 @@ func (e *Engine) release(g int) {
 		if e.cfg.Placement == NearMemory {
 			return // the memory side reduces; see tryGather
 		}
-		e.enqueueMem(false, g, nil, func(now sim.VTimeInSec, data []byte) {
+		e.enqueueRead(g, func(now sim.VTimeInSec, data []byte) {
 			e.own[g] = data
 			e.tryReduce(g)
 		})
 		return
 	}
 
-	e.enqueueMem(false, g, nil, func(now sim.VTimeInSec, data []byte) {
+	e.enqueueRead(g, func(now sim.VTimeInSec, data []byte) {
 		owner := Owner(g, e.cfg.NumGPU)
-		e.enqueueSend(now, g, false, owner, data, func(now sim.VTimeInSec) {
-			if e.cfg.Collective == ReduceScatter {
+		onSent := func(now sim.VTimeInSec) {
+			e.sendsLeft[g]--
+			if e.sendsLeft[g] == 0 && e.cfg.Collective == ReduceScatter {
 				e.nonOwnedDone++
 				e.checkFinished(now)
 			}
-		})
+		}
+		parts := e.split(g, data)
+		if !e.cfg.SplitSend && len(parts) > 1 {
+			e.enqueueReduce(g, len(parts)-1, func(now sim.VTimeInSec) {
+				sum := e.sum(parts)
+				e.sendsLeft[g] = 1
+				e.enqueueSend(now, g, false, owner, 0, sum, onSent)
+			})
+			return
+		}
+		e.sendsLeft[g] = len(parts)
+		for i, part := range parts {
+			e.enqueueSend(now, g, false, owner, i, part, onSent)
+		}
+	})
+}
+
+// msgsPerPeer is how many partial messages each peer sends for group g.
+func (e *Engine) msgsPerPeer(g int) int {
+	if e.cfg.SplitSend {
+		return 1 + len(e.groupCopies[g])
+	}
+	return 1
+}
+
+// partKey identifies a peer's partial message for a group.
+func partKey(from, part int) int {
+	return from<<8 | part
+}
+
+// split cuts a group read of all its copies into one slice per copy.
+func (e *Engine) split(g int, data []byte) [][]byte {
+	n := 1 + len(e.groupCopies[g])
+	size := len(data) / n
+	parts := make([][]byte, n)
+	for i := range parts {
+		parts[i] = data[i*size : (i+1)*size]
+	}
+	return parts
+}
+
+// sum adds slices into the first one and returns it.
+func (e *Engine) sum(parts [][]byte) []byte {
+	for _, p := range parts[1:] {
+		addFloat32s(parts[0], p)
+	}
+	return parts[0]
+}
+
+// enqueueReduce charges the engine's adder for adds additions of a group's
+// worth of data, then calls onDone.
+func (e *Engine) enqueueReduce(g, adds int, onDone func(now sim.VTimeInSec)) {
+	lines := (e.tileBytes*len(e.groups[g]) + 63) / 64
+	e.reduceQ = append(e.reduceQ, &reduceJob{
+		cyclesLeft: lines * e.reduceCyclesPerLine * adds,
+		onDone:     onDone,
 	})
 }
 
 func (e *Engine) tryReduce(g int) {
-	if e.reduced[g] || e.own[g] == nil ||
-		len(e.partials[g]) < e.cfg.NumGPU-1 {
+	peerMsgs := (e.cfg.NumGPU - 1) * e.msgsPerPeer(g)
+	if e.reduced[g] || e.own[g] == nil || len(e.partials[g]) < peerMsgs {
 		return
 	}
 	e.reduced[g] = true
 
-	lines := (len(e.own[g]) + 63) / 64
-	e.reduceQ = append(e.reduceQ, &reduceJob{
-		group:      g,
-		cyclesLeft: lines * e.reduceCyclesPerLine * (e.cfg.NumGPU - 1),
-	})
+	adds := len(e.groupCopies[g]) + peerMsgs
+	e.enqueueReduce(g, adds, func(now sim.VTimeInSec) { e.finishReduce(now, g) })
 }
 
 func (e *Engine) finishReduce(now sim.VTimeInSec, g int) {
-	sum := e.own[g]
+	sum := e.sum(e.split(g, e.own[g]))
 	for p := 0; p < e.cfg.NumGPU; p++ {
 		if p == e.cfg.GPU {
 			continue
 		}
-		addFloat32s(sum, e.partials[g][p])
+		for part := 0; part < e.msgsPerPeer(g); part++ {
+			addFloat32s(sum, e.partials[g][partKey(p, part)])
+		}
 	}
 	delete(e.partials, g)
 
@@ -461,7 +555,7 @@ func (e *Engine) finishReduce(now sim.VTimeInSec, g int) {
 		if p == e.cfg.GPU {
 			continue
 		}
-		e.enqueueSend(now, g, true, p, append([]byte(nil), sum...),
+		e.enqueueSend(now, g, true, p, 0, append([]byte(nil), sum...),
 			func(now sim.VTimeInSec) { e.ownedItemDone(now, g) })
 	}
 }
@@ -493,9 +587,15 @@ func addFloat32s(dst, src []byte) {
 	}
 }
 
-// groupSegments lists a group's bytes as line-sized physical segments, in
-// group-buffer order: tile by tile, row by row.
+// groupSegments lists a group's bytes in C as line-sized physical segments,
+// in group-buffer order: tile by tile, row by row.
 func (e *Engine) groupSegments(g int) []segment {
+	return e.copySegments(g, e.cfg.VBase, 0, 0)
+}
+
+// copySegments lists the segments of group g's copy in a buffer at base
+// holding C's rows from row0, at offset into the read buffer.
+func (e *Engine) copySegments(g int, base uint64, row0 uint32, offset int) []segment {
 	cfg := &e.cfg
 	rowBytes := int(cfg.TileCols * 4)
 	var segs []segment
@@ -503,14 +603,15 @@ func (e *Engine) groupSegments(g int) []segment {
 		tr := uint32(tile) / e.tilesX
 		tc := uint32(tile) % e.tilesX
 		for r := uint32(0); r < cfg.TileRows; r++ {
-			v := cfg.VBase + uint64(((tr*cfg.TileRows+r)*cfg.Cols+tc*cfg.TileCols)*4)
+			row := tr*cfg.TileRows + r - row0
+			v := base + uint64((row*cfg.Cols+tc*cfg.TileCols)*4)
 			for off := 0; off < rowBytes; {
 				addr := v + uint64(off)
 				lineEnd := addr/64*64 + 64
 				n := min(rowBytes-off, int(lineEnd-addr))
 				segs = append(segs, segment{
 					pAddr:  cfg.VToP(addr),
-					offset: i*e.tileBytes + int(r)*rowBytes + off,
+					offset: offset + i*e.tileBytes + int(r)*rowBytes + off,
 					size:   n,
 				})
 				off += n
@@ -518,6 +619,20 @@ func (e *Engine) groupSegments(g int) []segment {
 		}
 	}
 	return segs
+}
+
+// enqueueRead reads group g from C and from every partial buffer holding a
+// copy of it, one copy after another.
+func (e *Engine) enqueueRead(g int, onDone func(now sim.VTimeInSec, data []byte)) {
+	size := e.tileBytes * len(e.groups[g])
+	segs := e.groupSegments(g)
+	for i, p := range e.groupCopies[g] {
+		segs = append(segs, e.copySegments(g, p.VBase, p.Row, (i+1)*size)...)
+	}
+	e.memJobs = append(e.memJobs, &memJob{
+		segs: segs, data: make([]byte, size*(1+len(e.groupCopies[g]))),
+		onDone: onDone,
+	})
 }
 
 func (e *Engine) enqueueMem(
@@ -540,17 +655,17 @@ func (e *Engine) enqueueUpdate(g int, data []byte) {
 }
 
 func (e *Engine) enqueueSend(
-	now sim.VTimeInSec, g int, reduced bool, to int, data []byte,
+	now sim.VTimeInSec, g int, reduced bool, to, part int, data []byte,
 	onSent func(now sim.VTimeInSec),
 ) {
 	rec := &MsgRecord{
-		Group: g, Reduced: reduced, From: e.cfg.GPU, To: to,
+		Group: g, Reduced: reduced, From: e.cfg.GPU, To: to, Part: part,
 		PayloadBytes: len(data), TrafficBytes: len(data) + msgHeaderBytes,
 		Queued: now,
 	}
 	e.records = append(e.records, rec)
-	msg := &TileMsg{Group: g, Reduced: reduced, From: e.cfg.GPU, Data: data,
-		record: rec, onSent: onSent}
+	msg := &TileMsg{Group: g, Reduced: reduced, From: e.cfg.GPU, Part: part,
+		Data: data, record: rec, onSent: onSent}
 	msg.ID = sim.GetIDGenerator().Generate()
 	msg.Src = e.outPort(to)
 	msg.Dst = e.cfg.Peers[to]
@@ -606,7 +721,7 @@ func (e *Engine) recvFrom(now sim.VTimeInSec, port sim.Port) bool {
 		if e.partials[msg.Group] == nil {
 			e.partials[msg.Group] = map[int][]byte{}
 		}
-		e.partials[msg.Group][msg.From] = msg.Data
+		e.partials[msg.Group][partKey(msg.From, msg.Part)] = msg.Data
 		e.tryReduce(msg.Group)
 		return true
 	}
@@ -703,7 +818,7 @@ func (e *Engine) doReduce(now sim.VTimeInSec) bool {
 	job.cyclesLeft--
 	if job.cyclesLeft <= 0 {
 		e.reduceQ = e.reduceQ[1:]
-		e.finishReduce(now, job.group)
+		job.onDone(now)
 	}
 	return true
 }

@@ -233,6 +233,21 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   first: the driver serves queues in creation order) plus the main GEMM over the rest; the
   tracker uses the small tile grid and the engine takes explicit groups
   (`commengine.Options.Groups`). R must be a multiple of the main tile edge (32).
+- **Split-K first and last bands** (Step 5; `-splitk-ways s -splitk-rows R`, `-splitk-presum
+  on|off`, engines only, owner placement): each band runs as s launches, one per K chunk,
+  over A stored as s chunk buffers (M x K/s, since `WidthA` is both K and A's row stride) and
+  B offset per chunk; chunk 0 writes C, the others partial buffers. The tracker counts a
+  split tile complete after all s writes (`tiletracker.Region.Partials`); the engine reads
+  the s copies and adds them before sending (pre-sum) or sends each (`Config.SplitSend`).
+  Queues: first-band chunks, main GEMM, last-band chunks, in that order.
+- **CP dispatch** (`-cp-dispatchers`, default 8; `-ordered-dispatch`, default off). Without
+  ordered dispatch the CP's dispatchers interleave concurrent kernels' work-groups (each
+  waits a few cycles after every dispatch and the others fill slots), whatever the launch
+  order; with it a kernel dispatches only after every earlier one has dispatched all its
+  work-groups, like one kernel in work-group ID order. More than 8 concurrent kernels per
+  GPU need more dispatchers, or the extra kernel takes a freed low-index dispatcher.
+- **`-wg-trace file`** (`samples/allreducegemm`): CSV of every work-group's dispatch and
+  completion time; `scripts/step5_wgs.py` summarizes it per kernel.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -242,6 +257,8 @@ Gotchas that cost time before:
 - Akita's PCIe link bandwidth is whole bytes per cycle at the network clock, so very low or
   fractional bandwidths need a lower network frequency.
 - In a pattern for `pkill -f`, the pattern also matches the shell running it; kill by PID.
+- Don't edit a shell script while a service is running it: bash reads it as it goes, and the
+  edit broke the Step 5 batch mid-run.
 
 ## Running experiments
 
@@ -271,8 +288,9 @@ unchanged.
 | 2 | Send engine, per-tile reduce-scatter + all-gather, `-tiles-per-msg N`; verify at N = 1, 2, 4 | Done: `timing/commengine`, `results/step2_engine/` |
 | 3 | Reduction placement: (a) owner reduces via engine, (b) T3-style near memory; tile size × N with GCN3-native and matrix-core compute curves | Done: `results/step3_tiles/` |
 | 3b | Dispatch-shaping spike (`-wg-cap`, `-wg-ramp`) and the 4-GPU per-pair mesh | Done: `results/step4a_shaping/` |
+| 5 | Split-K first and last bands (no new kernel), s = 2 and 4 | Done: `results/step5_splitk/`. f≈0.5: s = 2 578 us (-8.6%), s = 4 612 (-3.2%), no pre-sum 658 (+4.0%); f≈0.8: -4.8% / -6.5% |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
-| 5 | MoE all-to-all extension (design note section only) | Not started |
+| 6 | MoE all-to-all extension (design note section only) | Not started |
 
 Step requirements, as the user set them:
 1. **Tracker spike.** One GPU, tracker only. Every output tile reports complete exactly once,

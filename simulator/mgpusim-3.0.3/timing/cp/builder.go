@@ -57,6 +57,16 @@ func (b Builder) WithWGShaping(cap, ramp int) Builder {
 	return b
 }
 
+// WithNumDispatchers sets how many kernels the CP dispatches at once (0
+// keeps the default, 8). Dispatchers serve CUs in index order, and a new
+// kernel takes the lowest free one.
+func (b Builder) WithNumDispatchers(n int) Builder {
+	if n > 0 {
+		b.numDispatchers = n
+	}
+	return b
+}
+
 // WithEngine sets the even-driven simulation engine to use.
 func (b Builder) WithEngine(engine sim.Engine) Builder {
 	b.engine = engine

@@ -41,6 +41,8 @@ type R9NanoGPUBuilder struct {
 	commEngine                     bool
 	valuCyclesScale                float64
 	wgCap, wgRamp                  int
+	numDispatchers                 int
+	orderedDispatch                bool
 	msgOverhead                    sim.VTimeInSec
 	l2CacheSize                    uint64
 	log2PageSize                   uint64
@@ -234,6 +236,20 @@ func (b R9NanoGPUBuilder) WithL1AcquireOnLaunch(on bool) R9NanoGPUBuilder {
 // WithWGShaping shapes work-group dispatch; see cp.Builder.WithWGShaping.
 func (b R9NanoGPUBuilder) WithWGShaping(cap, ramp int) R9NanoGPUBuilder {
 	b.wgCap, b.wgRamp = cap, ramp
+	return b
+}
+
+// WithNumDispatchers sets the CP's kernel dispatchers (0 = 8); see
+// cp.Builder.WithNumDispatchers.
+func (b R9NanoGPUBuilder) WithNumDispatchers(n int) R9NanoGPUBuilder {
+	b.numDispatchers = n
+	return b
+}
+
+// WithOrderedDispatch makes the CP dispatch kernels' work-groups in launch
+// order; see cp.CommandProcessor.OrderedDispatch.
+func (b R9NanoGPUBuilder) WithOrderedDispatch(on bool) R9NanoGPUBuilder {
+	b.orderedDispatch = on
 	return b
 }
 
@@ -545,6 +561,7 @@ func (b *R9NanoGPUBuilder) connectCPWithCaches() {
 		b.cp.L1VTopPorts = append(b.cp.L1VTopPorts, c.GetPortByName("Top"))
 	}
 	b.cp.AcquireOnLaunch = b.l1AcquireOnLaunch
+	b.cp.OrderedDispatch = b.orderedDispatch
 
 	for _, c := range b.l1sCaches {
 		ctrlPort := c.GetPortByName("Control")
@@ -893,7 +910,8 @@ func (b *R9NanoGPUBuilder) buildCP() {
 		WithMonitor(b.monitor).
 		WithPerfAnalyzer(b.perfAnalyzer).
 		WithLDSOccupancy(b.ldsOccupancy).
-		WithWGShaping(b.wgCap, b.wgRamp)
+		WithWGShaping(b.wgCap, b.wgRamp).
+		WithNumDispatchers(b.numDispatchers)
 
 	if b.enableVisTracing {
 		builder = builder.WithVisTracer(b.visTracer)

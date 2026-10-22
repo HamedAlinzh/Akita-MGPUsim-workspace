@@ -65,6 +65,8 @@ type Runner struct {
 	EngineMode        string
 	VALUCyclesScale   float64
 	WGCap, WGRamp     int
+	CPDispatchers     int
+	OrderedDispatch   bool
 	PeerMesh          bool
 	MsgOverheadNS     float64
 	L2CacheSize       uint64
@@ -138,6 +140,8 @@ func (r *Runner) buildTimingPlatform() {
 		WithCommEngine(r.EngineMode != "", r.MsgOverheadNS).
 		WithVALUCyclesScale(r.VALUCyclesScale).
 		WithWGShaping(r.WGCap, r.WGRamp).
+		WithNumDispatchers(r.CPDispatchers).
+		WithOrderedDispatch(r.OrderedDispatch).
 		WithPeerMesh(r.PeerMesh).
 		WithL2CacheSize(r.L2CacheSize).
 		WithDRAMSize(r.DRAMSize)

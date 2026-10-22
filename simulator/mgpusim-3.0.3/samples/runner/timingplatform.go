@@ -42,6 +42,8 @@ type R9NanoPlatformBuilder struct {
 	commEngine                         bool
 	valuCyclesScale                    float64
 	wgCap, wgRamp                      int
+	numDispatchers                     int
+	orderedDispatch                    bool
 	msgOverheadNS                      float64
 	h2dCycles                          int
 	l2CacheSize                        uint64
@@ -143,6 +145,19 @@ func (b R9NanoPlatformBuilder) WithLinkLatency(ns float64) R9NanoPlatformBuilder
 // from a start value; see cp.Builder.WithWGShaping.
 func (b R9NanoPlatformBuilder) WithWGShaping(cap, ramp int) R9NanoPlatformBuilder {
 	b.wgCap, b.wgRamp = cap, ramp
+	return b
+}
+
+// WithNumDispatchers sets each CP's kernel dispatchers (0 = 8).
+func (b R9NanoPlatformBuilder) WithNumDispatchers(n int) R9NanoPlatformBuilder {
+	b.numDispatchers = n
+	return b
+}
+
+// WithOrderedDispatch makes every CP dispatch work-groups in kernel launch
+// order.
+func (b R9NanoPlatformBuilder) WithOrderedDispatch(on bool) R9NanoPlatformBuilder {
+	b.orderedDispatch = on
 	return b
 }
 
@@ -504,6 +519,8 @@ func (b *R9NanoPlatformBuilder) createGPUBuilder(
 		WithCommEngine(b.commEngine, sim.VTimeInSec(b.msgOverheadNS*1e-9)).
 		WithVALUCyclesScale(b.valuCyclesScale).
 		WithWGShaping(b.wgCap, b.wgRamp).
+		WithNumDispatchers(b.numDispatchers).
+		WithOrderedDispatch(b.orderedDispatch).
 		WithL2CacheSize(b.l2CacheSize).
 		WithDRAMSize(b.dramSize)
 

@@ -21,6 +21,7 @@ import (
 	"github.com/sarchlab/mgpusim/v3/insts"
 	"github.com/sarchlab/mgpusim/v3/kernels"
 	"github.com/sarchlab/mgpusim/v3/timing/commengine"
+	"github.com/sarchlab/mgpusim/v3/timing/tiletracker"
 )
 
 //go:embed kernels.hsaco
@@ -115,6 +116,16 @@ type Benchmark struct {
 	SmallVALUScale   float64
 	SmallTilesPerMsg int
 
+	// SplitKWays, if at least 2, splits the K loop of the first and the last
+	// SplitKRows rows of C across that many work-groups (the hybrid
+	// schedule of Stream-K): each of these bands runs as SplitKWays
+	// launches, one per K chunk, on queues created before (first band) and
+	// after (last band) the main GEMM's over the middle rows. Chunk 0
+	// writes C, the others their own partial buffers, which the engines add
+	// (Comm only; CommOptions.SplitSend sends them unsummed).
+	SplitKWays int
+	SplitKRows uint32
+
 	// OnPartialC, if set, is called for each GPU once its partial C is
 	// allocated and A and B are copied, before any GEMM launch.
 	OnPartialC func(ctx *driver.Context, g, gpuID int, c driver.Ptr)
@@ -205,6 +216,7 @@ func (b *Benchmark) exec() {
 	gBs := make([]driver.Ptr, numGPU)
 	cmdQs := make([]*driver.CommandQueue, numGPU)
 	var smallQs []*driver.CommandQueue
+	splits := make([]*splitK, numGPU)
 
 	for g, gpuID := range b.gpus {
 		b.driver.SelectGPU(b.context, gpuID)
@@ -230,7 +242,13 @@ func (b *Benchmark) exec() {
 		if b.SmallRows > 0 {
 			smallQs = append(smallQs, b.driver.CreateCommandQueue(b.context))
 		}
+		if b.SplitKWays > 1 {
+			splits[g] = b.newSplitK(aSlice, bSlice, gB)
+		}
 		cmdQs[g] = b.driver.CreateCommandQueue(b.context)
+		if b.SplitKWays > 1 {
+			splits[g].createLastQueues(b)
+		}
 
 		if b.OnPartialC != nil {
 			b.OnPartialC(b.context, g, gpuID, gC)
@@ -247,6 +265,10 @@ func (b *Benchmark) exec() {
 	launchBand := func(rowStart uint32) {
 		if b.SmallRows > 0 {
 			b.launchSmallFirst(gAs, gBs, partialC, cmdQs, smallQs, kSlice)
+			return
+		}
+		if b.SplitKWays > 1 {
+			b.launchSplitK(gAs, gBs, partialC, cmdQs, splits, kSlice)
 			return
 		}
 		for g, gpuID := range b.gpus {
@@ -274,6 +296,14 @@ func (b *Benchmark) exec() {
 	drain := func() {
 		for _, q := range smallQs {
 			b.driver.DrainCommandQueue(q)
+		}
+		for _, sk := range splits {
+			if sk == nil {
+				continue
+			}
+			for _, q := range append(sk.firstQs, sk.lastQs...) {
+				b.driver.DrainCommandQueue(q)
+			}
 		}
 		for _, q := range cmdQs {
 			b.driver.DrainCommandQueue(q)
@@ -310,6 +340,12 @@ func (b *Benchmark) exec() {
 	}
 
 	if b.Comm != nil {
+		if b.SplitKWays > 1 {
+			b.CommOptions.Partials = make([][]tiletracker.Partial, numGPU)
+			for g, sk := range splits {
+				b.CommOptions.Partials[g] = sk.partials
+			}
+		}
 		b.execFused(partialC, launchBand, drain, timed)
 		return
 	}
@@ -456,6 +492,92 @@ func (b *Benchmark) collectFused(partialC []driver.Ptr, tileEdge uint32) {
 	}
 }
 
+// splitK is one GPU's split-K state: A cut into K chunks, the partial C
+// buffers of chunks 1.., and the queues of the split bands.
+type splitK struct {
+	aChunks  []driver.Ptr // M x K/s each
+	bChunks  []driver.Ptr // offsets into the GPU's B
+	partials []tiletracker.Partial
+	firstQs  []*driver.CommandQueue
+	lastQs   []*driver.CommandQueue
+}
+
+// newSplitK copies A in K chunks to the selected GPU, allocates the partial
+// buffers and creates the first band's queues.
+func (b *Benchmark) newSplitK(aSlice, bSlice *matrix, gB driver.Ptr) *splitK {
+	s := uint32(b.SplitKWays)
+	chunk := aSlice.Width / s
+	sk := &splitK{}
+	for j := uint32(0); j < s; j++ {
+		a := aSlice.columnSlice(j*chunk, (j+1)*chunk)
+		gA := b.driver.AllocateMemory(b.context, uint64(len(a.Data)*4))
+		b.driver.MemCopyH2D(b.context, gA, a.Data)
+		sk.aChunks = append(sk.aChunks, gA)
+		sk.bChunks = append(sk.bChunks,
+			gB+driver.Ptr(uint64(j*chunk)*uint64(bSlice.Width)*4))
+	}
+	for _, row := range []uint32{0, b.M - b.SplitKRows} {
+		for j := uint32(1); j < s; j++ {
+			buf := b.driver.AllocateMemory(b.context, uint64(b.SplitKRows*b.N*4))
+			sk.partials = append(sk.partials, tiletracker.Partial{
+				VBase: uint64(buf), Row: row, Rows: b.SplitKRows})
+		}
+	}
+	for j := uint32(0); j < s; j++ {
+		sk.firstQs = append(sk.firstQs, b.driver.CreateCommandQueue(b.context))
+	}
+	return sk
+}
+
+func (sk *splitK) createLastQueues(b *Benchmark) {
+	for j := 0; j < b.SplitKWays; j++ {
+		sk.lastQs = append(sk.lastQs, b.driver.CreateCommandQueue(b.context))
+	}
+}
+
+// launchSplitK launches, on every GPU, the first band's K chunks, the main
+// GEMM over the middle rows and the last band's K chunks, in that order.
+// The CP gives earlier kernels first claim on free CU slots.
+func (b *Benchmark) launchSplitK(
+	gAs, gBs, partialC []driver.Ptr,
+	cmdQs []*driver.CommandQueue, splits []*splitK, kSlice uint32,
+) {
+	ts := b.tileSize()
+	edge := driver.LocalPtr(4 * ts)
+	launch := func(q *driver.CommandQueue, a, bm, c driver.Ptr,
+		widthA, rowStart, rows uint32) {
+		b.driver.EnqueueLaunchKernel(q, b.kernel,
+			[3]uint32{b.N / 4, rows / 4, 1},
+			[3]uint16{uint16(ts), uint16(ts), 1},
+			&matrixmultiplication.KernelArgs{
+				MatrixA: a + driver.Ptr(uint64(rowStart)*uint64(widthA)*4),
+				MatrixB: bm,
+				MatrixC: c,
+				WidthA:  widthA,
+				BlockA:  edge * edge * 4,
+			})
+	}
+	s := uint32(b.SplitKWays)
+	r := b.SplitKRows
+	for g, gpuID := range b.gpus {
+		b.driver.SelectGPU(b.context, gpuID)
+		sk := splits[g]
+		band := func(qs []*driver.CommandQueue, rowStart uint32, partials []tiletracker.Partial) {
+			for j := uint32(0); j < s; j++ {
+				c := partialC[g] + driver.Ptr(uint64(rowStart)*uint64(b.N)*4)
+				if j > 0 {
+					c = driver.Ptr(partials[j-1].VBase)
+				}
+				launch(qs[j], sk.aChunks[j], sk.bChunks[j], c, kSlice/s, rowStart, r)
+			}
+		}
+		band(sk.firstQs, 0, sk.partials[:s-1])
+		launch(cmdQs[g], gAs[g], gBs[g],
+			partialC[g]+driver.Ptr(uint64(r)*uint64(b.N)*4), kSlice, r, b.M-2*r)
+		band(sk.lastQs, b.M-r, sk.partials[s-1:])
+	}
+}
+
 func (b *Benchmark) smallTileSize() uint32 {
 	if b.SmallTileSize == 0 {
 		return 4
@@ -540,6 +662,16 @@ func (b *Benchmark) bandRows() uint32 {
 // kernel's internal loop counts silently truncate and produce wrong
 // results rather than erroring.
 func (b *Benchmark) validateDimensions(numGPU uint32) {
+	if b.SplitKWays > 1 {
+		s, tile := uint32(b.SplitKWays), 4*b.tileSize()
+		if b.Comm == nil || b.SmallRows > 0 || b.SplitKRows%tile != 0 ||
+			b.SplitKRows == 0 || 2*b.SplitKRows >= b.M ||
+			(b.K/numGPU)%(s*tile) != 0 || b.CommOptions.Placement != commengine.OwnerEngine {
+			log.Panicf("split-K needs the engines (owner placement), a band "+
+				"of a multiple of %d rows below M/2, and K/GPU a multiple of %d",
+				tile, s*tile)
+		}
+	}
 	if b.SmallRows > 0 && (b.SmallRows%(4*b.tileSize()) != 0 ||
 		b.SmallRows >= b.M || b.bandRows() != b.M || b.Overlap ||
 		b.N%(4*b.smallTileSize()) != 0) {

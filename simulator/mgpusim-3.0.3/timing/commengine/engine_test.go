@@ -30,6 +30,9 @@ type rig struct {
 	engines []*Engine
 	mems    []*idealmemcontroller.Comp
 	done    []sim.VTimeInSec
+
+	partials  []tiletracker.Partial
+	splitSend bool
 }
 
 func newRig(t *testing.T, numGPU int, overhead sim.VTimeInSec) *rig {
@@ -95,6 +98,7 @@ func (r *rig) run(
 			Rows: testRows, Cols: testCols, TileRows: testEdge, TileCols: testEdge,
 			VToP:        func(v uint64) uint64 { return v },
 			TilesPerMsg: tilesPerMsg, Mode: mode, Collective: coll,
+			Partials: r.partials, SplitSend: r.splitSend,
 			OnDone: func(gpu int, now sim.VTimeInSec) {
 				if r.done[gpu] != 0 {
 					t.Errorf("engine %d finished twice", gpu)
@@ -234,5 +238,63 @@ func TestMsgOverheadIsSerializedPerEngine(t *testing.T) {
 					i-1, i, rec.Sent-recs[i-1].Sent)
 			}
 		}
+	}
+}
+
+// partialBase is where the rig's split-K partial of C's first tile row
+// lives: right after C.
+const partialBase = testRows * testCols * 4
+
+// withPartial adds a split-K partial of tile row 0 (tiles 0 and 1) holding,
+// like C, (i+1)*(tile+1) on GPU i, so those tiles' partial sums double.
+func (r *rig) withPartial(t *testing.T, splitSend bool) {
+	r.partials = []tiletracker.Partial{{VBase: partialBase, Row: 0, Rows: testEdge}}
+	r.splitSend = splitSend
+	for i, m := range r.mems {
+		for row := 0; row < testEdge; row++ {
+			for col := 0; col < testCols; col++ {
+				writeFloat(t, m, testRows+row, col, float32((i+1)*(col/testEdge+1)))
+			}
+		}
+	}
+}
+
+func TestSplitKPartials(t *testing.T) {
+	for _, splitSend := range []bool{false, true} {
+		t.Run(fmt.Sprintf("splitSend=%v", splitSend), func(t *testing.T) {
+			r := newRig(t, 2, 0)
+			r.withPartial(t, splitSend)
+			r.run(t, 1, ModeTile, AllReduce, staggered)
+
+			total := 3 // GPU partials 1x and 2x
+			for i, m := range r.mems {
+				for row := 0; row < testRows; row += 7 {
+					for col := 0; col < testCols; col += 5 {
+						tile := row/testEdge*(testCols/testEdge) + col/testEdge
+						want := float32(total * (tile + 1))
+						if tile < 2 {
+							want *= 2
+						}
+						if got := readFloat(t, m, row, col); got != want {
+							t.Fatalf("GPU %d (%d, %d), tile %d: got %v, want %v",
+								i, row, col, tile, got, want)
+						}
+					}
+				}
+			}
+
+			// Each GPU sends one partial (tile 1 or 0) of the split row and
+			// one of the other row, plus two reduced groups; a split send
+			// adds one message.
+			want := 4
+			if splitSend {
+				want = 5
+			}
+			for d, c := range r.messagesPerDirection() {
+				if c != want {
+					t.Errorf("%v: %d messages, want %d", d, c, want)
+				}
+			}
+		})
 	}
 }

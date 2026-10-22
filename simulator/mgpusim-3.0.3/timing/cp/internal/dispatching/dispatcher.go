@@ -43,6 +43,20 @@ type DispatcherImpl struct {
 
 	monitor     *monitoring.Monitor
 	progressBar *monitoring.ProgressBar
+
+	hold bool
+}
+
+// SetHold stops (or resumes) dispatching work-groups; a held dispatcher
+// still completes its kernel.
+func (d *DispatcherImpl) SetHold(hold bool) {
+	d.hold = hold
+}
+
+// HasWGsToDispatch tells whether the kernel has work-groups not yet
+// dispatched.
+func (d *DispatcherImpl) HasWGsToDispatch() bool {
+	return d.dispatching != nil && (d.currWG.valid || d.alg.HasNext())
 }
 
 // Name returns the name of the dispatcher
@@ -103,7 +117,7 @@ func (d *DispatcherImpl) Tick(now sim.VTimeInSec) (madeProgress bool) {
 	if d.dispatching != nil {
 		if d.kernelCompleted() {
 			madeProgress = d.completeKernel(now) || madeProgress
-		} else {
+		} else if !d.hold {
 			madeProgress = d.dispatchNextWG(now) || madeProgress
 		}
 	}

@@ -10,7 +10,8 @@
 // completion therefore sees the final values.
 //
 // The tracker relies on the producer writing every byte of the region
-// exactly once, as mmmKernel_local does. Writing a byte twice, or storing
+// exactly once, as mmmKernel_local does, or once per split-K partial (see
+// Region.Partials). Writing a byte twice, or storing
 // into a tile after it completed, is recorded as an error.
 package tiletracker
 
@@ -49,6 +50,27 @@ type Region struct {
 	// Accumulate, if set, marks tiles whose stores add to what the tile
 	// holds instead of overwriting it (op-and-store), in any order.
 	Accumulate func(tile int) bool
+
+	// Partials lists split-K partial buffers. A tile covered by k of them
+	// is written k+1 times by the local GEMM (once into the region, once
+	// into each partial) and is complete only after all k+1 are
+	// acknowledged. Not combined with Expected or Accumulate.
+	Partials []Partial
+}
+
+// Partial is a row-major buffer of Rows x Region.Cols elements at VBase
+// whose element (r, c) is a split-K partial of region element (Row+r, c).
+// Row and Rows are multiples of Region.TileRows.
+type Partial struct {
+	VBase     uint64
+	Row, Rows uint32
+}
+
+// Covers tells whether the partial holds part of tile row tileRow of tiles
+// tileRows high.
+func (p Partial) Covers(tileRow, tileRows uint32) bool {
+	r := tileRow * tileRows
+	return r >= p.Row && r < p.Row+p.Rows
 }
 
 const elemBytes = 4
@@ -86,6 +108,7 @@ type tileState struct {
 	data       []byte
 	sum        []float32 // running sums of an accumulating tile
 	expected   int
+	local      int // writes per byte from the local GEMM
 	accumulate bool
 	count      int
 	localCount int
@@ -181,6 +204,14 @@ func (t *Tracker) Arm(r Region) {
 		panic(fmt.Sprintf("tiletracker: tiles %dx%d do not divide %dx%d",
 			r.TileRows, r.TileCols, r.Rows, r.Cols))
 	}
+	for _, p := range r.Partials {
+		if r.Expected != nil || r.Accumulate != nil ||
+			p.Row%r.TileRows != 0 || p.Rows%r.TileRows != 0 ||
+			p.Rows == 0 || p.Row+p.Rows > r.Rows {
+			panic("tiletracker: partials must cover whole tile rows of the " +
+				"region, without Expected or Accumulate")
+		}
+	}
 
 	t.armed = true
 	t.region = r
@@ -192,7 +223,13 @@ func (t *Tracker) Arm(r Region) {
 		ts := &t.tiles[i]
 		ts.written = make([]uint8, t.tileSize)
 		ts.data = make([]byte, t.tileSize)
-		ts.expected = 1
+		ts.local = 1
+		for _, p := range r.Partials {
+			if p.Covers(uint32(i)/t.tilesX, r.TileRows) {
+				ts.local++
+			}
+		}
+		ts.expected = ts.local
 		if r.Expected != nil {
 			ts.expected = r.Expected(i)
 		}
@@ -270,18 +307,36 @@ func (t *Tracker) virtualAddr(pAddr uint64) (uint64, bool) {
 	return vPage | pAddr&pageMask, true
 }
 
-// locate maps a virtual byte address to its tile and byte within the tile.
+// locate maps a virtual byte address, in the region or one of its partials,
+// to its tile and byte within the tile.
 func (t *Tracker) locate(vAddr uint64) (tile, tileByte int, ok bool) {
 	r := &t.region
-	if vAddr < r.VBase {
+	if tile, tileByte, ok = t.locateIn(vAddr, r.VBase, 0, r.Rows); ok {
+		return tile, tileByte, true
+	}
+	for _, p := range r.Partials {
+		if tile, tileByte, ok = t.locateIn(vAddr, p.VBase, p.Row, p.Rows); ok {
+			return tile, tileByte, true
+		}
+	}
+	return 0, 0, false
+}
+
+// locateIn locates vAddr in a buffer of rows region rows, starting at region
+// row row0, at base.
+func (t *Tracker) locateIn(
+	vAddr, base uint64, row0, rows uint32,
+) (tile, tileByte int, ok bool) {
+	r := &t.region
+	if vAddr < base {
 		return 0, 0, false
 	}
-	off := vAddr - r.VBase
+	off := vAddr - base
 	elem := off / elemBytes
-	if elem >= uint64(r.Rows)*uint64(r.Cols) {
+	if elem >= uint64(rows)*uint64(r.Cols) {
 		return 0, 0, false
 	}
-	row := uint32(elem / uint64(r.Cols))
+	row := row0 + uint32(elem/uint64(r.Cols))
 	col := uint32(elem % uint64(r.Cols))
 	tile = int((row/r.TileRows)*t.tilesX + col/r.TileCols)
 	tileByte = int(((row%r.TileRows)*r.TileCols+col%r.TileCols)*elemBytes) +
@@ -398,7 +453,7 @@ func (t *Tracker) storeAcked(rsp *mem.WriteDoneRsp) {
 	for _, tile := range touched {
 		ts := &t.tiles[tile]
 		ts.pending--
-		if ts.localCount == t.tileSize && !ts.localDone {
+		if ts.localCount == t.tileSize*ts.local && !ts.localDone {
 			ts.localDone = true
 			ev := t.event(tile, now)
 			for _, f := range t.localListeners {

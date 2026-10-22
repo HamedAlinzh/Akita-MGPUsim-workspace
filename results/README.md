@@ -77,7 +77,35 @@ Layout: one subfolder per experiment.
   1` on top, small-tiles-first at R = 32/64/128 (2 GPUs) and its GEMM alone (1 GPU), and the
   default 433 us check. `runs_queue_order_bug/`: the first small-tiles-first runs, invalid:
   the main GEMM's queue was created first and the driver serves queues in creation order, so
-  the small-tile kernel did not start first.
+  the small-tile kernel did not start first. Caveat found in Step 5: even after that fix the
+  CP interleaves concurrent kernels' work-groups (no `-ordered-dispatch` then), so the
+  small-tile work-groups did not all dispatch first in these runs.
+- `step5_splitk/`: split-K for the first and last bands of C (`-splitk-ways s -splitk-rows R`,
+  s = 2 at R = 64, s = 4 at R = 32), on the capped baseline's f≈0.5/f≈0.8 shape and knobs
+  (2 GPUs, 4 CUs, 256x256, K/GPU 256, tileSize 8, `-gemm-wg-cap 8`, `-cp-dispatchers 16 -ordered-dispatch`).
+  `runs/` (`scripts/step5_runs.sh`, `summary.txt` from `scripts/step5_summary.py`), 9 runs,
+  each with a `wgs.csv` work-group trace (`-wg-trace`):
+  1. `gemm_s2`, `gemm_s4`: GEMM alone (1 GPU, K 256, engine tile mode), pre-sum.
+  2. `f05_tile_s2`, `f05_tile_s4`: engine tile mode at f≈0.5, pre-sum.
+  3. `f05_tile_s2_nopresum`: s = 2 without pre-sum (`-splitk-presum off`).
+  4. `f08_tile_s2`, `f08_tile_s4`: engine tile mode at f≈0.8, pre-sum.
+  5. `f05_bulk_s2`: engine bulk mode at f≈0.5, s = 2, pre-sum.
+  6. `defaults_433`: default flags, expect 432.742 us.
+  7. `f05_tile_s1` (added after the first results): the s = 1 baseline with the same flags
+     and a trace, to confirm 632.4 us and time plain work-groups.
+
+  Result (all verify; defaults 432.742 us; s = 1 with the new flags still 632.4 us). At f≈0.5,
+  s = 2 with pre-sum gives 578.0 us (-8.6%) and GEMM 339.4 us (-5.9%); s = 4 gives 612.2
+  (-3.2%); no pre-sum gives 657.6 (+4.0%). At f≈0.8: s = 2 1614.8 (-4.8%), s = 4 1585.7
+  (-6.5%). Bulk s = 2: 766.9 (-2.2%), all from the faster GEMM. First ready: 205.6 / 119.2 /
+  97.1 us for s = 1 / 2 / 4. The GEMM is faster because plain round-1 work-groups, all
+  starting together, take 172 us vs 137 in round 2; the split bands replace that round.
+  Residency is 8 per CU in every band, and a split work-group's time per unit of K is 1.04x
+  (s = 2) and 1.43x (s = 4) a plain one's. The queue model (tiles served in ready order)
+  predicts every window within 1-3%; max(GEMM, first ready + comm) misses s = 4 at f≈0.5 by
+  12%, because the link idles between the first band and the middle.
+  `runs_interleaved/`: the first GEMM-alone runs, without `-ordered-dispatch`; the
+  dispatchers interleaved all five or nine kernels, so the bands did not go in order.
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

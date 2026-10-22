@@ -22,6 +22,10 @@ type Options struct {
 	Mode       Mode
 	Collective Collective
 	Placement  Placement
+	// Partials, if set, gives every GPU's split-K partial buffers of C (by
+	// GPU, then buffer); see Config.Partials and Config.SplitSend.
+	Partials  [][]tiletracker.Partial
+	SplitSend bool
 }
 
 // Session drives the engines of a set of GPUs from the host: arm them before
@@ -71,7 +75,11 @@ func (s *Session) Arm(
 			}
 		}
 
-		region := s.region(ctx, uint64(cs[i]), rows, cols, tileEdge)
+		var partials []tiletracker.Partial
+		if opt.Partials != nil {
+			partials = opt.Partials[i]
+		}
+		region := s.region(ctx, uint64(cs[i]), rows, cols, tileEdge, partials)
 		if opt.Placement == NearMemory {
 			gpu, numGPU := i, len(s.parts)
 			groupOf := opt.groupIndex(int((rows / tileEdge) * (cols / tileEdge)))
@@ -110,6 +118,8 @@ func (s *Session) Arm(
 			Mode:        opt.Mode,
 			Collective:  opt.Collective,
 			Placement:   opt.Placement,
+			Partials:    partials,
+			SplitSend:   opt.SplitSend,
 			OnDone:      s.engineDone,
 		})
 	}
@@ -139,21 +149,29 @@ func (o Options) TileOwner(numTiles, numGPU int) func(tile int) int {
 
 func (s *Session) region(
 	ctx *driver.Context, c uint64, rows, cols, tileEdge uint32,
+	partials []tiletracker.Partial,
 ) tiletracker.Region {
 	log2 := s.driver.Log2PageSize
 	pageSize := uint64(1) << log2
 	pages := map[uint64]uint64{}
-	for v := c &^ (pageSize - 1); v < c+uint64(rows)*uint64(cols)*4; v += pageSize {
-		p, ok := s.driver.PhysicalAddress(ctx, v)
-		if !ok {
-			panic("commengine: C is not mapped")
+	mapPages := func(base uint64, rows uint32) {
+		for v := base &^ (pageSize - 1); v < base+uint64(rows)*uint64(cols)*4; v += pageSize {
+			p, ok := s.driver.PhysicalAddress(ctx, v)
+			if !ok {
+				panic("commengine: C is not mapped")
+			}
+			pages[p] = v
 		}
-		pages[p] = v
+	}
+	mapPages(c, rows)
+	for _, p := range partials {
+		mapPages(p.VBase, p.Rows)
 	}
 	return tiletracker.Region{
 		VBase: c, Rows: rows, Cols: cols,
 		TileRows: tileEdge, TileCols: tileEdge,
 		PageMap: pages, Log2PageSize: log2,
+		Partials: partials,
 	}
 }
 

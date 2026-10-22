@@ -8,6 +8,7 @@ import (
 	"github.com/sarchlab/mgpusim/v3/benchmarks/mccl"
 	"github.com/sarchlab/mgpusim/v3/samples/runner"
 	"github.com/sarchlab/mgpusim/v3/timing/commengine"
+	"github.com/tebeka/atexit"
 )
 
 var mFlag = flag.Uint("m", 128, "Number of rows of matrix A and C.")
@@ -47,6 +48,16 @@ var smallVALUScaleFlag = flag.Float64("small-valu-scale", 0,
 	"Scale the small-tile GEMM's vector ALU cycles (0 = -valu-cycles-scale).")
 var smallTilesPerMsgFlag = flag.Int("small-tiles-per-msg", 1,
 	"With -engine-mode: small tiles per engine message.")
+var splitKWaysFlag = flag.Int("splitk-ways", 0,
+	"With -engine-mode: split the K loop of the first and last bands of C "+
+		"across this many work-groups (0 = off).")
+var splitKRowsFlag = flag.Uint("splitk-rows", 0,
+	"Rows in each split-K band.")
+var splitKPresumFlag = flag.String("splitk-presum", "on",
+	`"on": the engine adds a tile's split-K partials before sending it; "off":
+it sends each partial and the owner adds them.`)
+var wgTraceFlag = flag.String("wg-trace", "",
+	"Write every work-group's dispatch and completion time to this CSV.")
 var tileSizeFlag = flag.Uint("tile-size", 0,
 	"Work-group edge T; each work-group computes a 4T x 4T tile (0 = 8).")
 var perBandScratchFlag = flag.Bool("per-band-scratch", false,
@@ -72,6 +83,8 @@ func main() {
 	benchmark.SmallTileSize = uint32(*smallTileSizeFlag)
 	benchmark.SmallVALUScale = *smallVALUScaleFlag
 	benchmark.SmallTilesPerMsg = *smallTilesPerMsgFlag
+	benchmark.SplitKWays = *splitKWaysFlag
+	benchmark.SplitKRows = uint32(*splitKRowsFlag)
 	mccl.CollectiveThreads = *collectiveThreadsFlag
 
 	if runner.EngineMode != "" {
@@ -88,6 +101,11 @@ func main() {
 	default:
 		log.Panicf(`-algorithm must be "ring" or "naive", got %q`,
 			*algorithmFlag)
+	}
+
+	if *wgTraceFlag != "" {
+		wgs := traceWGs(runner.Platform())
+		atexit.Register(func() { wgs.write(*wgTraceFlag) })
 	}
 
 	runner.AddBenchmark(benchmark)
@@ -109,6 +127,13 @@ func fusedComm(r *runner.Runner) (*commengine.Session, commengine.Options) {
 	}
 	if *reduceScatterFlag {
 		opt.Collective = commengine.ReduceScatter
+	}
+	switch *splitKPresumFlag {
+	case "on":
+	case "off":
+		opt.SplitSend = true
+	default:
+		log.Panicf(`-splitk-presum must be "on" or "off", got %q`, *splitKPresumFlag)
 	}
 	switch *placementFlag {
 	case "owner":

@@ -49,6 +49,15 @@ type CommandProcessor struct {
 	acquireSent []bool
 	acquireAcks int
 
+	// OrderedDispatch holds each kernel's work-groups until every kernel
+	// that reached the CP before it has dispatched all of its own, as if
+	// they were one kernel dispatching its work-groups in order. Otherwise
+	// the dispatchers interleave: each waits a few cycles after every
+	// dispatch, and the others fill CU slots meanwhile.
+	OrderedDispatch bool
+	launchSeq       map[dispatching.Dispatcher]int
+	numLaunched     int
+
 	ToDriver                   sim.Port
 	toDriverSender             sim.BufferedSender
 	ToDMA                      sim.Port
@@ -146,11 +155,35 @@ func (p *CommandProcessor) sendMsgsOutFromPort(
 func (p *CommandProcessor) tickDispatchers(
 	now sim.VTimeInSec,
 ) (madeProgress bool) {
+	if p.OrderedDispatch {
+		p.holdLaterKernels()
+	}
+
 	for _, d := range p.Dispatchers {
 		madeProgress = d.Tick(now) || madeProgress
 	}
 
 	return madeProgress
+}
+
+type holdableDispatcher interface {
+	SetHold(hold bool)
+	HasWGsToDispatch() bool
+}
+
+// holdLaterKernels lets only the earliest kernel with work-groups left
+// dispatch.
+func (p *CommandProcessor) holdLaterKernels() {
+	first := -1
+	for _, d := range p.Dispatchers {
+		h := d.(holdableDispatcher)
+		if h.HasWGsToDispatch() && (first < 0 || p.launchSeq[d] < first) {
+			first = p.launchSeq[d]
+		}
+	}
+	for _, d := range p.Dispatchers {
+		d.(holdableDispatcher).SetHold(first >= 0 && p.launchSeq[d] > first)
+	}
 }
 
 func (p *CommandProcessor) processReqFromDriver(now sim.VTimeInSec) bool {
@@ -323,6 +356,11 @@ func (p *CommandProcessor) processLaunchKernelReq(
 	}
 
 	d.StartDispatching(req)
+	if p.launchSeq == nil {
+		p.launchSeq = map[dispatching.Dispatcher]int{}
+	}
+	p.numLaunched++
+	p.launchSeq[d] = p.numLaunched
 	p.ToDriver.Retrieve(now)
 
 	tracing.TraceReqReceive(req, p)

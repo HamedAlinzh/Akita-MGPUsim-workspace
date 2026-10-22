@@ -83,6 +83,11 @@ var wgCapFlag = flag.Int("wg-cap", 0,
 var wgRampFlag = flag.Int("wg-ramp", 0,
 	"Start each CU's work-group cap at this value and raise it by one per "+
 		"completed work-group (dispatch shaping; 0 = off).")
+var cpDispatchersFlag = flag.Int("cp-dispatchers", 8,
+	"Kernels each command processor dispatches at once.")
+var orderedDispatchFlag = flag.Bool("ordered-dispatch", false,
+	"Dispatch work-groups in kernel launch order: a kernel waits until "+
+		"every earlier kernel has dispatched all of its work-groups.")
 var peerMeshFlag = flag.Bool("peer-mesh", false,
 	"Build the peer fabric as a full mesh with one link per GPU pair "+
 		"(MI300X-like) instead of one shared switch.")
@@ -175,6 +180,8 @@ func (r *Runner) ParseFlag() *Runner {
 	r.EngineMode = *engineModeFlag
 	r.VALUCyclesScale = *valuCyclesScaleFlag
 	r.WGCap, r.WGRamp = *wgCapFlag, *wgRampFlag
+	r.CPDispatchers = *cpDispatchersFlag
+	r.OrderedDispatch = *orderedDispatchFlag
 	r.PeerMesh = *peerMeshFlag
 	r.MsgOverheadNS = *msgOverheadFlag
 	r.L2CacheSize = *l2CacheSizeFlag
