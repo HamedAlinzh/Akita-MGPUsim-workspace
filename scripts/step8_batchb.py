@@ -72,11 +72,14 @@ def plans(rows):
 
 def split_cost(run, plan):
     """Steady split cost per work-group: mean duration of split work-groups
-    not dispatched at time 0, times s, over the mean of plain ones, GPU 1."""
+    not dispatched at time 0, normalized to 8 resident per CU (duration x 8 /
+    its time-averaged residency, since CUs time-share), times s, over the same
+    for plain ones, GPU 1."""
     path = os.path.join(RUNS, run, "wgs.csv")
     if not os.path.exists(path):
         return {}
     rows = [r for r in step5_wgs.load(path) if r["gpu"] == "1"]
+    step5_wgs.residency(rows)
     t0 = min(r["start"] for r in rows)
     grid = collections.Counter()
     by_kernel = collections.defaultdict(list)
@@ -93,7 +96,7 @@ def split_cost(run, plan):
         s = bands[i]
         for r in by_kernel[kid]:
             if r["start"] > t0 + 1:
-                dur[s].append(r["end"] - r["start"])
+                dur[s].append((r["end"] - r["start"]) * 8 / r["resident"])
         grid[s] += 1
     if 1 not in dur:
         return {}

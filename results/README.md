@@ -210,6 +210,13 @@ Layout: one subfolder per experiment.
      2.25 waves), `k128` and `k512` (256x256 at K/GPU 128 and 512).
   4. `rs05`, `rs08`: reduce-scatter only (`-reduce-scatter`) at f ≈ 0.555 and 0.814.
   5. `defaults_433`: default flags, expect 432.742 us.
+
+  Batch B result (all 15 verify; defaults 432.742 us), plan vs s = 1: 1.5 waves -20.1%,
+  3.375 waves -10.8%, 9 tile rows -16.3%, K/GPU 128 -13.2%, K/GPU 512 -20.2%,
+  reduce-scatter -16.8% (f 0.555) and -6.5% (f 0.814). Model (processor-sharing schedule
+  + event messages) errors -3.2% to +1.5%. Steady split cost per work-group, normalized to
+  8 resident: 1.03-1.09 (s = 2) and 1.13-1.25 (s = 4) at K/GPU 256, 1.18 / 1.42 at 128 (a
+  32-wide K chunk is mostly fixed cost), 1.12 / 1.14 at 512.
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
