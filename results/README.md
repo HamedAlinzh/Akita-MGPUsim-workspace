@@ -106,6 +106,20 @@ Layout: one subfolder per experiment.
   12%, because the link idles between the first band and the middle.
   `runs_interleaved/`: the first GEMM-alone runs, without `-ordered-dispatch`; the
   dispatchers interleaved all five or nine kernels, so the bands did not go in order.
+- `step5b_bounds/`: what is left after split-K. `model.txt` (`scripts/step5b_model.py`, no
+  runs): a work-group list-scheduling model (32 slots, times from the Step 5 traces) feeding
+  the queue model; bounds for an even tile stream and a search over a split factor per tile
+  row. `runs/` (`scripts/step5b_runs.sh`, `summary.txt` from `scripts/step5b_summary.py`):
+  B. `warm_plain`, `warm_s2`: 1 GPU, GEMM alone, launched twice (`-warmup`), with
+  `-mem-timeline`. Plain round-1 work-groups take 171.1 us cold and 142.7 warm (round 2:
+  136.8 / 133.3); cold round 1 reads 397 KB from DRAM (6,196 L2 misses, 104 L2-TLB misses),
+  warm about 0. Warm, split s = 2 no longer speeds the GEMM up (281 vs 280 us from first
+  dispatch to last end). C. `c_f05_plan`, `c_f08_plan`: `-splitk-plan 4,4,4,4,1,1,2,2`
+  (21 launches per GPU, `-cp-dispatchers 32`): 524.9 us at f≈0.5 (-9.2% vs Step 5's 578.0,
+  -17.0% vs s = 1) and 1,587.6 us at f≈0.8 (+0.1% vs 1,585.7). `repro_gemm_s2`: Step 5's
+  gemm_s2 with this binary, 334.764 vs 334.490 us (driver ordered launch). `defaults_433`:
+  432.742 us. `runs_misordered/`: the first `warm_s2`, whose second launch reached the CP out
+  of order (before the driver's ordered launch).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

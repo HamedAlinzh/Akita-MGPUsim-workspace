@@ -240,12 +240,19 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   split tile complete after all s writes (`tiletracker.Region.Partials`); the engine reads
   the s copies and adds them before sending (pre-sum) or sends each (`Config.SplitSend`).
   Queues: first-band chunks, main GEMM, last-band chunks, in that order.
+- **Split-K plan** (Step 5b; `-splitk-plan 4,4,4,4,1,1,2,2`): a split factor per row of
+  tiles, launched top to bottom, each split row as its own s launches, consecutive unsplit
+  rows as one; replaces `-splitk-ways/-splitk-rows` (which map to the same band list with
+  the same allocation and queue order). `-warmup` runs the GEMM once untimed first;
+  `-mem-timeline file` writes L1V/L2 hits and misses, TLB misses and DRAM bytes per 10 us.
 - **CP dispatch** (`-cp-dispatchers`, default 8; `-ordered-dispatch`, default off). Without
   ordered dispatch the CP's dispatchers interleave concurrent kernels' work-groups (each
   waits a few cycles after every dispatch and the others fill slots), whatever the launch
   order; with it a kernel dispatches only after every earlier one has dispatched all its
   work-groups, like one kernel in work-group ID order. More than 8 concurrent kernels per
   GPU need more dispatchers, or the extra kernel takes a freed low-index dispatcher.
+  `-ordered-dispatch` also makes the driver send each GPU's launches in enqueue order
+  (`Driver.OrderedLaunch`): queues race otherwise (see the flush gotcha below).
 - **`-wg-trace file`** (`samples/allreducegemm`): CSV of every work-group's dispatch and
   completion time; `scripts/step5_wgs.py` summarizes it per kernel.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
@@ -257,6 +264,10 @@ Gotchas that cost time before:
 - Akita's PCIe link bandwidth is whole bytes per cycle at the network clock, so very low or
   fractional bandwidths need a lower network frequency.
 - In a pattern for `pkill -f`, the pattern also matches the shell running it; kill by PID.
+- The driver marks every buffer L2-dirty at each launch and never clears it, and its
+  overlap test counts touching ranges, so after the first launch most host copies (including
+  each launch's argument copies) first flush L2 (write back, lines stay valid). Queues whose
+  copies flush fall behind, so launches on different queues can reach the CP out of order.
 - Don't edit a shell script while a service is running it: bash reads it as it goes, and the
   edit broke the Step 5 batch mid-run.
 
@@ -289,6 +300,7 @@ unchanged.
 | 3 | Reduction placement: (a) owner reduces via engine, (b) T3-style near memory; tile size × N with GCN3-native and matrix-core compute curves | Done: `results/step3_tiles/` |
 | 3b | Dispatch-shaping spike (`-wg-cap`, `-wg-ramp`) and the 4-GPU per-pair mesh | Done: `results/step4a_shaping/` |
 | 5 | Split-K first and last bands (no new kernel), s = 2 and 4 | Done: `results/step5_splitk/`. f≈0.5: s = 2 578 us (-8.6%), s = 4 612 (-3.2%), no pre-sum 658 (+4.0%); f≈0.8: -4.8% / -6.5% |
+| 5b | Queue-model bounds, cold vs warm first round, per-row split plan | Done: `results/step5b_bounds/`. Even-stream bound 490 us at f≈0.5 (-15% vs 578), 1,591 at f≈0.8 (+0.4%); plan 4,4,4,4,1,1,2,2: 524.9 us at f≈0.5 (-9.2%), f≈0.8 unchanged; slow first round is mostly cold caches |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
 | 6 | MoE all-to-all extension (design note section only) | Not started |
 

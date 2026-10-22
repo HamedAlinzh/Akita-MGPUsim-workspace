@@ -86,6 +86,8 @@ type LaunchKernelCommand struct {
 	Packet     *kernels.HsaKernelDispatchPacket
 	DPacket    Ptr
 	Reqs       []sim.Msg
+
+	seq int // enqueue order on its GPU, for Driver.OrderedLaunch
 }
 
 // GetID returns the ID of the command

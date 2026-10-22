@@ -154,8 +154,8 @@ func (b R9NanoPlatformBuilder) WithNumDispatchers(n int) R9NanoPlatformBuilder {
 	return b
 }
 
-// WithOrderedDispatch makes every CP dispatch work-groups in kernel launch
-// order.
+// WithOrderedDispatch makes the driver send each GPU's launches in enqueue
+// order and every CP dispatch work-groups in launch order.
 func (b R9NanoPlatformBuilder) WithOrderedDispatch(on bool) R9NanoPlatformBuilder {
 	b.orderedDispatch = on
 	return b
@@ -300,6 +300,7 @@ func (b R9NanoPlatformBuilder) Build() *Platform {
 	mmuComponent, pageTable := b.createMMU(b.engine)
 
 	gpuDriver := b.buildGPUDriver(pageTable)
+	gpuDriver.OrderedLaunch = b.orderedDispatch
 
 	gpuBuilder := b.createGPUBuilder(b.engine, gpuDriver, mmuComponent)
 	pcieConnector, rootComplexID :=

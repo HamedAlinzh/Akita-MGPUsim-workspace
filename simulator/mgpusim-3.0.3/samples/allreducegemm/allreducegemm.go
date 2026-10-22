@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"log"
+	"strconv"
+	"strings"
 
 	"github.com/sarchlab/mgpusim/v3/benchmarks/allreducegemm"
 	"github.com/sarchlab/mgpusim/v3/benchmarks/mccl"
@@ -53,11 +55,18 @@ var splitKWaysFlag = flag.Int("splitk-ways", 0,
 		"across this many work-groups (0 = off).")
 var splitKRowsFlag = flag.Uint("splitk-rows", 0,
 	"Rows in each split-K band.")
+var splitKPlanFlag = flag.String("splitk-plan", "",
+	`With -engine-mode: a split factor per row of tiles, top to bottom, e.g.
+"4,4,4,4,1,1,2,2" (replaces -splitk-ways and -splitk-rows).`)
 var splitKPresumFlag = flag.String("splitk-presum", "on",
 	`"on": the engine adds a tile's split-K partials before sending it; "off":
 it sends each partial and the owner adds them.`)
 var wgTraceFlag = flag.String("wg-trace", "",
 	"Write every work-group's dispatch and completion time to this CSV.")
+var memTimelineFlag = flag.String("mem-timeline", "",
+	"Write cache hits and misses, TLB misses and DRAM bytes per 10 us to this CSV.")
+var warmupFlag = flag.Bool("warmup", false,
+	"With -engine-mode: run the GEMM once, untimed, before the measured launch.")
 var tileSizeFlag = flag.Uint("tile-size", 0,
 	"Work-group edge T; each work-group computes a 4T x 4T tile (0 = 8).")
 var perBandScratchFlag = flag.Bool("per-band-scratch", false,
@@ -85,6 +94,16 @@ func main() {
 	benchmark.SmallTilesPerMsg = *smallTilesPerMsgFlag
 	benchmark.SplitKWays = *splitKWaysFlag
 	benchmark.SplitKRows = uint32(*splitKRowsFlag)
+	benchmark.Warmup = *warmupFlag
+	if *splitKPlanFlag != "" {
+		for _, f := range strings.Split(*splitKPlanFlag, ",") {
+			s, err := strconv.Atoi(strings.TrimSpace(f))
+			if err != nil {
+				log.Panicf("bad -splitk-plan %q: %v", *splitKPlanFlag, err)
+			}
+			benchmark.SplitKPlan = append(benchmark.SplitKPlan, s)
+		}
+	}
 	mccl.CollectiveThreads = *collectiveThreadsFlag
 
 	if runner.EngineMode != "" {
@@ -106,6 +125,10 @@ func main() {
 	if *wgTraceFlag != "" {
 		wgs := traceWGs(runner.Platform())
 		atexit.Register(func() { wgs.write(*wgTraceFlag) })
+	}
+	if *memTimelineFlag != "" {
+		mt := traceMemory(runner.Platform(), 10)
+		atexit.Register(func() { mt.write(*memTimelineFlag) })
 	}
 
 	runner.AddBenchmark(benchmark)

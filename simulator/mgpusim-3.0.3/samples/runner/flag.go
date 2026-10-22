@@ -86,8 +86,9 @@ var wgRampFlag = flag.Int("wg-ramp", 0,
 var cpDispatchersFlag = flag.Int("cp-dispatchers", 8,
 	"Kernels each command processor dispatches at once.")
 var orderedDispatchFlag = flag.Bool("ordered-dispatch", false,
-	"Dispatch work-groups in kernel launch order: a kernel waits until "+
-		"every earlier kernel has dispatched all of its work-groups.")
+	"Send each GPU's kernel launches in enqueue order, and dispatch work-groups "+
+		"in launch order: a kernel waits until every earlier kernel has "+
+		"dispatched all of its work-groups.")
 var peerMeshFlag = flag.Bool("peer-mesh", false,
 	"Build the peer fabric as a full mesh with one link per GPU pair "+
 		"(MI300X-like) instead of one shared switch.")

@@ -11,7 +11,7 @@ import (
 
 // runSplitK all-reduces a 128x128 C (K/GPU 128) on 2 GPUs with the engines,
 // its first and last 32-row bands split s ways, and verifies it.
-func runSplitK(t *testing.T, s int, splitSend bool) {
+func runSplitK(t *testing.T, s int, splitSend bool, plan ...int) {
 	t.Helper()
 
 	platform := runner.MakeR9NanoBuilder().
@@ -34,6 +34,9 @@ func runSplitK(t *testing.T, s int, splitSend bool) {
 	b := allreducegemm.NewBenchmark(d)
 	b.M, b.K, b.N = 128, 256, 128
 	b.SplitKWays, b.SplitKRows = s, 32
+	if plan != nil {
+		b.SplitKWays, b.SplitKRows, b.SplitKPlan = 0, 0, plan
+	}
 	b.Comm = commengine.NewSession(d, parts)
 	b.CommOptions = commengine.Options{
 		TilesPerMsg: 1, Mode: commengine.ModeTile, SplitSend: splitSend}
@@ -50,7 +53,7 @@ func runSplitK(t *testing.T, s int, splitSend bool) {
 
 	// Without pre-sum, each split tile a GPU does not own costs s messages.
 	want := 8 // per direction: the 8 of 16 tiles the peer owns
-	if splitSend {
+	if splitSend && plan == nil {
 		want += 4 * (s - 1) // 2 of them in each split band
 	}
 	count := map[[2]int]int{}
@@ -75,4 +78,5 @@ func TestSplitK(t *testing.T) {
 			runSplitK(t, c.s, c.splitSend)
 		})
 	}
+	t.Run("plan=4,1,1,2", func(t *testing.T) { runSplitK(t, 0, false, 4, 1, 1, 2) })
 }

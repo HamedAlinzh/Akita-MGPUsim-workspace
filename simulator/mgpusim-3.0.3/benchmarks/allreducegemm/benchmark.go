@@ -126,6 +126,16 @@ type Benchmark struct {
 	SplitKWays int
 	SplitKRows uint32
 
+	// SplitKPlan, if set, replaces SplitKWays and SplitKRows with a split
+	// factor for every row of tiles, launched top to bottom: each split
+	// row as its own K chunks, consecutive unsplit rows as one launch.
+	SplitKPlan []int
+
+	// Warmup runs the GEMM (with Comm) once, untimed and without the
+	// engines, before the measured launch, so it starts with warm caches
+	// and TLBs.
+	Warmup bool
+
 	// OnPartialC, if set, is called for each GPU once its partial C is
 	// allocated and A and B are copied, before any GEMM launch.
 	OnPartialC func(ctx *driver.Context, g, gpuID int, c driver.Ptr)
@@ -242,12 +252,12 @@ func (b *Benchmark) exec() {
 		if b.SmallRows > 0 {
 			smallQs = append(smallQs, b.driver.CreateCommandQueue(b.context))
 		}
-		if b.SplitKWays > 1 {
+		if b.splitKOn() {
 			splits[g] = b.newSplitK(aSlice, bSlice, gB)
 		}
 		cmdQs[g] = b.driver.CreateCommandQueue(b.context)
-		if b.SplitKWays > 1 {
-			splits[g].createLastQueues(b)
+		if b.splitKOn() {
+			splits[g].createLaterQueues(b)
 		}
 
 		if b.OnPartialC != nil {
@@ -267,7 +277,7 @@ func (b *Benchmark) exec() {
 			b.launchSmallFirst(gAs, gBs, partialC, cmdQs, smallQs, kSlice)
 			return
 		}
-		if b.SplitKWays > 1 {
+		if b.splitKOn() {
 			b.launchSplitK(gAs, gBs, partialC, cmdQs, splits, kSlice)
 			return
 		}
@@ -301,8 +311,10 @@ func (b *Benchmark) exec() {
 			if sk == nil {
 				continue
 			}
-			for _, q := range append(sk.firstQs, sk.lastQs...) {
-				b.driver.DrainCommandQueue(q)
+			for _, qs := range sk.queues {
+				for _, q := range qs {
+					b.driver.DrainCommandQueue(q)
+				}
 			}
 		}
 		for _, q := range cmdQs {
@@ -340,7 +352,7 @@ func (b *Benchmark) exec() {
 	}
 
 	if b.Comm != nil {
-		if b.SplitKWays > 1 {
+		if b.splitKOn() {
 			b.CommOptions.Partials = make([][]tiletracker.Partial, numGPU)
 			for g, sk := range splits {
 				b.CommOptions.Partials[g] = sk.partials
@@ -412,6 +424,11 @@ func (b *Benchmark) execFused(
 	if b.BandRows != 0 && b.BandRows != b.M || b.Overlap {
 		log.Panic("the communication engine runs one GEMM over all of M; " +
 			"do not set BandRows or Overlap")
+	}
+
+	if b.Warmup {
+		launch(0)
+		drain()
 	}
 
 	tileEdge := 4 * b.tileSize()
@@ -492,52 +509,112 @@ func (b *Benchmark) collectFused(partialC []driver.Ptr, tileEdge uint32) {
 	}
 }
 
-// splitK is one GPU's split-K state: A cut into K chunks, the partial C
-// buffers of chunks 1.., and the queues of the split bands.
+// splitBand is a band of rows of C computed by one launch (s = 1) or by s
+// launches, one per K chunk.
+type splitBand struct {
+	row, rows uint32
+	s         int
+}
+
+func (b *Benchmark) splitKOn() bool {
+	return b.SplitKWays > 1 || len(b.SplitKPlan) > 0
+}
+
+// splitBands lists the bands in launch order.
+func (b *Benchmark) splitBands() []splitBand {
+	if len(b.SplitKPlan) == 0 {
+		r, s := b.SplitKRows, b.SplitKWays
+		return []splitBand{{0, r, s}, {r, b.M - 2*r, 1}, {b.M - r, r, s}}
+	}
+	edge := 4 * b.tileSize()
+	var bands []splitBand
+	for i, s := range b.SplitKPlan {
+		row := uint32(i) * edge
+		if n := len(bands); s == 1 && n > 0 && bands[n-1].s == 1 {
+			bands[n-1].rows += edge
+			continue
+		}
+		bands = append(bands, splitBand{row, edge, s})
+	}
+	return bands
+}
+
+// splitK is one GPU's split-K state: A cut into K chunks for every split
+// factor, the partial C buffers of chunks 1.. of every split band, and each
+// band's queues (nil for the first unsplit band, which uses the main one).
 type splitK struct {
-	aChunks  []driver.Ptr // M x K/s each
-	bChunks  []driver.Ptr // offsets into the GPU's B
+	bands    []splitBand
+	aChunks  map[int][]driver.Ptr // by s: M x K/s each
+	bChunks  map[int][]driver.Ptr // by s: offsets into the GPU's B
 	partials []tiletracker.Partial
-	firstQs  []*driver.CommandQueue
-	lastQs   []*driver.CommandQueue
+	bandPart [][]tiletracker.Partial
+	queues   [][]*driver.CommandQueue
 }
 
 // newSplitK copies A in K chunks to the selected GPU, allocates the partial
-// buffers and creates the first band's queues.
+// buffers and creates the queues of the bands before the first unsplit one.
 func (b *Benchmark) newSplitK(aSlice, bSlice *matrix, gB driver.Ptr) *splitK {
-	s := uint32(b.SplitKWays)
-	chunk := aSlice.Width / s
-	sk := &splitK{}
-	for j := uint32(0); j < s; j++ {
-		a := aSlice.columnSlice(j*chunk, (j+1)*chunk)
-		gA := b.driver.AllocateMemory(b.context, uint64(len(a.Data)*4))
-		b.driver.MemCopyH2D(b.context, gA, a.Data)
-		sk.aChunks = append(sk.aChunks, gA)
-		sk.bChunks = append(sk.bChunks,
-			gB+driver.Ptr(uint64(j*chunk)*uint64(bSlice.Width)*4))
-	}
-	for _, row := range []uint32{0, b.M - b.SplitKRows} {
-		for j := uint32(1); j < s; j++ {
-			buf := b.driver.AllocateMemory(b.context, uint64(b.SplitKRows*b.N*4))
-			sk.partials = append(sk.partials, tiletracker.Partial{
-				VBase: uint64(buf), Row: row, Rows: b.SplitKRows})
+	sk := &splitK{bands: b.splitBands(),
+		aChunks: map[int][]driver.Ptr{}, bChunks: map[int][]driver.Ptr{}}
+	for _, band := range sk.bands {
+		if band.s == 1 || sk.aChunks[band.s] != nil {
+			continue
+		}
+		s := uint32(band.s)
+		chunk := aSlice.Width / s
+		for j := uint32(0); j < s; j++ {
+			a := aSlice.columnSlice(j*chunk, (j+1)*chunk)
+			gA := b.driver.AllocateMemory(b.context, uint64(len(a.Data)*4))
+			b.driver.MemCopyH2D(b.context, gA, a.Data)
+			sk.aChunks[band.s] = append(sk.aChunks[band.s], gA)
+			sk.bChunks[band.s] = append(sk.bChunks[band.s],
+				gB+driver.Ptr(uint64(j*chunk)*uint64(bSlice.Width)*4))
 		}
 	}
-	for j := uint32(0); j < s; j++ {
-		sk.firstQs = append(sk.firstQs, b.driver.CreateCommandQueue(b.context))
+	for _, band := range sk.bands {
+		var parts []tiletracker.Partial
+		for j := 1; j < band.s; j++ {
+			buf := b.driver.AllocateMemory(b.context, uint64(band.rows*b.N*4))
+			parts = append(parts, tiletracker.Partial{
+				VBase: uint64(buf), Row: band.row, Rows: band.rows})
+		}
+		sk.bandPart = append(sk.bandPart, parts)
+		sk.partials = append(sk.partials, parts...)
+	}
+	sk.queues = make([][]*driver.CommandQueue, len(sk.bands))
+	for i, band := range sk.bands {
+		if band.s == 1 {
+			break
+		}
+		sk.createQueues(b, i)
 	}
 	return sk
 }
 
-func (sk *splitK) createLastQueues(b *Benchmark) {
-	for j := 0; j < b.SplitKWays; j++ {
-		sk.lastQs = append(sk.lastQs, b.driver.CreateCommandQueue(b.context))
+func (sk *splitK) createQueues(b *Benchmark, i int) {
+	for j := 0; j < sk.bands[i].s; j++ {
+		sk.queues[i] = append(sk.queues[i], b.driver.CreateCommandQueue(b.context))
 	}
 }
 
-// launchSplitK launches, on every GPU, the first band's K chunks, the main
-// GEMM over the middle rows and the last band's K chunks, in that order.
-// The CP gives earlier kernels first claim on free CU slots.
+// createLaterQueues creates the queues of the bands after the first
+// unsplit one, which uses the main queue.
+func (sk *splitK) createLaterQueues(b *Benchmark) {
+	main := -1
+	for i, band := range sk.bands {
+		if main < 0 && band.s == 1 {
+			main = i
+			continue
+		}
+		if main >= 0 {
+			sk.createQueues(b, i)
+		}
+	}
+}
+
+// launchSplitK launches, on every GPU, every band's launches in band order.
+// With ordered dispatch the CP gives earlier kernels first claim on free CU
+// slots.
 func (b *Benchmark) launchSplitK(
 	gAs, gBs, partialC []driver.Ptr,
 	cmdQs []*driver.CommandQueue, splits []*splitK, kSlice uint32,
@@ -557,24 +634,29 @@ func (b *Benchmark) launchSplitK(
 				BlockA:  edge * edge * 4,
 			})
 	}
-	s := uint32(b.SplitKWays)
-	r := b.SplitKRows
 	for g, gpuID := range b.gpus {
 		b.driver.SelectGPU(b.context, gpuID)
 		sk := splits[g]
-		band := func(qs []*driver.CommandQueue, rowStart uint32, partials []tiletracker.Partial) {
-			for j := uint32(0); j < s; j++ {
-				c := partialC[g] + driver.Ptr(uint64(rowStart)*uint64(b.N)*4)
-				if j > 0 {
-					c = driver.Ptr(partials[j-1].VBase)
+		for i, band := range sk.bands {
+			cBand := partialC[g] + driver.Ptr(uint64(band.row)*uint64(b.N)*4)
+			if band.s == 1 {
+				q := cmdQs[g]
+				if sk.queues[i] != nil {
+					q = sk.queues[i][0]
 				}
-				launch(qs[j], sk.aChunks[j], sk.bChunks[j], c, kSlice/s, rowStart, r)
+				launch(q, gAs[g], gBs[g], cBand, kSlice, band.row, band.rows)
+				continue
+			}
+			s := uint32(band.s)
+			for j := 0; j < band.s; j++ {
+				c := cBand
+				if j > 0 {
+					c = driver.Ptr(sk.bandPart[i][j-1].VBase)
+				}
+				launch(sk.queues[i][j], sk.aChunks[band.s][j], sk.bChunks[band.s][j],
+					c, kSlice/s, band.row, band.rows)
 			}
 		}
-		band(sk.firstQs, 0, sk.partials[:s-1])
-		launch(cmdQs[g], gAs[g], gBs[g],
-			partialC[g]+driver.Ptr(uint64(r)*uint64(b.N)*4), kSlice, r, b.M-2*r)
-		band(sk.lastQs, b.M-r, sk.partials[s-1:])
 	}
 }
 
@@ -662,14 +744,25 @@ func (b *Benchmark) bandRows() uint32 {
 // kernel's internal loop counts silently truncate and produce wrong
 // results rather than erroring.
 func (b *Benchmark) validateDimensions(numGPU uint32) {
-	if b.SplitKWays > 1 {
-		s, tile := uint32(b.SplitKWays), 4*b.tileSize()
-		if b.Comm == nil || b.SmallRows > 0 || b.SplitKRows%tile != 0 ||
-			b.SplitKRows == 0 || 2*b.SplitKRows >= b.M ||
-			(b.K/numGPU)%(s*tile) != 0 || b.CommOptions.Placement != commengine.OwnerEngine {
-			log.Panicf("split-K needs the engines (owner placement), a band "+
-				"of a multiple of %d rows below M/2, and K/GPU a multiple of %d",
-				tile, s*tile)
+	if b.splitKOn() {
+		tile := 4 * b.tileSize()
+		bad := b.Comm == nil || b.SmallRows > 0 ||
+			b.CommOptions.Placement != commengine.OwnerEngine
+		if len(b.SplitKPlan) == 0 {
+			bad = bad || b.SplitKRows%tile != 0 || b.SplitKRows == 0 ||
+				2*b.SplitKRows >= b.M
+		} else {
+			bad = bad || b.SplitKWays > 1 || uint32(len(b.SplitKPlan))*tile != b.M
+		}
+		if !bad {
+			for _, band := range b.splitBands() {
+				bad = bad || band.s < 1 || (b.K/numGPU)%(uint32(band.s)*tile) != 0
+			}
+		}
+		if bad {
+			log.Panicf("split-K needs the engines (owner placement), and either "+
+				"bands of a multiple of %d rows below M/2 or one split factor per "+
+				"row of tiles, with K/GPU a multiple of %d x the factor", tile, tile)
 		}
 	}
 	if b.SmallRows > 0 && (b.SmallRows%(4*b.tileSize()) != 0 ||

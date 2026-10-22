@@ -59,6 +59,39 @@ type Driver struct {
 	isCurrentlyMigratingOnePage     bool
 
 	RemotePMCPorts []sim.Port
+
+	// OrderedLaunch sends each GPU's kernel launches to it in the order
+	// the host enqueued them, across command queues. Otherwise a launch is
+	// sent when its queue gets to it, and queues whose argument copies
+	// need an L2 flush fall behind others.
+	OrderedLaunch bool
+	launchMutex   sync.Mutex
+	launchSeq     map[int]int // per GPU: launches enqueued
+	launchSent    map[int]int // per GPU: launches sent
+}
+
+// takeLaunchSeq numbers a launch on a GPU in enqueue order.
+func (d *Driver) takeLaunchSeq(gpuID int) int {
+	d.launchMutex.Lock()
+	defer d.launchMutex.Unlock()
+	if d.launchSeq == nil {
+		d.launchSeq, d.launchSent = map[int]int{}, map[int]int{}
+	}
+	seq := d.launchSeq[gpuID]
+	d.launchSeq[gpuID]++
+	return seq
+}
+
+// launchInTurn tells whether a launch may be sent under OrderedLaunch, and
+// if so counts it as sent.
+func (d *Driver) launchInTurn(gpuID, seq int) bool {
+	d.launchMutex.Lock()
+	defer d.launchMutex.Unlock()
+	if d.launchSent[gpuID] != seq {
+		return false
+	}
+	d.launchSent[gpuID]++
+	return true
 }
 
 // Run starts a new threads that handles all commands in the command queues
@@ -275,6 +308,9 @@ func (d *Driver) processOneCommand(
 
 	switch cmd := cmd.(type) {
 	case *LaunchKernelCommand:
+		if d.OrderedLaunch && !d.launchInTurn(cmdQueue.GPUID, cmd.seq) {
+			return false
+		}
 		d.logCmdStart(cmd, now)
 		return d.processLaunchKernelCommand(now, cmd, cmdQueue)
 	case *NoopCommand:
