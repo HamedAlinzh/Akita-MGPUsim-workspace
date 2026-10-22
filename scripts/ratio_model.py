@@ -230,16 +230,17 @@ def points(tokens: int) -> list[Point]:
     ]
 
 
-def sim_comm_bytes(pt: Point) -> float:
-    """Bytes each simulated GPU sends: the engine's reduce-scatter sends
-    (p-1)/p of C, and the all-gather sends as much again."""
+def sim_comm_bytes(pt: Point, num_gpu: int = SIM_GPUS) -> float:
+    """Bytes each simulated GPU sends over one link. The engine's
+    reduce-scatter sends (p-1)/p of C, and the all-gather as much again; on
+    the per-pair mesh that is spread over p-1 links."""
     c = pt.m * pt.n * FP32
-    share = (SIM_GPUS - 1) / SIM_GPUS
+    share = (num_gpu - 1) / num_gpu / (num_gpu - 1)
     return c * share * (2 if pt.layer.collective == "all-reduce" else 1)
 
 
 def derive_knobs(pt: Point, f: float, latency_ns: float = REAL_MSG_LATENCY_NS,
-                 measured=None):
+                 measured=None, num_gpu: int = SIM_GPUS):
     """Simulator knobs that match f and the per-message latency ratio.
 
     1. t_comm = f / (1 - f) x measured GEMM time; the link must move this
@@ -251,7 +252,7 @@ def derive_knobs(pt: Point, f: float, latency_ns: float = REAL_MSG_LATENCY_NS,
        cycles of it."""
     t_g, first_share = measured or tracker_times(pt.m, pt.n, pt.kg, pt.cus)
     t_c = f / (1 - f) * t_g
-    bw_eff = sim_comm_bytes(pt) / (t_c * 1e-6)
+    bw_eff = sim_comm_bytes(pt, num_gpu) / (t_c * 1e-6)
     bw = bw_eff / SIM_FABRIC_EFF
     x_sim = SIM_TILE * SIM_TILE * FP32 / bw_eff * 1e9
     x_real = real_tile_transfer_ns()
@@ -386,6 +387,33 @@ def capped_points(tokens: int) -> list[Point]:
 def capped_measured():
     g = CAPPED["gemm_us"] - SIM_LAUNCH_US
     return g, (CAPPED["first_us"] - SIM_LAUNCH_US) / g
+
+
+# Step 6 points.
+# f~0.25 at the cap: 512x320 (Step 1's shape), K/GPU 256, 4 CUs, cap 8: 160
+# tiles / 32 slots = 5.0 waves (the real layer is 3.37; 384x288 would be
+# 3.375). Its capped GEMM time is not measured; it is estimated with the
+# Step 5b work-group model (launch to first dispatch 46 us, a cold first
+# round of 172 us, then 137 us per round, plus the 4.4 us tail the model
+# misses at 256x256) and checked against the bulk run.
+# f~0.5 on 4 GPUs: the same 256x256 GEMM per GPU (K/GPU 256) on the
+# per-pair mesh; the engines' direct reduce-scatter + all-gather put 2C/p on
+# each link, half of the 2-GPU load, so the knobs keep the link time and the
+# latency/transfer ratio.
+F025_CAPPED = dict(m=512, n=320, kg=256, cus=4,
+                   gemm_us=46 + 172 + 4 * 137 + 4.4, first_us=46 + 172)
+
+
+def step6_points(tokens: int):
+    f025 = points(tokens)[2]
+    c = F025_CAPPED
+    g = c["gemm_us"] - SIM_LAUNCH_US
+    out = [("f~0.25 capped", Point(f025.label, f025.layer, c["m"], c["n"], c["kg"], c["cus"]),
+            2, (g, (c["first_us"] - SIM_LAUNCH_US) / g))]
+    for pt in capped_points(tokens):
+        if pt.label == "f~0.5":
+            out.append(("f~0.5 4 GPUs", pt, 4, capped_measured()))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +613,32 @@ def main():
     print(table(cap_rows, ["point", "sim_shape", "sim_gemm_us", "sim_comm_us",
                            "link_bw_gbps", "link_latency_ns", "latency_cycles",
                            "msg_overhead_ns"]))
+
+    # 2c. Step 6 points.
+    s6 = []
+    for label, pt, gpus, measured in step6_points(args.tokens):
+        f = pt.layer.frac()
+        k = derive_knobs(pt, f, measured=measured, num_gpu=gpus)
+        s6.append(dict(
+            point=label, layer=f"{pt.layer.model.name} {pt.layer.gemm}",
+            collective=pt.layer.collective, gpus=gpus, real_f=round(f, 3),
+            sim_f=round(k["t_comm_us"] / (k["t_comm_us"] + k["t_gemm_us"]), 3),
+            real_LX=round(REAL_MSG_LATENCY_NS / x_real, 2), sim_LX=round(k["ratio"], 2),
+            real_waves=round(pt.layer.waves, 2),
+            sim_waves=round((pt.m // SIM_TILE) * (pt.n // SIM_TILE) / (pt.cus * CAP), 2),
+            sim_shape=f"{pt.m}x{pt.n}, K/GPU {pt.kg}", sim_gemm_us=round(k["t_gemm_us"], 1),
+            sim_comm_us=round(k["t_comm_us"], 1),
+            link_bw_gbps=round(k["link_bw_gbps"], 4),
+            link_latency_ns=round(k["link_latency_ns"]),
+            msg_overhead_ns=round(k["msg_overhead_ns"]),
+            latency_cycles=k["latency_cycles"]))
+    write_csv(os.path.join(args.outdir, "points_step6.csv"), s6)
+    print(f"\n2c. Step 6 points (-gemm-wg-cap {CAP}, tileSize 8, 4 CUs; f~0.25 GEMM "
+          "time estimated)")
+    print(table(s6, ["point", "collective", "gpus", "real_f", "sim_f", "real_LX", "sim_LX",
+                     "real_waves", "sim_waves"]))
+    print(table(s6, ["point", "sim_shape", "sim_gemm_us", "sim_comm_us", "link_bw_gbps",
+                     "link_latency_ns", "latency_cycles", "msg_overhead_ns"]))
 
     # 4. MoE.
     moe = moe_rows()

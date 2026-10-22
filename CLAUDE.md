@@ -301,6 +301,7 @@ unchanged.
 | 3b | Dispatch-shaping spike (`-wg-cap`, `-wg-ramp`) and the 4-GPU per-pair mesh | Done: `results/step4a_shaping/` |
 | 5 | Split-K first and last bands (no new kernel), s = 2 and 4 | Done: `results/step5_splitk/`. f≈0.5: s = 2 578 us (-8.6%), s = 4 612 (-3.2%), no pre-sum 658 (+4.0%); f≈0.8: -4.8% / -6.5% |
 | 5b | Queue-model bounds, cold vs warm first round, per-row split plan | Done: `results/step5b_bounds/`. Even-stream bound 490 us at f≈0.5 (-15% vs 578), 1,591 at f≈0.8 (+0.4%); plan 4,4,4,4,1,1,2,2: 524.9 us at f≈0.5 (-9.2%), f≈0.8 unchanged; slow first round is mostly cold caches |
+| 6 | Paper-ready split plan: warm/cold, f≈0.25, 4 GPUs, MI300X projection | Done: `results/step6_paper/`. Plan vs s = 1: f≈0.25 -3.7%, f≈0.5 -17.0% cold / -15.5% warm, 4 GPUs -16.4%, f≈0.8 -6.4%; model within 0.5-4.3% |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
 | 6 | MoE all-to-all extension (design note section only) | Not started |
 
@@ -348,6 +349,12 @@ Representative points (user-approved; use only these in Step 4 and later sweeps)
 | f≈0.8 | Llama-3 70B attn out-proj all-reduce | 384×256×512 | 0.1807 | 1904 | 9163 |
 | f≈0.5 | Llama-3 70B MLP down-proj all-reduce | 384×256×512 | 0.6325 | 544 | 2618 |
 | f≈0.25 | Llama-3.1 405B MLP down-proj reduce-scatter | 512×320×512 | 1.1504 | 299 | 1440 |
+
+Step 6 knobs (`results/step0_ratio/points_step6.csv`): f≈0.25 at the cap, 512x320,
+reduce-scatter, `-link-bw 1.632 -link-latency 211 -msg-overhead 1015` (GEMM time estimated,
+achieved f 0.246); f≈0.5 on 4 GPUs (`-peer-mesh`, K/GPU 256), `-link-bw 0.3903 -link-latency
+881 -msg-overhead 4243` (the direct reduce-scatter + all-gather puts 2C/p on each link, so
+half the bandwidth keeps the link time; latency and overhead double to keep the ratio).
 
 Latency/transfer for a 1-tile message is matched to the real 0.39 (1 µs DMA copy = 172 ns wire
 + 828 ns engine, MI300A data; 128 KiB tile at 51.2 GB/s); the sensitivity range is 0.27–0.78.

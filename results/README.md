@@ -120,9 +120,79 @@ Layout: one subfolder per experiment.
   gemm_s2 with this binary, 334.764 vs 334.490 us (driver ordered launch). `defaults_433`:
   432.742 us. `runs_misordered/`: the first `warm_s2`, whose second launch reached the CP out
   of order (before the driver's ordered launch).
+- `step6_paper/`: the per-row split plan, made paper-ready. `model.txt` from
+  `scripts/step6_model.py` (work-group schedule + per-link message queues; also the MI300X
+  projection, model only); `runs/` from `scripts/step6_runs.sh`, `summary.txt` from
+  `scripts/step6_summary.py`. Every split run and its s = 1 baseline use `-ordered-dispatch`
+  (CP order and driver launch order) and `-cp-dispatchers 32`; every run verifies. Runs:
+  1. `warm_f05_s1`, `warm_f05_plan`: f≈0.5, 2 GPUs, s = 1 and plan 4,4,4,4,1,1,2,2, both
+     with `-warmup`.
+  2. `f025_tile_s1`, `f025_bulk_s1`, `f025_tile_plan`: f≈0.25, 512x320, K/GPU 256, cap 8,
+     reduce-scatter, knobs from `points_step6.csv`; the plan is the model's best after
+     recalibrating work-group times on `f025_tile_s1`.
+  3. `f05_4gpu_tile_s1`, `f05_4gpu_tile_plan`: f≈0.5 shape on 4 GPUs (`-peer-mesh`, K/GPU
+     256), knobs from `points_step6.csv`, plan 4,4,4,4,1,1,2,2 (the model's best, tied).
+  4. `defaults_433`: default flags, expect 432.742 us.
+
+  Result (all verify; defaults 432.742 us). Gain of the plan over s = 1 / over engine bulk:
+  f≈0.25 (cold, reduce-scatter, plan 2,2,1x10,2,2) -3.7% / -24.0% (785.5 vs 815.5 / 1,033.4
+  us; achieved f 0.246); f≈0.5 cold -17.0% / -33.1%, warm -15.5% (516.1 vs 610.8 us);
+  f≈0.5 on 4 GPUs -16.4% (559.2 vs 669.0 us); f≈0.8 cold -6.4% / -14.1%. The model
+  (`model.txt`) predicted every Step 6 run within -0.5% to +4.3% (it reads high). Cold = A,
+  B and C all cold in L2 and TLBs (first launch); warm = all warm (second launch); a real
+  layer, with weights from HBM and activations possibly warm, lies between. The f≈0.25 sim
+  shape is 5.0 waves at cap 8 (the real layer 3.37). MI300X projection (model only, split
+  costs assumed from the simulator): -8.4% at f≈0.8, -22.6% at f≈0.5, -11.6% at f≈0.25, the
+  last mostly from a shorter GEMM tail (wave quantization), not overlap.
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
   launch count) and always on 2 GPUs. Kept for the record only.
 - `allreducegemm/`: **outdated.** Metrics from manual `samples/allreducegemm` runs taken with
   the same pre-`3be1037` benchmark.
+
+## MGPUSim v3 issues found (simulator lessons)
+
+Problems in stock MGPUSim v3.0.3 / Akita v3.0.0 (or its benchmarks) that changed results in
+this project, in the order found. Fixes are on branch `All-reduce`; new behavior is behind
+flags where it would change old results.
+
+1. **L1 vector caches are never invalidated between kernels.** L1s are not coherent and the
+   dispatcher's CU rotation continues across kernels, so a kernel could read stale lines
+   another kernel's writes made obsolete (wrong 4-GPU overlap results). Fix: the CP
+   invalidates every L1V at each launch and dispatches after all acknowledge (`-l1-acquire`,
+   on by default; `8d33e6c`).
+2. **mccl collectives ran on one GPU.** `createCommandQueues` created every communicator's
+   queue on the last-selected GPU, so all push/reduce kernels of Ring All-Reduce and
+   Broadcast ran there (`141ff40`).
+3. **Upstream `mmmKernel_local` indexes A by the local Y id,** correct only for a single
+   work-group row; any multi-row launch reads wrong rows of A. Patched binary in
+   `benchmarks/allreducegemm` (`3be1037`); the copy in `benchmarks/amdappsdk/` still has it.
+4. **Memory requests carry PID 0 after address translation.** The L2 caches hold every
+   line under PID 0, so a component issuing physical-address requests with the process's
+   PID misses the dirty lines and reads stale DRAM data (the engine first read zeros).
+   Anything below the translators must use PID 0 (`fda18d0`).
+5. **The multi-GPU fabric is one shared switch with one endpoint per GPU.** A GPU's traffic
+   to different peers shares one port, so head-of-line blocking serializes its links; there
+   is no per-peer link as on MI300X. Fix: `-peer-mesh`, one two-GPU network per pair, with
+   per-peer RDMA routes and engine links (`0e73c0c`).
+6. **Over-occupancy.** The dispatcher fills a CU up to the VGPR limit (12 GEMM work-groups),
+   which oversubscribes it: capping at 8 makes the GEMM 19-23% faster. Not a bug, but the
+   default is not the fastest configuration; results use `-gemm-wg-cap 8` (`0e73c0c`,
+   `818f115`).
+7. **The CP interleaves concurrent kernels' work-groups, whatever the launch order.** Each
+   of its 8 dispatchers waits a few cycles after every dispatch and the others fill CU
+   slots meanwhile; a 9th kernel waits for a freed dispatcher and, taking the lowest index,
+   gets the highest priority. Fix: `-ordered-dispatch` (a kernel dispatches only after every
+   earlier one has dispatched all its work-groups) and `-cp-dispatchers` (`13bae25`).
+8. **The driver never clears L2-dirty flags, so argument copies flush L2.** Every launch
+   marks all buffers L2-dirty, nothing marks them clean, and the overlap test counts
+   touching ranges, so after the first launch most host copies, including each launch's
+   kernel-argument copies, first flush L2 (write back; lines stay valid). Queues whose
+   copies flush fall behind, so launches on different queues reach the CP out of order.
+   Fix: `-ordered-dispatch` also makes the driver send each GPU's launches in enqueue order
+   (`f23ed3f`); the flush itself is unchanged, since fixing it would change every old result.
+9. Smaller ones: Akita's link bandwidth is whole bytes per cycle at the network clock, so
+   low or fractional bandwidths need a lower network frequency; component name indices must
+   be integers; MGPUSim v3 loads only code object v2; `total_time` varies by about 4 ns
+   between identical runs (the measured windows are exact).
