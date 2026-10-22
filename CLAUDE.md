@@ -310,13 +310,14 @@ unchanged.
 | 2 | Send engine, per-tile reduce-scatter + all-gather, `-tiles-per-msg N`; verify at N = 1, 2, 4 | Done: `timing/commengine`, `results/step2_engine/` |
 | 3 | Reduction placement: (a) owner reduces via engine, (b) T3-style near memory; tile size × N with GCN3-native and matrix-core compute curves | Done: `results/step3_tiles/` |
 | 3b | Dispatch-shaping spike (`-wg-cap`, `-wg-ramp`) and the 4-GPU per-pair mesh | Done: `results/step4a_shaping/` |
-| 5 | Split-K first and last bands (no new kernel), s = 2 and 4 | Done: `results/step5_splitk/`. f≈0.5: s = 2 578 us (-8.6%), s = 4 612 (-3.2%), no pre-sum 658 (+4.0%); f≈0.8: -4.8% / -6.5% |
-| 5b | Queue-model bounds, cold vs warm first round, per-row split plan | Done: `results/step5b_bounds/`. Even-stream bound 490 us at f≈0.5 (-15% vs 578), 1,591 at f≈0.8 (+0.4%); plan 4,4,4,4,1,1,2,2: 524.9 us at f≈0.5 (-9.2%), f≈0.8 unchanged; slow first round is mostly cold caches |
-| 6 | Paper-ready split plan: warm/cold, f≈0.25, 4 GPUs, MI300X projection | Done: `results/step6_paper/`. Plan vs s = 1: f≈0.25 -3.7%, f≈0.5 -17.0% cold / -15.5% warm, 4 GPUs -16.4%, f≈0.8 -6.4%; model within 0.5-4.3% |
-| 7 | Baselines and model validation (batch 1 of 3) | Done: `results/step7_baselines/`. Software overlap: plan +35% vs s = 1 (gain does not survive). 8 GPUs: plan -13.3% vs s = 1, -68.9% vs direct software. Rank test Spearman 0.97, chosen plan = best measured. MI300X f≈0.5 gain < 10% only at 1.63x split cost |
-| 8 | Realistic software baseline and edge cases (batch 2 of 3) | Batch A done (`results/step8_edges/`): event-driven model (mean error 1.5%); splits help software overlap only below ~20 us per call; f sweep -14% / -13% / -3% at f 0.35 / 0.65 / 0.9; shapes, K 128/512, 9 rows, reduce-scatter all keep the gain (-6.5% to -20.2%), model within -3.2% to +1.5% |
-| 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
-| 6 | MoE all-to-all extension (design note section only) | Not started |
+| 5 | Split-K first and last bands (no new kernel), s = 2 and 4 | Done, `13bae25`: `results/step5_splitk/`. f≈0.5: s = 2 578 us (-8.6%), s = 4 612 (-3.2%), no pre-sum 658 (+4.0%); f≈0.8: -4.8% / -6.5% |
+| 5b | Queue-model bounds, cold vs warm first round, per-row split plan | Done, `f23ed3f`: `results/step5b_bounds/`. Even-stream bound 490 us at f≈0.5 (-15% vs 578), 1,591 at f≈0.8 (+0.4%); plan 4,4,4,4,1,1,2,2: 524.9 us at f≈0.5 (-9.2%), f≈0.8 unchanged; slow first round is mostly cold caches |
+| 6 | Paper-ready split plan: warm/cold, f≈0.25, 4 GPUs, MI300X projection | Done, `fab2f71`: `results/step6_paper/`. Plan vs s = 1: f≈0.25 -3.7%, f≈0.5 -17.0% cold / -15.5% warm, 4 GPUs -16.4%, f≈0.8 -6.4%; model within 0.5-4.3% |
+| 7 | Baselines and model validation (batch 1 of 3) | Done, `dee876c`: `results/step7_baselines/`. Software overlap: plan +35% vs s = 1 (gain does not survive). 8 GPUs: plan -13.3% vs s = 1, -68.9% vs direct software. Rank test Spearman 0.97, chosen plan = best measured. MI300X f≈0.5 gain < 10% only at 1.63x split cost |
+| 8 | Realistic software baseline and edge cases (batch 2 of 3) | Done, `aaa48da` + `706d7b1`: `results/step8_edges/`. Event-driven model (mean error 1.5%); splits help software overlap only below ~20 us per call (published RCCL minimum ~20 us); f sweep -14% / -13% / -3% at f 0.35 / 0.65 / 0.9; shapes, K 128/512, 9 rows, reduce-scatter all keep the gain (-6.5% to -20.2%), model within -3.2% to +1.5% |
+| 9 | Other layer patterns (batch 3 of 3) | Not started |
+| 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Mostly covered by the capped baseline (`results/step4b_capped/`: mccl ring, engine bulk, engine tile) and Steps 5-8; near-memory (b) not rerun at the cap |
+| 10 | MoE all-to-all extension (design note section only) | Not started |
 
 Step requirements, as the user set them:
 1. **Tracker spike.** One GPU, tracker only. Every output tile reports complete exactly once,
@@ -386,7 +387,38 @@ Waves = tiles / (CUs × resident work-groups per CU); check spread with the trac
 tileSize 8, K/GPU 256: 384×256 (2.0 waves) and 512×320 (3.3 waves). A 16-CU 768×512 run
 (also 2.0 waves) has the same spread, so 4 CUs is not a toy.
 
-Findings that shape the design (details in `reports/gemm-allreduce-overlap.html`):
+Modelling tools (Python, `scripts/`; run from the repo root, no simulations):
+- `step6_model.py`: work-group list schedule (`Gemm`: 32 slots, per-split work-group times
+  from the Step 5 traces, optional cold first round) and per-row plan search helpers;
+  `knobs()` reads every point's link knobs from `results/step0_ratio/`.
+- `step8_model.py`: the current model. `Comm` is event-driven (an owner's sum waits for every
+  partial; per-engine or per-peer lanes; wire latency calibrated as 1.07 x (overhead +
+  latency) - overhead); `PSGemm` time-shares each CU among up to 8 resident work-groups, for
+  partial last rounds. `step8_validate.py` checks it on 22 engine runs (-4.9% to +1.5%).
+  Predict every run with it before running.
+- `step7_model.py` / `step8_sw.py`: software-overlap model (F per call + bytes at eta of the
+  link, fitted to the capped mccl runs: F 277 us, eta 0.50; CU loss phi).
+- `step7_sensitivity.py`: MI300X projection over split costs.
+- Work-group time is linear in its K chunk, 5.4 + 0.514 x K us; steady split cost per
+  work-group (normalized to 8 resident) is 1.03-1.09x (s = 2) and 1.13-1.25x (s = 4) at
+  K/GPU 256, 1.18x / 1.42x at 128.
+
+Findings from Steps 5-8:
+- The per-row split plan (pick it with the model; 4,4,4,4,1,1,2,2 at f≈0.5) beats s = 1
+  with the hardware engine everywhere tried: 2, 4 and 8 GPUs (-17%, -17%, -13%), warm and cold,
+  f 0.35-0.9 (-14% to -3%), 1.5-3.4 waves, K/GPU 128-512, 9 tile rows, reduce-scatter.
+- The gain comes from the first tile ready earlier and the link kept busy, not from faster
+  work-groups (residency is 8 per CU in every band). Part of Step 5's GEMM speedup was the
+  cold first round (172 vs 137 us per work-group), which warm caches remove.
+- Software overlap does not get it: at ~277 us per mccl call (138 us of it launches) and
+  collectives slowing the GEMM about 2x, splitting makes it worse (+35%). Splits only help
+  software once a call costs about 20 us or less, and software still trails the engine by
+  50-67% at its 50% link efficiency.
+- Model rank order matches measurement (Spearman 0.97); its chosen plan was the best measured.
+- MI300X projection (model only): f≈0.5 gain stays above 10% unless both split costs exceed
+  about 1.63x; no published per-split cost exists for MI300X or MI250.
+
+Earlier findings (details in `reports/gemm-allreduce-overlap.html`):
 - Banding a GEMM to overlap All-Reduce never beat one launch: extra launches, low-occupancy
   short GEMMs, and collective kernels competing for CUs. This holds at `-h2d-cycles` 1450.
 - Ring All-Reduce cost is per-launch setup plus latency-bound kernels; the link is busy under
