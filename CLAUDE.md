@@ -314,6 +314,7 @@ unchanged.
 | 5b | Queue-model bounds, cold vs warm first round, per-row split plan | Done: `results/step5b_bounds/`. Even-stream bound 490 us at f≈0.5 (-15% vs 578), 1,591 at f≈0.8 (+0.4%); plan 4,4,4,4,1,1,2,2: 524.9 us at f≈0.5 (-9.2%), f≈0.8 unchanged; slow first round is mostly cold caches |
 | 6 | Paper-ready split plan: warm/cold, f≈0.25, 4 GPUs, MI300X projection | Done: `results/step6_paper/`. Plan vs s = 1: f≈0.25 -3.7%, f≈0.5 -17.0% cold / -15.5% warm, 4 GPUs -16.4%, f≈0.8 -6.4%; model within 0.5-4.3% |
 | 7 | Baselines and model validation (batch 1 of 3) | Done: `results/step7_baselines/`. Software overlap: plan +35% vs s = 1 (gain does not survive). 8 GPUs: plan -13.3% vs s = 1, -68.9% vs direct software. Rank test Spearman 0.97, chosen plan = best measured. MI300X f≈0.5 gain < 10% only at 1.63x split cost |
+| 8 | Realistic software baseline and edge cases (batch 2 of 3) | Batch A done (`results/step8_edges/`): event-driven model (mean error 1.5%); splits help software overlap only below ~20 us per call; f sweep -14% / -13% / -3% at f 0.35 / 0.65 / 0.9. Batch B (shapes, K, reduce-scatter) running |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Not started |
 | 6 | MoE all-to-all extension (design note section only) | Not started |
 

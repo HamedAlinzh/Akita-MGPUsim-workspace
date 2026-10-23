@@ -176,6 +176,40 @@ Layout: one subfolder per experiment.
   split-cost sensitivity: the f≈0.5 gain stays above 10% when either split keeps its
   measured cost (the search uses the other), and falls below 10% at 1.63x when both cost
   the same; no published per-split cost exists for MI300X or MI250.
+- `step8_edges/`: realistic software baseline and edge cases (batch 2 of 3). Model: the
+  Step 6 work-group schedule with an event-driven message model (`scripts/step8_model.py`;
+  `scripts/step8_validate.py` checks it on 22 past runs); every run is predicted before it
+  runs. `mccl_breakdown.txt` (`scripts/step8_mccl_breakdown.py`), `sw_sweep.txt`
+  (`scripts/step8_sw.py`), `fsweep.txt` (`scripts/step8_fsweep.py`): model only. `runs/` from
+  `scripts/step8_runs.sh`; split runs and their s = 1 baselines use `-ordered-dispatch`
+  and `-cp-dispatchers 40`, 4- and 8-GPU engine runs `-engine-peer-queues`; every run
+  verifies. Batch A (items 0 and 2):
+  1. `x4_s1_pq`, `x4_plan_pq`: Step 6's 4-GPU f≈0.5 engine runs (s = 1, plan 4,4,4,4,1,1,2,2)
+     with `-engine-peer-queues`.
+  2. `f035_s1`, `f035_plan`, `f065_s1`, `f065_plan`, `f090_s1`, `f090_plan`: 2 GPUs, f = 0.35,
+     0.65, 0.9 (knobs from `fsweep.txt`), s = 1 and the model's best plan at that f.
+
+  Batch A result (all 8 verify): 4 GPUs with per-peer queues s = 1 641.4 us, plan 531.5 us
+  (-17.1%; Step 6 with one queue 669.0 / 559.2). f sweep, plan vs s = 1: -14.4% at f 0.35,
+  -12.9% at 0.65, -3.3% at 0.9 (model -18.7%, -14.5%, -3.8%; model errors -3.5% to +1.5%).
+  Model fix: the Step 6 tail (a full round trip after the last link finish) double-counted
+  the last transfer, which grows with the per-message cost (+10.3% at 8 GPUs); messages are
+  now simulated with the sum waiting for every partial (22 past runs: -4.9% to +1.5%, mean
+  |error| 1.5%, was 3.0%). One mccl call (128 KB band, 2 GPUs): 530 us = 138 launch (68 host
+  copies) + 211 transfer + 163 push beyond transfer + 17 reduce; nothing in it is an mccl
+  artifact removable without new kernels (the driver's per-launch code-object copy is about
+  23 us per call), so the software runs were not repeated. Software sweep: splits help from
+  about 20 us per call (RCCL point-to-point minimum on MI300A, arXiv 2508.11298): -5.6% at the
+  measured CU loss, -9.2% with none; still 50-67% behind the engine, mostly from the
+  software path's 50% link efficiency (at the engine's 79%, 5 us and no CU loss: within 4.8%).
+
+  Batch B (items 3 and 4; `scripts/step8_runs_b.sh`, knobs and plans from `batchb.txt`,
+  `scripts/step8_batchb.py`; f ≈ 0.555 unless noted, latency/transfer 0.39), each as `_s1`
+  and `_plan` (the model's best plan):
+  3. `w15` 192x256 (1.5 waves), `w337` 384x288 (3.375 waves), `r9` 288x256 (9 tile rows,
+     2.25 waves), `k128` and `k512` (256x256 at K/GPU 128 and 512).
+  4. `rs05`, `rs08`: reduce-scatter only (`-reduce-scatter`) at f ≈ 0.555 and 0.814.
+  5. `defaults_433`: default flags, expect 432.742 us.
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
