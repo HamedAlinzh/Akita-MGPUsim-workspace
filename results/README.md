@@ -294,6 +294,21 @@ Layout: one subfolder per experiment.
   172 at 4 CUs; later rounds 148.9 against 137), so the s = 1 GEMM takes 462.3 us against
   360 at 4 CUs, and here the plan's GEMM is shorter (386.5 us): unlike at 4 CUs, part of the
   gain is the GEMM's own (`model.txt`).
+
+  Step 10b (same settings and binary; predictions `predictions_10b.txt` from the Step 9
+  software model with its saved constants, not refitted):
+  3. `fo_s1`, `fo_plan`: FlashOverlap-style, `-sw-comm-cus 1`, s = 1 and the engine's plan
+     4,2,2,2,2,2,2,1,1,1,1,1,1,2,2,4, sixteen 32-row groups (the model's partition for both).
+  4. `wab_s1`, `wab_plan`: engine s = 1 and plan with `-warmup -warmup-skip-b`.
+
+  Step 10b result (all 4 verify; `model.txt`): FlashOverlap-style s = 1 999.7 us (model
+  -3.1%), plan 943.4 us (-4.3%): the plan helps at 1 comm CU of 16 (-5.6%; at 1 of 4 it
+  hurt, +3.0%). GEMM inside the software run vs beside the engine: s = 1 506.8 against
+  462.3 us (+9.6%), plan 389.4 against 386.5 (+0.8%). Link efficiency of the software path
+  0.480 (s = 1) and 0.422 (plan). A and C warm, engine: s = 1 715.3 us (-12.9%), plan
+  525.9 us (-2.3%), -26.5%, of which the GEMM part is -10.8% (436.0 -> 358.5 us) and the
+  overlap part -15.6%; cold: -23.7% = GEMM -10.5% + overlap -13.2%. Engine plan vs
+  software plan, cold: -41.8%. Wall time 213-301 s per run (the warm-up runs about 300 s).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
