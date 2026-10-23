@@ -418,6 +418,9 @@ Modelling tools (Python, `scripts/`; run from the repo root, no simulations):
 - `step9_model.py`: FlashOverlap-style path (GEMM on the CUs comm leaves, per-group direct
   all-reduce at the calibrated link efficiency, contention when several groups overlap) and the
   Step 9 run list; `step9_allgather.py`: all-gather-before-GEMM queue model.
+- `step10_model.py`: the 16-CU point (knob derivation, engine plan search over the structured
+  16-row family with at most 36 launches, the Step 9 software model on 16 x 16 tiles with its
+  saved constants) and the Step 10 run list.
 - `step8_model.py`: the engine model. `Comm` is event-driven (an owner's sum waits for every
   partial; per-engine or per-peer lanes; wire latency calibrated as 1.07 x (overhead +
   latency) - overhead); `PSGemm` time-shares each CU among up to 8 resident work-groups, for
@@ -455,6 +458,20 @@ Findings from Step 9:
 - With A and C warm and B cold (streamed weights) the plan still gains 17.1%.
 - `step9_model.py` covers the software path (calibrated on cal_one / cal_rows); it misses the
   8-GPU CU limit (-74%) and the plan's pre-sum contention (about -10%).
+
+Findings from Step 10 (16 CUs per GPU, 512x512, K/GPU 256, 2.0 waves, knobs `-link-bw 3.1218
+-link-latency 110 -msg-overhead 530`, f 0.489):
+- At 1 comm CU of 16 the FlashOverlap-style path still trails the engine (plan 943 vs 549 us,
+  -42%), but the plan now helps it a little (-5.6%; +3.0% at 1 of 4). The comm CU stretches the
+  s = 1 GEMM 9.6% (about 40% at 4 CUs); link efficiency stays 0.42-0.48, so one CU drives the 4x
+  faster link at 2 GPUs.
+- With 16 CUs on one L2 the cold first round is slow (262 vs 172 us per work-group), and
+  warming A and C barely helps s = 1 (715 vs 720 us). About 40% of the engine plan's gain is
+  then the GEMM getting shorter (GEMM -10.5% / -10.8% + overlap -13.2% / -15.6%, cold / A+C
+  warm); at 4 CUs it was none.
+- The models assume the 4-CU work-group times, so they under-predict 16-CU s = 1 runs by
+  11-13%; plan and software runs are within -2% to -6%.
+- 16-CU runs take 135-300 s of wall time each (about 4-5x the 4-CU runs).
 
 Earlier findings (details in `reports/gemm-allreduce-overlap.html`):
 - Banding a GEMM to overlap All-Reduce never beat one launch: extra launches, low-occupancy
