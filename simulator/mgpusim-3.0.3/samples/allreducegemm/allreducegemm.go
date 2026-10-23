@@ -106,6 +106,13 @@ var allGatherLocalFlag = flag.Bool("allgather-local", false,
 	"With -allgather-a: A is already on every GPU; one GEMM launch (the floor).")
 var allGatherMCCLFlag = flag.Bool("allgather-mccl", false,
 	"With -allgather-a: mccl's direct all-gather, then one GEMM launch.")
+var allGatherPlanFlag = flag.String("allgather-plan", "",
+	`With -allgather-a and -engine-mode: a K split factor per row of tiles in
+each GPU's arrival order, local rows first (they must be 1), e.g.
+"1,4,4,4,4,4,4,4" at 8 GPUs. A split row arrives as K chunks and runs as one
+launch per chunk; the engine adds the partials into C.`)
+var allGatherNoSumFlag = flag.Bool("allgather-no-sum", false,
+	"With -allgather-plan: skip the partial sums (C will not verify; shows their cost).")
 var perBandScratchFlag = flag.Bool("per-band-scratch", false,
 	"Give every band its own All-Reduce scratch buffers.")
 
@@ -183,8 +190,9 @@ func main() {
 
 	if *allGatherAFlag {
 		allGatherSetup(runner, benchmark)
-	} else if *allGatherBulkFlag || *allGatherLocalFlag || *allGatherMCCLFlag {
-		log.Panic("-allgather-bulk, -allgather-local and -allgather-mccl need -allgather-a")
+	} else if *allGatherBulkFlag || *allGatherLocalFlag || *allGatherMCCLFlag ||
+		*allGatherPlanFlag != "" || *allGatherNoSumFlag {
+		log.Panic("the other -allgather-* flags need -allgather-a")
 	}
 
 	if *wgTraceFlag != "" {
@@ -274,6 +282,16 @@ func allGatherSetup(r *runner.Runner, b *allreducegemm.Benchmark) {
 	default:
 		b.AllGather = allreducegemm.AllGatherRows
 	}
+	if *allGatherPlanFlag != "" {
+		for _, f := range strings.Split(*allGatherPlanFlag, ",") {
+			s, err := strconv.Atoi(strings.TrimSpace(f))
+			if err != nil {
+				log.Panicf("bad -allgather-plan %q: %v", *allGatherPlanFlag, err)
+			}
+			b.AllGatherPlan = append(b.AllGatherPlan, s)
+		}
+	}
+	b.AllGatherNoSum = *allGatherNoSumFlag
 	if b.AllGather == allreducegemm.AllGatherRows || b.AllGather == allreducegemm.AllGatherBulk {
 		if r.EngineMode == "" {
 			log.Panic("-allgather-a needs -engine-mode unless -allgather-local or -allgather-mccl")

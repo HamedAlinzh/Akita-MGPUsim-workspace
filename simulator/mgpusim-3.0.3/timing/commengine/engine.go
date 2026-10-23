@@ -162,6 +162,7 @@ type TileMsg struct {
 	Reduced bool
 	From    int
 	Part    int // which copy of a split-K tile, with SplitSend
+	Parts   int // push: the K chunks the band is cut into; Part is the chunk
 	Data    []byte
 
 	record *MsgRecord
@@ -178,7 +179,7 @@ type MsgRecord struct {
 	Group        int
 	Reduced      bool
 	From, To     int
-	Part         int
+	Part, Parts  int
 	PayloadBytes int
 	TrafficBytes int
 	// Queued: the data is read and the message waits for the engine.
@@ -537,7 +538,13 @@ func (e *Engine) sum(parts [][]byte) []byte {
 // enqueueReduce charges the engine's adder for adds additions of a group's
 // worth of data, then calls onDone.
 func (e *Engine) enqueueReduce(g, adds int, onDone func(now sim.VTimeInSec)) {
-	lines := (e.tileBytes*len(e.groups[g]) + 63) / 64
+	e.enqueueAdds(e.tileBytes*len(e.groups[g]), adds, onDone)
+}
+
+// enqueueAdds charges the engine's adder for adds additions of bytes of
+// data, then calls onDone.
+func (e *Engine) enqueueAdds(bytes, adds int, onDone func(now sim.VTimeInSec)) {
+	lines := (bytes + 63) / 64
 	e.reduceQ = append(e.reduceQ, &reduceJob{
 		cyclesLeft: lines * e.reduceCyclesPerLine * adds,
 		onDone:     onDone,
@@ -686,7 +693,7 @@ func (e *Engine) enqueueUpdate(g int, data []byte) {
 func (e *Engine) enqueueSend(
 	now sim.VTimeInSec, g int, reduced bool, to, part int, data []byte,
 	onSent func(now sim.VTimeInSec),
-) {
+) *TileMsg {
 	rec := &MsgRecord{
 		Group: g, Reduced: reduced, From: e.cfg.GPU, To: to, Part: part,
 		PayloadBytes: len(data), TrafficBytes: len(data) + msgHeaderBytes,
@@ -704,6 +711,7 @@ func (e *Engine) enqueueSend(
 		lane = e.lanes[to]
 	}
 	lane.q = append(lane.q, msg)
+	return msg
 }
 
 // sendLane is a queue of messages waiting for the engine's per-message

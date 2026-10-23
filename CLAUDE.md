@@ -300,6 +300,14 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   push start; launches are enqueued at the same time (their ~46 us driver latency is in the
   window, but held launches wait at the CP during the push). `CommandProcessor
   .MaxBusyDispatchers` counts dispatchers in use (logged as `allgather dispatchers`).
+- **Input-side split plan** (Step 13; `-allgather-plan 1,4,...` per row of tiles in each GPU's
+  arrival order, local rows 1; `-allgather-no-sum`). A split remote row is pushed as s K-chunk
+  messages (`PushSend.Parts`, `TileMsg.Parts`) into the receiver's chunk buffers (M x K/s, the
+  kernel's `WidthA` is both K length and A's stride) with `gpuN/a/rowR/chunkC` signals, and
+  runs as s held launches via `Benchmark.launchRows` (shared with the reduce side's split-K
+  launches): chunk 0 writes C, the others partial buffers. The engine adds a row's partials
+  into C (`PushSum`, `Engine.OnRowTile`) once the tracker, armed on C with the partials,
+  reports every tile of the row complete; the engine finishes after the last sum.
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -360,7 +368,7 @@ unchanged.
 | 10 | FlashOverlap-style baseline at a realistic CU share (16 CUs, 1 comm CU) | Done, 10 + 10b (`results/step10_cushare/`). 512x512 cold: software s = 1 / plan 999.7 / 943.4 us, engine 719.9 / 549.1 us (engine plan -41.8% vs software plan). The plan helps software at 1/16 CU (-5.6%). Comm CU stretches the s = 1 GEMM 9.6%. Engine plan gain = GEMM about -11% + overlap about -13 to -16% (cold and A+C warm): slow cold first round with 16 CUs on one L2 |
 | 11 | Plan gain split vs CU count and cache state | Done, `8f1e357`: `results/step11_firstround/`. All warm at 16 CUs the plan gains -12.9% = GEMM +5.7% + overlap -18.6% (as at 4 CUs); cold 4 / 8 / 16 CUs: GEMM part +2.3% / +0.3% / -10.5%. The 16-CU GEMM part is the cold first round (round-1 work-groups 1.76x the later ones cold, 1.07x warm): nearly every first-round L2 read misses or merges into an in-flight miss; not DRAM queueing, not TLB. Model with measured round times: s = 1 error 3.9% -> 0.8%, plans 2.5% -> 2.1% |
 | 12 | All-gather of A before the GEMM on the engines, s = 1 | Done: `results/step12_allgather/`. 2 GPUs gather-then-GEMM 649.8 / per-row 401.4 us (model 696.2 / 421.5); 8 GPUs 662.0 / 604.9 (709.4 / 640.2); GEMM alone 361.1 / 362.3 (355.0); mccl all-gather + GEMM 931.9 (2 GPUs). Push at 0.79 of the link (0.76 at 8 GPUs from the push start) |
-| 13 | Split rows on the input side (K-chunk messages) | Next |
+| 13 | K-chunk splits of the remote rows in the all-gather (`-allgather-plan`) | Done: `results/step13_allgather_split/`. 8 GPUs 1,4,4,4,4,4,4,4 434.9 us (-28.1% vs s = 1 604.9, floor 362.3), s = 2 504.8, s = 8 474.6; 2 GPUs last row s = 4 367.1 (-8.6% vs 401.4), s = 2 374.5. Model 1-10% high. Partial sum 4.1 us per s = 4 row alone, +5.3 us on the 8-GPU window |
 | - | MoE all-to-all extension (design note section only) | Not started |
 
 Step requirements, as the user set them:
@@ -493,6 +501,19 @@ knobs 2 GPUs `-link-bw 0.487 -link-latency 707 -msg-overhead 3403`, 8 GPUs `0.12
   after another (signals 354.8 to 357.9 us, about 0.5 us per 32 KB row).
 - mccl's direct all-gather + GEMM (2 GPUs) is 931.9 us (gather 584.8), 1.43x gather-then-GEMM
   on the engines and 2.3x per-row overlap.
+
+Findings from Step 13 (same config as Step 12):
+- Splitting the remote rows by K pays at 8 GPUs: s = 4 on all 7 remote rows 434.9 us, -28.1% vs
+  s = 1 and -13.8% vs s = 2 (504.8), 20% above the floor; every remote row starts at 103 us
+  (first chunk) instead of 355. s = 8 is worse (474.6): 57 launches per GPU reach the CP only
+  at ~82 us, after their first chunks, and 7 sums of 8 copies queue on the engine.
+- At 2 GPUs splitting the last remote row s = 4 gives 367.1 us (-8.6% vs s = 1, 1.7% above the
+  floor); s = 2 374.5.
+- Partial sum: 4.13 us (s = 4) / 2.08 us (s = 2) per row when alone, as modelled ((s + 1) x
+  0.512 us traffic + (s - 1) x 0.512 us adds); rows finishing together queue on the one engine;
+  +5.3 us on the 8-GPU s = 4 window. 224 held launches (28 per GPU), at most 12 dispatchers busy.
+- `scripts/step13_allgather.py` (Step 9 queue model + sum pass) over-predicts by 1-10% (-9.8%
+  at s = 4, 8 GPUs); adding the sum moved it +0.5% to +2.6% (s = 8 +9.3%), away from the runs.
 
 Findings from Step 10 (16 CUs per GPU, 512x512, K/GPU 256, 2.0 waves, knobs `-link-bw 3.1218
 -link-latency 110 -msg-overhead 530`, f 0.489):

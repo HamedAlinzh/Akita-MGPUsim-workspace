@@ -388,6 +388,48 @@ Layout: one subfolder per experiment.
   GPU), at most 7 of 40 dispatchers busy, every launch at the CP about 50 us after the start
   (before its row), released within 4 ns of its signal (no dispatcher limit). Wall time
   22-23 s (2 GPUs), 109-119 s (8 GPUs).
+- `step13_allgather_split/`: K-chunk splits of the remote rows in the all-gather before the
+  GEMM (the input-side split-K plan). Same config and knobs as `step12_allgather/`; the Step
+  12 runs are reused for s = 1, gather-then-GEMM and the floor. New code: `-allgather-plan`
+  (a split factor per row of tiles in each GPU's arrival order, local rows first and 1); a
+  remote row split s ways is pushed as s messages in K order (32 rows x K/s of A each) into
+  the receiver's K chunk buffers (M x K/s, since the kernel's `WidthA` is both the K length
+  and A's row stride, as on the reduce side), raising `gpuN/a/rowR/chunkC`, and runs as s
+  launches through the reduce side's launch code (now `Benchmark.launchRows`), each held on
+  its chunk; chunk 0 writes C, the others partial buffers. A new engine job adds a split
+  row's partials into C once the tile tracker reports every tile of the row complete in all
+  copies (the reduce side's tracker setup); the engine, and so the window, finishes only
+  after the last sum. `-allgather-no-sum` skips the sums (C then does not verify).
+  Predictions from `scripts/step13_allgather.py` (the Step 9 queue model plus a partial-sum
+  pass: (s + 1) x 0.512 us of engine memory traffic per row, from Step 12's measured row
+  write, + (s - 1) x 0.512 us of adds, rows one after another), runs from
+  `scripts/step13_runs.sh`:
+  1. `g8_s4`: 8 GPUs, plan 1,4,4,4,4,4,4,4 (model 469.8 us without the sum, 482.1 with it).
+  2. `g8_s2`: 8 GPUs, 1,2,2,2,2,2,2,2 (525.2 / 531.4 us).
+  3. `g8_s4_nosum`: `g8_s4` with `-allgather-no-sum`; does not verify, only shows the sum's
+     cost (469.8 us).
+  4. `g2_last4`: 2 GPUs, 1,1,1,1,1,1,1,4 (397.2 / 401.3 us).
+  5. `g2_last2`: 2 GPUs, 1,1,1,1,1,1,1,2 (405.1 / 407.1 us).
+  6. `g8_s8`: 8 GPUs, 1,8,8,8,8,8,8,8, only if `g8_s4` beats `g8_s2` by more than 3% (s = 8
+     work-group times extrapolated in the model).
+  7. `defaults_433`: default flags, expect 432.742 us.
+
+  Result (all verify except `g8_s4_nosum`, as expected; defaults 432.742 us; `summary.txt`).
+  Measured / model with the sum (us): 8 GPUs s = 4 434.9 / 482.1 (-9.8%), s = 2 504.8 / 531.4
+  (-5.0%), s = 8 474.6 / 480.7 (-1.3%), s = 4 without the sum 429.6 / 469.8; 2 GPUs last row
+  s = 4 367.1 / 401.3 (-8.5%), s = 2 374.5 / 407.1 (-8.0%). Against Step 12 at 8 GPUs (s = 1
+  604.9, gather-then-GEMM 662.0, floor 362.3): s = 4 -28.1% vs s = 1, 20% above the floor;
+  at 2 GPUs (401.4 / 649.8 / 361.1) last row s = 4 -8.6%, 1.7% above the floor. The sum pass
+  moves the model +0.5% to +2.6% (s = 8 +9.3%), away from the runs: the model already
+  over-predicts by charging the launch after the data. Partial sums: 4.13 us per s = 4 row
+  and 2.08 us per s = 2 row alone (the model's 4.10 / 2.05); rows that finish together
+  queue on the engine (8 GPUs s = 4: 4.1-8.6 us each, mean 6.0; s = 8: 8.9-24.5, mean
+  15.5); on the window +5.3 us (g8_s4 vs g8_s4_nosum). 8 GPUs s = 4: first launch of every
+  remote row released at 103 us (first chunk in L2), last chunk in L2 at 355-356 us; 224
+  held launches (28 per GPU), at most 12 of 40 dispatchers busy, none late beyond the L1
+  acquire (at most 117 ns). s = 8 is slower than s = 4: its 57 launches per GPU reach the CP
+  at about 82 us, after their first chunks (56 launches late), and its 7 sums (each 1 row + 7
+  partials) queue on the engine (tail 17 us). Wall time 22-25 s (2 GPUs), 126-162 s (8).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

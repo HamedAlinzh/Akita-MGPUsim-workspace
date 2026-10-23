@@ -115,6 +115,16 @@ type PushOptions struct {
 	// Order lists a GPU's sends given the bands it owns (nil: DirectOrder).
 	Order   func(gpu, numGPU int, own []int) []PushSend
 	Signals *signal.Board
+	// Parts gives the K chunks band is sent to participant to in (nil: 1),
+	// and Chunks[to][s] are to's s chunk buffers (rows x cols/s each).
+	Parts  func(to, band int) int
+	Chunks []map[int][]driver.Ptr
+	// Sums[i] are GPU i's partial sums (PushSum) of the rows of C[i], a
+	// row-major matrix of rows x CCols floats that GPU i's tracker watches
+	// in BandRows x BandRows tiles, with each sum's sources as partials.
+	Sums  [][]PushSum
+	C     []driver.Ptr
+	CCols uint32
 }
 
 // ArmPush programs every GPU's engine to all-gather a row-major matrix of
@@ -134,6 +144,10 @@ func (s *Session) ArmPush(
 	if order == nil {
 		order = DirectOrder
 	}
+	parts := opt.Parts
+	if parts == nil {
+		parts = func(int, int) int { return 1 }
+	}
 
 	s.mu.Lock()
 	s.numDone = 0
@@ -149,18 +163,72 @@ func (s *Session) ArmPush(
 		for k := range own {
 			own[k] = i*per + k
 		}
+		sends := order(i, n, own)
+		for k := range sends {
+			sends[k].Parts = parts(sends[k].To, sends[k].Band)
+		}
+		receives := 0
+		for b := 0; b < bands; b++ {
+			if b/per != i {
+				receives += parts(i, b)
+			}
+		}
+
 		pages := map[uint64]uint64{}
 		mapPages(s.driver, ctx, pages, uint64(as[i]), uint64(rows)*uint64(cols)*4)
+		chunks := map[int][]uint64{}
+		if opt.Chunks != nil {
+			for k, bufs := range opt.Chunks[i] {
+				for _, b := range bufs {
+					chunks[k] = append(chunks[k], uint64(b))
+					mapPages(s.driver, ctx, pages, uint64(b), uint64(rows*cols/uint32(k))*4)
+				}
+			}
+		}
+		var sums []PushSum
+		if opt.Sums != nil {
+			sums = opt.Sums[i]
+		}
+		if len(sums) > 0 {
+			var partials []tiletracker.Partial
+			for _, sum := range sums {
+				for _, src := range sum.Srcs {
+					partials = append(partials, tiletracker.Partial{VBase: src,
+						Row: uint32(sum.Row) * opt.BandRows, Rows: opt.BandRows})
+				}
+			}
+			region := TrackRegion(s.driver, ctx, uint64(opt.C[i]), rows, opt.CCols,
+				opt.BandRows, partials)
+			region.IgnoreLate = true
+			for pp, v := range region.PageMap {
+				pages[pp] = v
+			}
+			p.Tracker.Arm(region)
+			p.Tracker.ClearListeners()
+			p.Tracker.AddLocalListener(p.Engine.OnRowTile)
+			p.Tracker.IgnoreSrc(p.Engine.ToMem)
+		}
+
 		p.Engine.Arm(Config{
 			GPU: i, NumGPU: n, Peers: peers, Out: out,
 			VBase: uint64(as[i]), Rows: rows, Cols: cols,
 			VToP:   translator(pages, log2),
 			OnDone: s.engineDone,
-			Push: &PushConfig{BandRows: opt.BandRows, Sends: order(i, n, own),
-				Receives: (n - 1) * per, Signals: opt.Signals},
+			Push: &PushConfig{BandRows: opt.BandRows, Sends: sends,
+				Receives: receives, Signals: opt.Signals, Chunks: chunks,
+				Sums: sums, RowTiles: int(opt.CCols / opt.BandRows)},
 		})
 		p.Engine.TickLater(now)
 	}
+}
+
+// SumRecords returns every partial sum of the last push.
+func (s *Session) SumRecords() []SumRecord {
+	var out []SumRecord
+	for _, p := range s.parts {
+		out = append(out, p.Engine.SumRecords()...)
+	}
+	return out
 }
 
 // ports gives participant i's destination port at each peer and the port

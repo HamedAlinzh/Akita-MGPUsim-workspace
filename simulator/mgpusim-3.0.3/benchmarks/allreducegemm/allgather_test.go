@@ -12,19 +12,23 @@ import (
 
 // TestAllGather gathers A (128x128, K 128) before the GEMM in every mode and
 // verifies each GPU's C = A x B_local; with the engines every remote row's
-// launch is held and released only after its row has arrived.
+// (or K chunk's) launch is held and released only after its data has
+// arrived, and every split row's partials are summed.
 func TestAllGather(t *testing.T) {
 	for _, c := range []struct {
 		mode allreducegemm.AllGatherMode
 		gpus int
+		plan []int
 	}{
-		{allreducegemm.AllGatherRows, 2},
-		{allreducegemm.AllGatherRows, 4},
-		{allreducegemm.AllGatherBulk, 2},
-		{allreducegemm.AllGatherLocal, 2},
-		{allreducegemm.AllGatherMCCL, 2},
+		{allreducegemm.AllGatherRows, 2, nil},
+		{allreducegemm.AllGatherRows, 4, nil},
+		{allreducegemm.AllGatherRows, 2, []int{1, 1, 4, 2}},
+		{allreducegemm.AllGatherRows, 4, []int{1, 2, 4, 1}},
+		{allreducegemm.AllGatherBulk, 2, nil},
+		{allreducegemm.AllGatherLocal, 2, nil},
+		{allreducegemm.AllGatherMCCL, 2, nil},
 	} {
-		t.Run(fmt.Sprintf("%s/%dgpus", c.mode, c.gpus), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/%dgpus/plan%v", c.mode, c.gpus, c.plan), func(t *testing.T) {
 			engines := c.mode == allreducegemm.AllGatherRows ||
 				c.mode == allreducegemm.AllGatherBulk
 			platform := runner.MakeR9NanoBuilder().
@@ -41,7 +45,7 @@ func TestAllGather(t *testing.T) {
 
 			b := allreducegemm.NewBenchmark(d)
 			b.M, b.K, b.N = 128, 128, 128
-			b.AllGather = c.mode
+			b.AllGather, b.AllGatherPlan = c.mode, c.plan
 			var ids []int
 			var parts []commengine.Participant
 			board := signal.NewBoard(platform.Engine)
@@ -65,7 +69,15 @@ func TestAllGather(t *testing.T) {
 			want := 0
 			switch c.mode {
 			case allreducegemm.AllGatherRows:
-				want = 4 * (c.gpus - 1) // each GPU's remote rows of the 4
+				// one launch per remote row, or per chunk of a split one
+				per := 4 / c.gpus
+				for i := per; i < 4; i++ {
+					s := 1
+					if c.plan != nil {
+						s = c.plan[i]
+					}
+					want += c.gpus * s
+				}
 			case allreducegemm.AllGatherBulk:
 				want = c.gpus
 			}
@@ -73,14 +85,35 @@ func TestAllGather(t *testing.T) {
 				t.Fatalf("%d held launches, want %d", len(recs), want)
 			}
 			for _, r := range recs {
-				var g, row int
-				if _, err := fmt.Sscanf(r.Name, "gpu%d/gemm/row%d", &g, &row); err != nil {
+				var g, row, chunk int
+				wait := ""
+				if _, err := fmt.Sscanf(r.Name, "gpu%d/gemm/row%d/chunk%d", &g, &row,
+					&chunk); err == nil {
+					wait = commengine.ChunkSignal(g, row, chunk)
+				} else if _, err := fmt.Sscanf(r.Name, "gpu%d/gemm/row%d", &g, &row); err == nil {
+					wait = commengine.RowSignal(g, row)
+				} else {
 					continue
 				}
-				arrived, ok := board.RaisedAt(commengine.RowSignal(g, row))
+				arrived, ok := board.RaisedAt(wait)
 				if !ok || r.Released < arrived || r.Released < r.Held || r.Done <= r.Released {
 					t.Errorf("%s: arrived %g, held %g, released %g, done %g",
 						r.Name, arrived, r.Held, r.Released, r.Done)
+				}
+			}
+
+			wantSums := 0
+			for i, s := range c.plan {
+				if s > 1 && i >= 4/c.gpus {
+					wantSums += c.gpus
+				}
+			}
+			if engines && len(b.Comm.SumRecords()) != wantSums {
+				t.Errorf("%d partial sums, want %d", len(b.Comm.SumRecords()), wantSums)
+			}
+			for _, p := range parts {
+				if errs := p.Tracker.Errors(); len(errs) > 0 {
+					t.Fatalf("tracker errors: %v", errs[:min(3, len(errs))])
 				}
 			}
 		})

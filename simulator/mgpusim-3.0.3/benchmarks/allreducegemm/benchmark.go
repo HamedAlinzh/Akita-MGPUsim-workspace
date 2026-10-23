@@ -173,6 +173,14 @@ type Benchmark struct {
 	AllGather        AllGatherMode
 	AllGatherSignals *signal.Board
 	gatherC          [][]float32
+	agWait           map[string][]string // held launch name -> its signals
+
+	// AllGatherPlan (AllGatherRows only) splits rows of tiles by K: one
+	// factor per row in each GPU's arrival order, local rows first (1).
+	// AllGatherNoSum skips adding the partials of split rows (C is then
+	// wrong; it only shows the sum's cost).
+	AllGatherPlan  []int
+	AllGatherNoSum bool
 
 	// OnPartialC, if set, is called for each GPU once its partial C is
 	// allocated and A and B are copied, before any GEMM launch.
@@ -917,20 +925,9 @@ func (b *Benchmark) launchSplitK(
 	gAs, gBs, partialC []driver.Ptr,
 	cmdQs []*driver.CommandQueue, splits []*splitK, kSlice uint32,
 ) {
-	ts := b.tileSize()
-	edge := driver.LocalPtr(4 * ts)
 	launch := func(q *driver.CommandQueue, a, bm, c driver.Ptr,
 		widthA, rowStart, rows uint32) {
-		b.driver.EnqueueLaunchKernel(q, b.kernel,
-			[3]uint32{b.N / 4, rows / 4, 1},
-			[3]uint16{uint16(ts), uint16(ts), 1},
-			&matrixmultiplication.KernelArgs{
-				MatrixA: a + driver.Ptr(uint64(rowStart)*uint64(widthA)*4),
-				MatrixB: bm,
-				MatrixC: c,
-				WidthA:  widthA,
-				BlockA:  edge * edge * 4,
-			})
+		b.launchRows(q, b.kernel, a, bm, c, widthA, rowStart, rows)
 	}
 	for g, gpuID := range b.gpus {
 		b.driver.SelectGPU(b.context, gpuID)
@@ -956,6 +953,25 @@ func (b *Benchmark) launchSplitK(
 			}
 		}
 	}
+}
+
+// launchRows enqueues co over rows [rowStart, rowStart+rows) of C (c points
+// at the first of them), reading A at a with row stride and K length widthA
+// (a K chunk of A is its own buffer) and B at bm.
+func (b *Benchmark) launchRows(q *driver.CommandQueue, co *insts.HsaCo,
+	a, bm, c driver.Ptr, widthA, rowStart, rows uint32) {
+	ts := b.tileSize()
+	edge := driver.LocalPtr(4 * ts)
+	b.driver.EnqueueLaunchKernel(q, co,
+		[3]uint32{b.N / 4, rows / 4, 1},
+		[3]uint16{uint16(ts), uint16(ts), 1},
+		&matrixmultiplication.KernelArgs{
+			MatrixA: a + driver.Ptr(uint64(rowStart)*uint64(widthA)*4),
+			MatrixB: bm,
+			MatrixC: c,
+			WidthA:  widthA,
+			BlockA:  edge * edge * 4,
+		})
 }
 
 func (b *Benchmark) smallTileSize() uint32 {

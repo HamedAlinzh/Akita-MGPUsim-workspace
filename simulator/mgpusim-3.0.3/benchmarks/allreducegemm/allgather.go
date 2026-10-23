@@ -5,9 +5,9 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/sarchlab/akita/v3/sim"
-	"github.com/sarchlab/mgpusim/v3/benchmarks/amdappsdk/matrixmultiplication"
 	"github.com/sarchlab/mgpusim/v3/benchmarks/mccl"
 	"github.com/sarchlab/mgpusim/v3/driver"
 	"github.com/sarchlab/mgpusim/v3/insts"
@@ -26,7 +26,12 @@ const (
 	// AllGatherRows: the engines push each GPU's rows of A to every peer,
 	// one row of tiles per message, and the GEMM runs as one launch per row
 	// of tiles: local rows first, then remote rows in expected arrival
-	// order, each held at the CP until its row's arrival signal.
+	// order, each held at the CP until its row's arrival signal. With
+	// Benchmark.AllGatherPlan a remote row split s ways arrives as s K
+	// chunks into chunk buffers, and runs as s launches (one per chunk, the
+	// first writing C, the others partial buffers), each held until its
+	// chunk; the engine adds the partials into C once the tracker reports
+	// the row's tiles complete in all copies.
 	AllGatherRows AllGatherMode = "rows"
 	// AllGatherBulk: the same push, and one GEMM launch held until every
 	// remote row has arrived (gather, then GEMM).
@@ -49,10 +54,21 @@ func (b *Benchmark) validateAllGather(edge uint32) {
 	default:
 		bad = true
 	}
+	if b.AllGatherPlan != nil {
+		tileRows := int(b.M / edge)
+		per := tileRows / int(p)
+		bad = bad || b.AllGather != AllGatherRows || len(b.AllGatherPlan) != tileRows
+		for i, s := range b.AllGatherPlan {
+			bad = bad || s < 1 || i < per && s != 1 || (b.K/uint32(s))%edge != 0
+		}
+	}
+	bad = bad || b.AllGatherNoSum && b.AllGatherPlan == nil
 	if bad {
 		log.Panicf("AllGather %q needs M a multiple of %d x GPUs, N and K multiples "+
 			"of %d, the engines and a signal board for rows/bulk, and no split-K, "+
-			"small tiles, bands or warm-up", b.AllGather, edge, edge)
+			"small tiles, bands or warm-up; a plan needs rows mode, a factor per "+
+			"row of tiles with the local rows 1, and K/s a multiple of %d",
+			b.AllGather, edge, edge, edge)
 	}
 }
 
@@ -86,26 +102,20 @@ func (b *Benchmark) execAllGather() {
 		b.driver.MemCopyH2D(b.context, bs[g], bLocal.Data)
 	}
 
-	ts := b.tileSize()
 	launch := func(g int, q *driver.CommandQueue, co *insts.HsaCo, row, rows uint32) {
 		b.driver.SelectGPU(b.context, b.gpus[g])
-		e := driver.LocalPtr(edge)
-		b.driver.EnqueueLaunchKernel(q, co,
-			[3]uint32{b.N / 4, rows / 4, 1},
-			[3]uint16{uint16(ts), uint16(ts), 1},
-			&matrixmultiplication.KernelArgs{
-				MatrixA: as[g] + driver.Ptr(uint64(row)*uint64(b.K)*4),
-				MatrixB: bs[g],
-				MatrixC: cs[g] + driver.Ptr(uint64(row)*uint64(b.N)*4),
-				WidthA:  b.K,
-				BlockA:  e * e * 4,
-			})
+		b.launchRows(q, co, as[g], bs[g], cs[g]+driver.Ptr(uint64(row)*uint64(b.N)*4),
+			b.K, row, rows)
 	}
+	b.agWait = map[string][]string{}
 	held := func(wait []string, name string) *insts.HsaCo {
 		co := *b.kernel
 		co.WaitSignals, co.Signal = wait, name
+		b.agWait[name] = wait
 		return &co
 	}
+	split := b.allGatherSplits(per)
+	chunks, sums := b.allocSplitRows(split, cs, edge)
 	newQueue := func(g int) *driver.CommandQueue {
 		b.driver.SelectGPU(b.context, b.gpus[g])
 		return b.driver.CreateCommandQueue(b.context)
@@ -143,11 +153,32 @@ func (b *Benchmark) execAllGather() {
 				launches = append(launches, func() { launch(g, q, b.kernel, row, edge) })
 			}
 			for _, r := range b.remoteRows(g, per) {
-				q, row := newQueue(g), uint32(r)*edge
-				queues = append(queues, q)
-				co := held([]string{commengine.RowSignal(g, r)},
-					fmt.Sprintf("gpu%d/gemm/row%d", g, r))
-				launches = append(launches, func() { launch(g, q, co, row, edge) })
+				row, s := uint32(r)*edge, split[g][r]
+				if s == 1 {
+					q := newQueue(g)
+					queues = append(queues, q)
+					co := held([]string{commengine.RowSignal(g, r)},
+						fmt.Sprintf("gpu%d/gemm/row%d", g, r))
+					launches = append(launches, func() { launch(g, q, co, row, edge) })
+					continue
+				}
+				kc := b.K / uint32(s)
+				for c := 0; c < s; c++ {
+					q := newQueue(g)
+					queues = append(queues, q)
+					co := held([]string{commengine.ChunkSignal(g, r, c)},
+						fmt.Sprintf("gpu%d/gemm/row%d/chunk%d", g, r, c))
+					a := chunks[g][s][c]
+					bm := bs[g] + driver.Ptr(uint64(c)*uint64(kc)*uint64(b.N)*4)
+					dst := cs[g] + driver.Ptr(uint64(row)*uint64(b.N)*4)
+					if c > 0 {
+						dst = driver.Ptr(sums[g][r].Srcs[c-1])
+					}
+					launches = append(launches, func() {
+						b.driver.SelectGPU(b.context, b.gpus[g])
+						b.launchRows(q, co, a, bm, dst, kc, row, edge)
+					})
+				}
 			}
 		}
 	}
@@ -160,8 +191,23 @@ func (b *Benchmark) execAllGather() {
 		mccl.AllGatherDirect(b.driver, comms, as, shard)
 		gather = b.driver.Engine.CurrentTime() - windowStart
 	case AllGatherRows, AllGatherBulk:
-		b.Comm.ArmPush(b.context, as, b.M, b.K, commengine.PushOptions{
-			BandRows: edge, Signals: b.AllGatherSignals})
+		opt := commengine.PushOptions{BandRows: edge, Signals: b.AllGatherSignals}
+		if b.AllGatherPlan != nil {
+			opt.Parts = func(to, band int) int { return split[to][band] }
+			opt.Chunks, opt.C, opt.CCols = chunks, cs, b.N
+			if !b.AllGatherNoSum {
+				opt.Sums = make([][]commengine.PushSum, p)
+				for g := range sums {
+					for _, sum := range sums[g] {
+						opt.Sums[g] = append(opt.Sums[g], sum)
+					}
+					sort.Slice(opt.Sums[g], func(i, j int) bool {
+						return opt.Sums[g][i].Row < opt.Sums[g][j].Row
+					})
+				}
+			}
+		}
+		b.Comm.ArmPush(b.context, as, b.M, b.K, opt)
 	}
 	gemmStart := b.driver.Engine.CurrentTime()
 	for _, l := range launches {
@@ -188,6 +234,73 @@ func (b *Benchmark) execAllGather() {
 		b.driver.SelectGPU(b.context, gpuID)
 		b.driver.MemCopyD2H(b.context, b.gatherC[g], cs[g])
 	}
+}
+
+// allGatherSplits gives, by GPU, the split factor of every row of tiles:
+// AllGatherPlan by position in that GPU's arrival order (local rows first),
+// or 1 without a plan.
+func (b *Benchmark) allGatherSplits(per int) []map[int]int {
+	split := make([]map[int]int, len(b.gpus))
+	for g := range split {
+		split[g] = map[int]int{}
+		order := append([]int(nil), b.localRows(g, per)...)
+		order = append(order, b.remoteRows(g, per)...)
+		for i, r := range order {
+			split[g][r] = 1
+			if b.AllGatherPlan != nil {
+				split[g][r] = b.AllGatherPlan[i]
+			}
+		}
+	}
+	return split
+}
+
+func (b *Benchmark) localRows(g, per int) []int {
+	rows := make([]int, per)
+	for k := range rows {
+		rows[k] = g*per + k
+	}
+	return rows
+}
+
+// allocSplitRows allocates, on every GPU, the K chunk buffers of A for each
+// split factor its rows use (s buffers of M x K/s), and for every split row
+// the partial buffers of its chunks 1.. (one row of tiles of C each); sums
+// gives each split row's sum into C, by GPU and row.
+func (b *Benchmark) allocSplitRows(
+	split []map[int]int, cs []driver.Ptr, edge uint32,
+) (chunks []map[int][]driver.Ptr, sums []map[int]commengine.PushSum) {
+	chunks = make([]map[int][]driver.Ptr, len(b.gpus))
+	sums = make([]map[int]commengine.PushSum, len(b.gpus))
+	rowBytes := uint64(edge * b.N * 4)
+	for g, gpuID := range b.gpus {
+		b.driver.SelectGPU(b.context, gpuID)
+		chunks[g], sums[g] = map[int][]driver.Ptr{}, map[int]commengine.PushSum{}
+		rows := make([]int, 0, len(split[g]))
+		for r := range split[g] {
+			rows = append(rows, r)
+		}
+		sort.Ints(rows)
+		for _, r := range rows {
+			s := split[g][r]
+			if s == 1 {
+				continue
+			}
+			if chunks[g][s] == nil {
+				for c := 0; c < s; c++ {
+					chunks[g][s] = append(chunks[g][s], b.driver.AllocateMemory(b.context,
+						uint64(b.M*b.K/uint32(s)*4)))
+				}
+			}
+			sum := commengine.PushSum{Row: r,
+				Dst: uint64(cs[g]) + uint64(r)*rowBytes, Bytes: int(rowBytes)}
+			for c := 1; c < s; c++ {
+				sum.Srcs = append(sum.Srcs, uint64(b.driver.AllocateMemory(b.context, rowBytes)))
+			}
+			sums[g][r] = sum
+		}
+	}
+	return chunks, sums
 }
 
 // remoteRows lists the rows of tiles GPU g receives, in expected arrival
@@ -226,11 +339,16 @@ func (b *Benchmark) logAllGather(start, pushDone sim.VTimeInSec, per int) {
 		s.bytes += r.TrafficBytes
 		s.firstSent = min(s.firstSent, r.Sent)
 		s.lastRecv = max(s.lastRecv, r.Received)
-		raised, _ := board.RaisedAt(commengine.RowSignal(r.To, r.Group))
+		name := commengine.RowSignal(r.To, r.Group)
+		if r.Parts > 1 {
+			name = commengine.ChunkSignal(r.To, r.Group, r.Part)
+		}
+		raised, _ := board.RaisedAt(name)
 		lastArrival = max(lastArrival, raised)
-		log.Printf("allreducegemm allgather row: gpu=%d row=%d from=%d queued=%.9f "+
-			"sent=%.9f received=%.9f raised=%.9f", r.To, r.Group, r.From,
-			r.Queued-start, r.Sent-start, r.Received-start, raised-start)
+		log.Printf("allreducegemm allgather row: gpu=%d row=%d chunk=%d of=%d from=%d "+
+			"queued=%.9f sent=%.9f received=%.9f raised=%.9f", r.To, r.Group, r.Part,
+			max(1, r.Parts), r.From, r.Queued-start, r.Sent-start, r.Received-start,
+			raised-start)
 	}
 	keys := make([]link, 0, len(links))
 	for l := range links {
@@ -249,31 +367,60 @@ func (b *Benchmark) logAllGather(start, pushDone sim.VTimeInSec, per int) {
 
 	recs := board.Records()
 	for _, r := range recs {
-		var g int
-		fmt.Sscanf(r.Name, "gpu%d/", &g)
-		waited := b.waitedFor(board, r.Name, g, per)
+		var waited sim.VTimeInSec
+		for _, w := range b.agWait[r.Name] {
+			t, _ := board.RaisedAt(w)
+			waited = max(waited, t)
+		}
 		log.Printf("allreducegemm allgather launch: name=%s held=%.9f signal=%.9f "+
 			"released=%.9f done=%.9f", r.Name, r.Held-start, waited-start,
 			r.Released-start, r.Done-start)
 	}
+	b.logRemoteRows(start, recs, per)
 	log.Printf("allreducegemm allgather push: done=%.9f last_arrival=%.9f held=%d",
 		pushDone-start, lastArrival-start, len(recs))
 }
 
-// waitedFor returns when the last signal a held GEMM launch waited for was
-// raised.
-func (b *Benchmark) waitedFor(board *signal.Board, name string, g, per int) sim.VTimeInSec {
-	var row int
-	if _, err := fmt.Sscanf(name, fmt.Sprintf("gpu%d/gemm/row%%d", g), &row); err == nil {
-		t, _ := board.RaisedAt(commengine.RowSignal(g, row))
-		return t
+// logRemoteRows prints, for every remote row, when its first launch was
+// released, when its last chunk (or the row) was in L2, and its partial
+// sum's timeline (0 without one).
+func (b *Benchmark) logRemoteRows(start sim.VTimeInSec, recs []signal.Record, per int) {
+	board := b.AllGatherSignals
+	sums := map[[2]int]commengine.SumRecord{}
+	for _, s := range b.Comm.SumRecords() {
+		sums[[2]int{s.GPU, s.Row}] = s
 	}
-	var last sim.VTimeInSec
-	for _, r := range b.remoteRows(g, per) {
-		t, _ := board.RaisedAt(commengine.RowSignal(g, r))
-		last = max(last, t)
+	split := b.allGatherSplits(per)
+	for g := range b.gpus {
+		for _, r := range b.remoteRows(g, per) {
+			s := split[g][r]
+			prefix := fmt.Sprintf("gpu%d/gemm/row%d", g, r)
+			first := sim.VTimeInSec(-1)
+			for _, rec := range recs {
+				if rec.Name == prefix || strings.HasPrefix(rec.Name, prefix+"/") {
+					if first < 0 || rec.Released < first {
+						first = rec.Released
+					}
+				}
+			}
+			var inL2 sim.VTimeInSec
+			for c := 0; c < s; c++ {
+				name := commengine.RowSignal(g, r)
+				if s > 1 {
+					name = commengine.ChunkSignal(g, r, c)
+				}
+				t, _ := board.RaisedAt(name)
+				inL2 = max(inL2, t)
+			}
+			sum, ok := sums[[2]int{g, r}]
+			if !ok {
+				sum.Ready, sum.Done = start, start
+			}
+			log.Printf("allreducegemm allgather remote: gpu=%d row=%d s=%d "+
+				"first_release=%.9f last_in_l2=%.9f sum_ready=%.9f sum_done=%.9f",
+				g, r, s, first-start, inL2-start, sum.Ready-start, sum.Done-start)
+		}
 	}
-	return last
 }
 
 // verifyAllGather checks every GPU's C = A x B_local against the CPU.
