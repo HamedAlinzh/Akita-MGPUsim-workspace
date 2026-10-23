@@ -33,6 +33,10 @@
 // before sending (pre-sum), so the messages are the same as without
 // partials; with SplitSend it sends each copy in its own message and the
 // owner adds them all.
+//
+// In push mode (Config.Push, push.go) the engine all-gathers rows of a
+// matrix instead: it reads this GPU's bands from local memory, writes each
+// peer's into its own copy and raises a signal per band received.
 package commengine
 
 import (
@@ -144,6 +148,11 @@ type Config struct {
 	// OnDone is called, inside the simulation, when this engine has
 	// finished all its work.
 	OnDone func(gpu int, now sim.VTimeInSec)
+
+	// Push, if set, puts the engine in push mode: VBase, Rows, Cols and
+	// VToP then describe the matrix whose rows are all-gathered, and the
+	// tile, group and reduction fields are unused.
+	Push *PushConfig
 }
 
 // TileMsg carries one group's partial or reduced data between engines.
@@ -254,6 +263,8 @@ type Engine struct {
 	finished                    bool
 
 	records []*MsgRecord
+
+	push *pushState
 }
 
 // SetMemFinder sets how local physical addresses map to L2 banks.
@@ -274,6 +285,13 @@ func (e *Engine) Finished() bool {
 // Arm prepares the engine for one GEMM. It must be called before the GEMM's
 // first tile completes.
 func (e *Engine) Arm(cfg Config) {
+	if cfg.Push != nil {
+		e.cfg = cfg
+		e.armed = true
+		e.resetQueues()
+		e.armPush()
+		return
+	}
 	if cfg.TilesPerMsg < 1 && cfg.Groups == nil {
 		panic("commengine: TilesPerMsg must be at least 1")
 	}
@@ -336,18 +354,9 @@ func (e *Engine) Arm(cfg Config) {
 	e.reduced = map[int]bool{}
 	e.nearDone = make([]int, e.numGroups)
 	e.gathered = make([]bool, e.numGroups)
-	e.memJobs = nil
-	e.inflight = map[string]*memJob{}
-	e.offsets = map[string]int{}
-	e.reduceQ = nil
-	e.lanes = make([]*sendLane, cfg.NumGPU)
-	for i := range e.lanes {
-		e.lanes[i] = &sendLane{}
-	}
+	e.resetQueues()
 	e.ownedPending = map[int]int{}
 	e.sendsLeft = map[int]int{}
-	e.records = nil
-	e.finished = false
 
 	e.ownedTotal, e.nonOwnedTotal = 0, 0
 	e.ownedDone, e.nonOwnedDone = 0, 0
@@ -360,10 +369,26 @@ func (e *Engine) Arm(cfg Config) {
 	}
 }
 
+// resetQueues empties the memory, adder and send queues and the message
+// records for a new collective.
+func (e *Engine) resetQueues() {
+	e.memJobs = nil
+	e.inflight = map[string]*memJob{}
+	e.offsets = map[string]int{}
+	e.reduceQ = nil
+	e.lanes = make([]*sendLane, e.cfg.NumGPU)
+	for i := range e.lanes {
+		e.lanes[i] = &sendLane{}
+	}
+	e.records = nil
+	e.finished = false
+	e.push = nil
+}
+
 // OnTileLocal is the tile tracker's listener for a tile whose local GEMM
 // output is complete in L2.
 func (e *Engine) OnTileLocal(ev tiletracker.TileEvent) {
-	if !e.armed {
+	if !e.armed || e.push != nil {
 		return
 	}
 
@@ -393,7 +418,7 @@ func (e *Engine) OnTileLocal(ev tiletracker.TileEvent) {
 // every peer's update added; otherwise it is the same as OnTileLocal and is
 // ignored.
 func (e *Engine) OnTileComplete(ev tiletracker.TileEvent) {
-	if !e.armed || e.cfg.Placement != NearMemory {
+	if !e.armed || e.push != nil || e.cfg.Placement != NearMemory {
 		return
 	}
 
@@ -727,6 +752,11 @@ func (e *Engine) recvFrom(now sim.VTimeInSec, port sim.Port) bool {
 
 	msg := item.(*TileMsg)
 	msg.record.Received = now
+
+	if e.push != nil {
+		e.pushRecv(msg)
+		return true
+	}
 
 	if !msg.Reduced && e.cfg.Placement == NearMemory {
 		e.enqueueUpdate(msg.Group, msg.Data)

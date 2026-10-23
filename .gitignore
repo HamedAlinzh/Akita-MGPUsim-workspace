@@ -18,3 +18,7 @@
 # so it stays local. Commit the derived plots in diagrams/ instead.
 results/*
 !results/README.md
+
+# Python bytecode
+__pycache__/
+*.pyc

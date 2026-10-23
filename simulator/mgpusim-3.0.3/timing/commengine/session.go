@@ -5,6 +5,7 @@ import (
 
 	"github.com/sarchlab/akita/v3/sim"
 	"github.com/sarchlab/mgpusim/v3/driver"
+	"github.com/sarchlab/mgpusim/v3/timing/signal"
 	"github.com/sarchlab/mgpusim/v3/timing/tiletracker"
 )
 
@@ -64,16 +65,7 @@ func (s *Session) Arm(
 	s.mu.Unlock()
 
 	for i, p := range s.parts {
-		// With dedicated links, send through our link to each peer and
-		// address the peer's end of it; otherwise both are ToFabric.
-		peers := make([]sim.Port, len(s.parts))
-		out := make([]sim.Port, len(s.parts))
-		for j, q := range s.parts {
-			peers[j], out[j] = q.Engine.ToFabric, p.Engine.ToFabric
-			if l, ok := p.Engine.Links[q.Engine]; ok {
-				out[j], peers[j] = l, q.Engine.Links[p.Engine]
-			}
-		}
+		peers, out := s.ports(i)
 
 		var partials []tiletracker.Partial
 		if opt.Partials != nil {
@@ -92,9 +84,6 @@ func (s *Session) Arm(
 				return 1
 			}
 		}
-		vToP := invert(region.PageMap)
-		mask := uint64(1)<<region.Log2PageSize - 1
-
 		p.Tracker.Arm(region)
 		p.Tracker.ClearListeners()
 		p.Tracker.AddLocalListener(p.Engine.OnTileLocal)
@@ -106,13 +95,7 @@ func (s *Session) Arm(
 			GPU: i, NumGPU: len(s.parts), Peers: peers, Out: out,
 			VBase: uint64(cs[i]), Rows: rows, Cols: cols,
 			TileRows: tileEdge, TileCols: tileEdge,
-			VToP: func(v uint64) uint64 {
-				pPage, ok := vToP[v&^mask]
-				if !ok {
-					panic("commengine: address outside the armed C")
-				}
-				return pPage | v&mask
-			},
+			VToP:        translator(region.PageMap, region.Log2PageSize),
 			TilesPerMsg: opt.TilesPerMsg,
 			Groups:      opt.Groups,
 			Mode:        opt.Mode,
@@ -122,6 +105,91 @@ func (s *Session) Arm(
 			SplitSend:   opt.SplitSend,
 			OnDone:      s.engineDone,
 		})
+	}
+}
+
+// PushOptions configures an all-gather of a matrix's rows with the engines
+// in push mode (see PushConfig).
+type PushOptions struct {
+	BandRows uint32
+	// Order lists a GPU's sends given the bands it owns (nil: DirectOrder).
+	Order   func(gpu, numGPU int, own []int) []PushSend
+	Signals *signal.Board
+}
+
+// ArmPush programs every GPU's engine to all-gather a row-major matrix of
+// rows x cols floats at as[i] on GPU i, where GPU i owns the i-th of numGPU
+// equal blocks of bands, and starts the engines at the current simulated
+// time. Call it while the simulation is idle (Driver.WaitIdle).
+func (s *Session) ArmPush(
+	ctx *driver.Context, as []driver.Ptr, rows, cols uint32, opt PushOptions,
+) {
+	n := len(s.parts)
+	bands := int(rows / opt.BandRows)
+	if opt.BandRows == 0 || rows%opt.BandRows != 0 || bands%n != 0 {
+		panic("commengine: push bands must split evenly among the GPUs")
+	}
+	per := bands / n
+	order := opt.Order
+	if order == nil {
+		order = DirectOrder
+	}
+
+	s.mu.Lock()
+	s.numDone = 0
+	s.firstReady = -1
+	s.done = make(chan struct{})
+	s.mu.Unlock()
+
+	now := s.driver.Engine.CurrentTime()
+	log2 := s.driver.Log2PageSize
+	for i, p := range s.parts {
+		peers, out := s.ports(i)
+		own := make([]int, per)
+		for k := range own {
+			own[k] = i*per + k
+		}
+		pages := map[uint64]uint64{}
+		mapPages(s.driver, ctx, pages, uint64(as[i]), uint64(rows)*uint64(cols)*4)
+		p.Engine.Arm(Config{
+			GPU: i, NumGPU: n, Peers: peers, Out: out,
+			VBase: uint64(as[i]), Rows: rows, Cols: cols,
+			VToP:   translator(pages, log2),
+			OnDone: s.engineDone,
+			Push: &PushConfig{BandRows: opt.BandRows, Sends: order(i, n, own),
+				Receives: (n - 1) * per, Signals: opt.Signals},
+		})
+		p.Engine.TickLater(now)
+	}
+}
+
+// ports gives participant i's destination port at each peer and the port
+// it sends through: with dedicated links, its link to that peer and the
+// peer's end of it; otherwise both are ToFabric.
+func (s *Session) ports(i int) (peers, out []sim.Port) {
+	p := s.parts[i]
+	peers = make([]sim.Port, len(s.parts))
+	out = make([]sim.Port, len(s.parts))
+	for j, q := range s.parts {
+		peers[j], out[j] = q.Engine.ToFabric, p.Engine.ToFabric
+		if l, ok := p.Engine.Links[q.Engine]; ok {
+			out[j], peers[j] = l, q.Engine.Links[p.Engine]
+		}
+	}
+	return peers, out
+}
+
+// translator maps virtual to physical addresses with a physical-to-virtual
+// page map.
+func translator(pageMap map[uint64]uint64, log2PageSize uint64) func(uint64) uint64 {
+	vToP := invert(pageMap)
+	mask := uint64(1)<<log2PageSize - 1
+	return func(v uint64) uint64 {
+		pPage, ok := vToP[v&^mask]
+		if !ok {
+			panic("commengine: address outside the armed region")
+		}
+		return pPage | v&mask
 	}
 }
 
@@ -161,27 +229,29 @@ func TrackRegion(
 	d *driver.Driver, ctx *driver.Context, c uint64, rows, cols, tileEdge uint32,
 	partials []tiletracker.Partial,
 ) tiletracker.Region {
-	log2 := d.Log2PageSize
-	pageSize := uint64(1) << log2
 	pages := map[uint64]uint64{}
-	mapPages := func(base uint64, rows uint32) {
-		for v := base &^ (pageSize - 1); v < base+uint64(rows)*uint64(cols)*4; v += pageSize {
-			p, ok := d.PhysicalAddress(ctx, v)
-			if !ok {
-				panic("commengine: C is not mapped")
-			}
-			pages[p] = v
-		}
-	}
-	mapPages(c, rows)
+	mapPages(d, ctx, pages, c, uint64(rows)*uint64(cols)*4)
 	for _, p := range partials {
-		mapPages(p.VBase, p.Rows)
+		mapPages(d, ctx, pages, p.VBase, uint64(p.Rows)*uint64(cols)*4)
 	}
 	return tiletracker.Region{
 		VBase: c, Rows: rows, Cols: cols,
 		TileRows: tileEdge, TileCols: tileEdge,
-		PageMap: pages, Log2PageSize: log2,
+		PageMap: pages, Log2PageSize: d.Log2PageSize,
 		Partials: partials,
+	}
+}
+
+// mapPages adds the physical-to-virtual map of every page of the size bytes
+// at base to pages.
+func mapPages(d *driver.Driver, ctx *driver.Context, pages map[uint64]uint64, base, size uint64) {
+	pageSize := uint64(1) << d.Log2PageSize
+	for v := base &^ (pageSize - 1); v < base+size; v += pageSize {
+		p, ok := d.PhysicalAddress(ctx, v)
+		if !ok {
+			panic("commengine: buffer is not mapped")
+		}
+		pages[p] = v
 	}
 }
 

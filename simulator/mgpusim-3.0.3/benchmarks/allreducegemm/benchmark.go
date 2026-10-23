@@ -165,6 +165,15 @@ type Benchmark struct {
 	Warmup      bool
 	WarmupSkipB bool
 
+	// AllGather, if set, runs the input side of a tensor-parallel layer
+	// instead of the K-split GEMM (allgather.go): A's rows are gathered to
+	// every GPU, which computes C = A x B_local. K is then every GPU's full
+	// K, and B is K x pN. AllGatherSignals is the CPs' shared signal board,
+	// needed with the engines (AllGatherRows, AllGatherBulk).
+	AllGather        AllGatherMode
+	AllGatherSignals *signal.Board
+	gatherC          [][]float32
+
 	// OnPartialC, if set, is called for each GPU once its partial C is
 	// allocated and A and B are copied, before any GEMM launch.
 	OnPartialC func(ctx *driver.Context, g, gpuID int, c driver.Ptr)
@@ -251,13 +260,21 @@ func (b *Benchmark) initMem() {
 		b.matrixA.Data[i] = r.Float32()
 	}
 
-	b.matrixB = newMatrix(b.N, b.K)
+	bCols := b.N
+	if b.AllGather != "" {
+		bCols *= uint32(len(b.gpus))
+	}
+	b.matrixB = newMatrix(bCols, b.K)
 	for i := range b.matrixB.Data {
 		b.matrixB.Data[i] = r.Float32()
 	}
 }
 
 func (b *Benchmark) exec() {
+	if b.AllGather != "" {
+		b.execAllGather()
+		return
+	}
 	numGPU := uint32(len(b.gpus))
 	b.validateDimensions(numGPU)
 
@@ -1213,6 +1230,10 @@ func (b *Benchmark) ResultC() []float32 {
 
 func (b *Benchmark) Verify() {
 	if !b.verify {
+		return
+	}
+	if b.AllGather != "" {
+		b.verifyAllGather()
 		return
 	}
 

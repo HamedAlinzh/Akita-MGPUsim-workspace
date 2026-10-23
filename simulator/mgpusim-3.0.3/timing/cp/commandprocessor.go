@@ -66,6 +66,11 @@ type CommandProcessor struct {
 	held    []*protocol.LaunchKernelReq
 	cuPool  *resource.CUResourcePoolImpl
 
+	// MaxBusyDispatchers is the most dispatchers that held a kernel at
+	// once; a dispatcher holds one until it completes.
+	MaxBusyDispatchers int
+	busyDispatchers    int
+
 	ToDriver                   sim.Port
 	toDriverSender             sim.BufferedSender
 	ToDMA                      sim.Port
@@ -424,6 +429,8 @@ func (p *CommandProcessor) startKernel(
 	}
 
 	d.StartDispatching(req)
+	p.busyDispatchers++
+	p.MaxBusyDispatchers = max(p.MaxBusyDispatchers, p.busyDispatchers)
 	if co := req.HsaCo; co != nil && co.CommCUs && p.cuPool != nil &&
 		len(co.WaitSignals) == 0 {
 		p.cuPool.CommStart()
@@ -437,12 +444,14 @@ func (p *CommandProcessor) startKernel(
 	return true, true
 }
 
-// kernelDone ends a communication kernel's CU reservation and raises the
+// kernelDone frees the kernel's dispatcher in the count, ends a
+// communication kernel's CU reservation and raises the
 // kernel's signal.
 func (p *CommandProcessor) kernelDone(
 	now sim.VTimeInSec,
 	req *protocol.LaunchKernelReq,
 ) {
+	p.busyDispatchers--
 	co := req.HsaCo
 	if co == nil {
 		return

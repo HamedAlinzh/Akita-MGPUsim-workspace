@@ -30,6 +30,9 @@ file wires local `./simulator/akita-3.0.0` in place of a tagged release so cross
 up immediately without touching `go.mod`. Each module also has commented-out `replace` directives
 in its `go.mod` for standalone (non-workspace) development.
 
+## Keep in mind
+Write the progress of each step in the CLAUD.md so for the next steps you can understand what is happening even if the session was cleared.
+
 ## Common commands
 
 Run from inside the relevant module directory (`simulator/akita-3.0.0` or
@@ -283,6 +286,20 @@ changing timing code. Commit hashes are on branch `All-reduce`.
   marks its blocks invalid in place; replacing the directory (`Reset`) under an in-flight
   fill let another miss take the block, and hits returned other lines' data.
   `allreducegemm` seeds its own `rand` source.
+- **All-gather before the GEMM** (Step 12; `-allgather-a`, `timing/commengine/push.go`,
+  `benchmarks/allreducegemm/allgather.go`). Every GPU holds M/p rows of A (full K, here `-k`
+  is not split) and its own K x N block of B (B is K x pN), C = A x B_local, verified per GPU.
+  Engine push mode (`Config.Push`, `Session.ArmPush`): reads this GPU's rows of tiles of A,
+  writes them into every peer's A (one row of tiles per message, send order a list, default
+  `DirectOrder`), raises `gpuN/a/rowR` on the CP signal board once L2 acknowledged the row's
+  last write. GEMM: one launch per row of tiles on its own queue, local rows first, remote
+  rows held (`WaitSignals`) in expected arrival order; `-allgather-bulk` one launch held for
+  all rows; `-allgather-local` A on every GPU (floor); `-allgather-mccl`
+  `mccl.AllGatherDirect` then the GEMM. Needs `-engine-mode` (rows/bulk), `-ordered-dispatch`;
+  8 GPUs `-peer-mesh -engine-peer-queues`. The window starts after `Driver.WaitIdle`, at the
+  push start; launches are enqueued at the same time (their ~46 us driver latency is in the
+  window, but held launches wait at the CP during the push). `CommandProcessor
+  .MaxBusyDispatchers` counts dispatchers in use (logged as `allgather dispatchers`).
 - **`samples/allreducebench`** runs Ring All-Reduce alone and splits its time into setup copies,
   kernel time, link-busy time and bytes; resumable via its `-out` CSV.
 
@@ -341,7 +358,10 @@ unchanged.
 | 9 | Fair software baseline, gain split, caches, all-gather design (batch 3 of 3) | Done: `results/step9_baselines/`. FlashOverlap-style (1 comm CU) vs engine, f≈0.5 2 GPUs: s = 1 979 / plan 1009 vs 632 / 525 us; 8 GPUs 3758 / 3919 vs 655 / 575. Plan gain is all overlap (GEMM 1-4% longer). A+C-warm plan -17.1%. L1 invalidate bug fixed. All-gather: design note, worth building |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Mostly covered by the capped baseline (`results/step4b_capped/`: mccl ring, engine bulk, engine tile) and Steps 5-8; near-memory (b) not rerun at the cap |
 | 10 | FlashOverlap-style baseline at a realistic CU share (16 CUs, 1 comm CU) | Done, 10 + 10b (`results/step10_cushare/`). 512x512 cold: software s = 1 / plan 999.7 / 943.4 us, engine 719.9 / 549.1 us (engine plan -41.8% vs software plan). The plan helps software at 1/16 CU (-5.6%). Comm CU stretches the s = 1 GEMM 9.6%. Engine plan gain = GEMM about -11% + overlap about -13 to -16% (cold and A+C warm): slow cold first round with 16 CUs on one L2 |
-| 11 | MoE all-to-all extension (design note section only) | Not started |
+| 11 | Plan gain split vs CU count and cache state | Done, `8f1e357`: `results/step11_firstround/`. All warm at 16 CUs the plan gains -12.9% = GEMM +5.7% + overlap -18.6% (as at 4 CUs); cold 4 / 8 / 16 CUs: GEMM part +2.3% / +0.3% / -10.5%. The 16-CU GEMM part is the cold first round (round-1 work-groups 1.76x the later ones cold, 1.07x warm): nearly every first-round L2 read misses or merges into an in-flight miss; not DRAM queueing, not TLB. Model with measured round times: s = 1 error 3.9% -> 0.8%, plans 2.5% -> 2.1% |
+| 12 | All-gather of A before the GEMM on the engines, s = 1 | Done: `results/step12_allgather/`. 2 GPUs gather-then-GEMM 649.8 / per-row 401.4 us (model 696.2 / 421.5); 8 GPUs 662.0 / 604.9 (709.4 / 640.2); GEMM alone 361.1 / 362.3 (355.0); mccl all-gather + GEMM 931.9 (2 GPUs). Push at 0.79 of the link (0.76 at 8 GPUs from the push start) |
+| 13 | Split rows on the input side (K-chunk messages) | Next |
+| - | MoE all-to-all extension (design note section only) | Not started |
 
 Step requirements, as the user set them:
 1. **Tracker spike.** One GPU, tracker only. Every output tile reports complete exactly once,
@@ -458,6 +478,21 @@ Findings from Step 9:
 - With A and C warm and B cold (streamed weights) the plan still gains 17.1%.
 - `step9_model.py` covers the software path (calibrated on cal_one / cal_rows); it misses the
   8-GPU CU limit (-74%) and the plan's pre-sum contention (about -10%).
+
+Findings from Step 12 (all-gather before the GEMM, s = 1, f 0.5, 256x256x256 per GPU, 4 CUs;
+knobs 2 GPUs `-link-bw 0.487 -link-latency 707 -msg-overhead 3403`, 8 GPUs `0.122 / 2827 /
+13611`):
+- Every run within -6.7% to +2.0% of the design note's queue model (`step9_allgather.py`),
+  which over-predicts the held runs because it charges the 46 us launch after the data
+  arrives, while the held launch already waits at the CP.
+- Per-row overlap: -38% vs gather-then-GEMM at 2 GPUs, only -8.6% at 8 GPUs, where all 7 remote
+  rows arrive together at 354 us (one per link) and only the local row (8 of 64 tiles)
+  overlaps: the case K-chunk splits (Step 13) target.
+- At 8 GPUs: 56 held launches (7 per GPU), at most 7 of 40 dispatchers busy, no release
+  later than 4 ns after its signal; the 7 rows arriving together are written into L2 one
+  after another (signals 354.8 to 357.9 us, about 0.5 us per 32 KB row).
+- mccl's direct all-gather + GEMM (2 GPUs) is 931.9 us (gather 584.8), 1.43x gather-then-GEMM
+  on the engines and 2.3x per-row overlap.
 
 Findings from Step 10 (16 CUs per GPU, 512x512, K/GPU 256, 2.0 waves, knobs `-link-bw 3.1218
 -link-latency 110 -msg-overhead 530`, f 0.489):

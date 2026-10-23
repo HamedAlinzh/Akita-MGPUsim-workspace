@@ -93,6 +93,19 @@ var warmupSkipBFlag = flag.Bool("warmup-skip-b", false,
 		"and C start warm and B cold.")
 var tileSizeFlag = flag.Uint("tile-size", 0,
 	"Work-group edge T; each work-group computes a 4T x 4T tile (0 = 8).")
+var allGatherAFlag = flag.Bool("allgather-a", false,
+	`All-gather A before the GEMM (input side of a tensor-parallel layer): every
+GPU holds M/p rows of A (full -k) and its own -k x -n block of B, and computes
+C = A x B_local over all M rows. With -engine-mode the engines push each
+GPU's rows to every peer and the GEMM runs one launch per row of tiles, local
+rows first, each remote row's launch held at the CP until it has arrived.`)
+var allGatherBulkFlag = flag.Bool("allgather-bulk", false,
+	"With -allgather-a and -engine-mode: one GEMM launch, held until every "+
+		"row has arrived (gather, then GEMM).")
+var allGatherLocalFlag = flag.Bool("allgather-local", false,
+	"With -allgather-a: A is already on every GPU; one GEMM launch (the floor).")
+var allGatherMCCLFlag = flag.Bool("allgather-mccl", false,
+	"With -allgather-a: mccl's direct all-gather, then one GEMM launch.")
 var perBandScratchFlag = flag.Bool("per-band-scratch", false,
 	"Give every band its own All-Reduce scratch buffers.")
 
@@ -168,6 +181,12 @@ func main() {
 			*algorithmFlag)
 	}
 
+	if *allGatherAFlag {
+		allGatherSetup(runner, benchmark)
+	} else if *allGatherBulkFlag || *allGatherLocalFlag || *allGatherMCCLFlag {
+		log.Panic("-allgather-bulk, -allgather-local and -allgather-mccl need -allgather-a")
+	}
+
 	if *wgTraceFlag != "" {
 		wgs := traceWGs(runner.Platform())
 		atexit.Register(func() { wgs.write(*wgTraceFlag) })
@@ -239,4 +258,39 @@ func flashSetup(r *runner.Runner) *allreducegemm.FlashSetup {
 	peer := local + max(0, r.LinkLatencyNS)*1e-9
 	return &allreducegemm.FlashSetup{Trackers: trackers, Signals: board,
 		Delays: mccl.SignalDelays{Local: local, Peer: peer}}
+}
+
+// allGatherSetup selects the all-gather mode from the -allgather-* flags; with
+// the engines it gives every CP one signal board for the rows' arrival
+// signals, and reports each CP's busiest dispatcher count at exit.
+func allGatherSetup(r *runner.Runner, b *allreducegemm.Benchmark) {
+	switch {
+	case *allGatherLocalFlag:
+		b.AllGather = allreducegemm.AllGatherLocal
+	case *allGatherMCCLFlag:
+		b.AllGather = allreducegemm.AllGatherMCCL
+	case *allGatherBulkFlag:
+		b.AllGather = allreducegemm.AllGatherBulk
+	default:
+		b.AllGather = allreducegemm.AllGatherRows
+	}
+	if b.AllGather == allreducegemm.AllGatherRows || b.AllGather == allreducegemm.AllGatherBulk {
+		if r.EngineMode == "" {
+			log.Panic("-allgather-a needs -engine-mode unless -allgather-local or -allgather-mccl")
+		}
+		board := signal.NewBoard(r.Platform().Engine)
+		for _, id := range r.GPUIDs {
+			cp := r.Platform().GPUs[id-1].CommandProcessor
+			cp.Signals = board
+			board.AddWaker(cp)
+		}
+		b.AllGatherSignals = board
+	}
+	atexit.Register(func() {
+		for i, id := range r.GPUIDs {
+			log.Printf("allreducegemm allgather dispatchers: gpu=%d max_busy=%d of=%d", i,
+				r.Platform().GPUs[id-1].CommandProcessor.MaxBusyDispatchers,
+				len(r.Platform().GPUs[id-1].CommandProcessor.Dispatchers))
+		}
+	})
 }

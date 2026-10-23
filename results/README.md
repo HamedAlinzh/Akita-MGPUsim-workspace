@@ -349,6 +349,45 @@ Layout: one subfolder per experiment.
   on 7 plans 2.5% (max 5.9%) -> 2.1% (max 3.8%); 16-CU cold plan -5.9% -> +1.6%, but A+C-warm
   and all-warm plans -2.3% -> +3.7% and -3.0% -> -3.8%. Wall time 75-103 s (8 CUs), 271-295 s
   (16 CUs with warm-up).
+- `step12_allgather/`: all-gather of A before the GEMM on the engines (input side of a
+  tensor-parallel layer), s = 1, no K splits. Every GPU holds 256/p rows of A (full K 256) and
+  its own 256 x 256 block of B and computes C = A x B_local (256 x 256, 4 CUs, tileSize 8, cap
+  8, `-ordered-dispatch -cp-dispatchers 40 -lds-occupancy`, `-wg-trace`). New code at this
+  step: engine push mode (`timing/commengine/push.go`: reads this GPU's rows of tiles of A,
+  writes them into every peer's A, one row of tiles per message, direct order on per-peer
+  queues, raises `gpuN/a/rowR` on the CP signal board once L2 has acknowledged the row's last
+  write), `-allgather-a` / `-allgather-bulk` / `-allgather-local` / `-allgather-mccl` in
+  `samples/allreducegemm`, `mccl.AllGatherDirect` (the all-gather half of the direct
+  all-reduce as its own call), and a CP counter of the most dispatchers busy at once.
+  Verification per GPU against the CPU. Knobs from `reports/allgather-before-gemm.md` (f 0.5):
+  2 GPUs `-link-bw 0.487 -link-latency 707 -msg-overhead 3403`; 8 GPUs `-link-bw 0.122
+  -link-latency 2827 -msg-overhead 13611 -peer-mesh`, engines with `-engine-peer-queues`.
+  Run list `runs.txt` and `summary.txt` from `scripts/step12_allgather.py` (predictions from
+  the design note's queue model, `scripts/step9_allgather.py`), runs from
+  `scripts/step12_runs.sh`:
+  1. `g2_bulk`, `g8_bulk`: gather, then one GEMM launch held at the CP until every remote row
+     has arrived (model 696.2 / 709.4 us).
+  2. `g2_rows`, `g8_rows`: one launch per row of tiles, local rows first, then remote rows in
+     expected arrival order, each held until its row's signal (model 421.5 / 640.2 us).
+  3. `g2_local`, `g8_local`: A already on every GPU, one launch, no gather (the floor; model
+     355.0 us).
+  4. `g2_mccl`: mccl direct all-gather (one push kernel per direction, `-collective-threads
+     16384`), then the GEMM (software reference; rough estimate 939 us = one launch + the
+     shard at 0.50 of the link + the GEMM).
+  5. `defaults_433`: default flags, expect 432.742 us.
+
+  Result (all 8 verify; defaults 432.742 us; `summary.txt`). Measured / model (us): 2 GPUs
+  gather-then-GEMM 649.8 / 696.2 (-6.7%), per-row 401.4 / 421.5 (-4.8%); 8 GPUs 662.0 / 709.4
+  (-6.7%), 604.9 / 640.2 (-5.5%); GEMM alone 361.1 / 362.3 vs 355.0 (+1.7% / +2.0%); mccl
+  all-gather + GEMM 931.9 (gather 584.8, GEMM 347.1) vs the rough 939.3. The model charges the
+  46 us launch after the last row arrives; the held launch already waits at the CP, hence the
+  -5% to -7%. The push moves 0.79 of the link from its first send (0.788 from the push start
+  at 2 GPUs, 0.759 at 8, where the first send waits for the 13.6 us overhead); the last row
+  is in L2 at 342.3 us (2 GPUs) and 357.9 us (8). At 8 GPUs every remote row arrives at
+  354.3 us, so per-row overlap saves only 8.6% (the one local row): 56 held launches (7 per
+  GPU), at most 7 of 40 dispatchers busy, every launch at the CP about 50 us after the start
+  (before its row), released within 4 ns of its signal (no dispatcher limit). Wall time
+  22-23 s (2 GPUs), 109-119 s (8 GPUs).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
