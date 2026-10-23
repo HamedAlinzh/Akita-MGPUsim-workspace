@@ -309,6 +309,46 @@ Layout: one subfolder per experiment.
   525.9 us (-2.3%), -26.5%, of which the GEMM part is -10.8% (436.0 -> 358.5 us) and the
   overlap part -15.6%; cold: -23.7% = GEMM -10.5% + overlap -13.2%. Engine plan vs
   software plan, cold: -41.8%. Wall time 213-301 s per run (the warm-up runs about 300 s).
+- `step11_firstround/`: how much of the plan's gain is the slow cold first round, and how it
+  scales with CU count. f≈0.5, 2 GPUs, cap 8, K/GPU 256, 2.0 waves; engine tile mode,
+  `-ordered-dispatch -cp-dispatchers 40`, every run verifies. Link knobs from
+  `ratio_model.derive_knobs` as in Step 10 (each CU does 16 tiles, so the GEMM estimate is the
+  4-CU one and the link scales with C's bytes). Binary built at this step: the Step 10 code plus
+  a fix to `-mem-timeline` (its L2 MSHR column matched a step name the caches never use and
+  was always 0; it now counts L1V and L2 `read-mshr-hit`) and two new columns, DRAM reads and
+  their summed latency from arrival at the controller's port to completion. Tracing only; no
+  timing change. `trace.txt` from `scripts/step11_trace.py` (existing traces, first round vs
+  later rounds); `runs/` from `scripts/step11_runs.sh`, run list `runs.txt` and predictions
+  `model.txt` from `scripts/step11_model.py` (the Step 10 engine model, unchanged, predicts
+  each run first). Runs, all with `-wg-trace` and `-mem-timeline`:
+  1. `w16_s1`, `w16_plan`: 16 CUs, 512x512, A, B and C warm (`-warmup`), s = 1 and Step 10's
+     plan 4,2,2,2,2,2,2,1,1,1,1,1,1,2,2,4; `-link-bw 3.1218 -link-latency 110 -msg-overhead
+     530`.
+  2. `c8_s1`, `c8_plan`: 8 CUs (`-cus-per-gpu 8`), cold, 512x256 (M doubled from the 4-CU
+     256x256; N and K unchanged): 16 x 8 = 128 tiles over 8 x 8 slots = 2.0 waves. `-link-bw
+     1.5609 -link-latency 220 -msg-overhead 1061`; s = 1 and the model's plan (the same
+     4,2,2,2,2,2,2,1,1,1,1,1,1,2,2,4, 25 launches).
+  3. `defaults_433`: default flags, expect 432.742 us.
+
+  Result (all 5 verify; defaults 432.742 us; `summary.txt`). All warm at 16 CUs the plan
+  gains -12.9% (607.2 -> 528.9 us) = GEMM +5.7% (its GEMM is longer, 328.5 -> 363.0 us) +
+  overlap -18.6%, as at 4 CUs all warm (+3.2% / -18.7%). Cold by CU count: 4 CUs -17.0% =
+  GEMM +2.3% + overlap -19.3%; 8 CUs (643.7 -> 535.8 us, achieved f 0.547) -16.8% = +0.3% +
+  -17.1%; 16 CUs -23.7% = -10.5% + -13.2%. So the GEMM part appears only at 16 CUs cold or with
+  B cold, and is the cold first round: round-1 work-groups take 1.07x the later ones when all
+  warm at both 4 and 16 CUs (143.3 / 134.3 us at 16), against 1.26x / 1.31x / 1.76x cold at
+  4 / 8 / 16 CUs, and warming A and C alone leaves 1.78x at 16. The memory timeline (16-CU
+  cold = the warm-up kernel of `w16_s1`) shows no DRAM queueing (mean read latency 56-59 ns in
+  every cold phase) and no TLB effect (L1V TLB misses per work-group the same warm and cold;
+  L2 TLB misses about 300); instead, in the 16-CU cold round 1 only 19 of 73,672 L2 reads hit:
+  12,300 miss and 61,353 merge into an in-flight miss (5 per miss), against 57% hits at 8 CUs.
+  All first-round work-groups read the same cold lines (mostly B) at the same time. Why the
+  merged waits cost so much more at 16 than at 8 CUs (L2 bank queues, the L1-to-L2
+  connection, MSHR fan-out) the counters cannot tell. Model (`model.txt`): mean |error| on 7
+  s = 1 runs 3.9% (max 12.9%) before -> 0.8% (max 1.6%, in-sample) with measured round times;
+  on 7 plans 2.5% (max 5.9%) -> 2.1% (max 3.8%); 16-CU cold plan -5.9% -> +1.6%, but A+C-warm
+  and all-warm plans -2.3% -> +3.7% and -3.0% -> -3.8%. Wall time 75-103 s (8 CUs), 271-295 s
+  (16 CUs with warm-up).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the

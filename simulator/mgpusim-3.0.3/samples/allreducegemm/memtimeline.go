@@ -14,21 +14,24 @@ import (
 	"github.com/sarchlab/mgpusim/v3/samples/runner"
 )
 
-// memTimeline counts, per GPU and per time bucket, cache hits and misses
-// (L1V and L2), TLB misses (L1V TLBs and the L2 TLB) and DRAM bytes, for
-// -mem-timeline.
+// memTimeline counts, per GPU and per time bucket, cache hits, misses and
+// MSHR hits (L1V and L2), TLB misses (L1V TLBs and the L2 TLB), DRAM bytes,
+// and DRAM reads with their total latency (from arrival at the controller's
+// port to completion, in the bucket of the arrival), for -mem-timeline.
 type memTimeline struct {
 	time   sim.TimeTeller
 	bucket float64 // seconds
 
-	mu     sync.Mutex
-	counts map[[2]int]map[string]float64 // [gpu, bucket] -> column -> count
+	mu      sync.Mutex
+	counts  map[[2]int]map[string]float64 // [gpu, bucket] -> column -> count
+	pending map[string]sim.VTimeInSec     // DRAM read task ID -> arrival
 }
 
 var memColumns = []string{
-	"l1v_read_hit", "l1v_read_miss", "l2_read_hit", "l2_read_miss",
-	"l2_read_mshr_miss", "l2_write_hit", "l2_write_miss",
+	"l1v_read_hit", "l1v_read_miss", "l1v_read_mshr_hit", "l2_read_hit",
+	"l2_read_miss", "l2_read_mshr_hit", "l2_write_hit", "l2_write_miss",
 	"l1v_tlb_miss", "l2_tlb_miss", "dram_read_bytes", "dram_write_bytes",
+	"dram_reads", "dram_read_ns",
 }
 
 type memTracer struct {
@@ -40,7 +43,12 @@ type memTracer struct {
 func (m memTracer) add(column string, v float64) {
 	m.t.mu.Lock()
 	defer m.t.mu.Unlock()
-	b := int(float64(m.t.time.CurrentTime()) / m.t.bucket)
+	m.addAt(m.t.time.CurrentTime(), column, v)
+}
+
+// addAt adds to the bucket holding time t; the caller holds the lock.
+func (m memTracer) addAt(t sim.VTimeInSec, column string, v float64) {
+	b := int(float64(t) / m.t.bucket)
 	key := [2]int{m.gpu, b}
 	if m.t.counts[key] == nil {
 		m.t.counts[key] = map[string]float64{}
@@ -55,6 +63,9 @@ func (m memTracer) StartTask(task tracing.Task) {
 	switch req := task.Detail.(type) {
 	case *mem.ReadReq:
 		m.add("dram_read_bytes", float64(req.AccessByteSize))
+		m.t.mu.Lock()
+		m.t.pending[task.ID] = req.RecvTime
+		m.t.mu.Unlock()
 	case *mem.WriteReq:
 		m.add("dram_write_bytes", float64(len(req.Data)))
 	}
@@ -66,8 +77,8 @@ func (m memTracer) StepTask(task tracing.Task) {
 		switch m.kind {
 		case "l1v", "l2":
 			if what == "read_hit" || what == "read_miss" ||
-				m.kind == "l2" && (what == "read_mshr_miss" ||
-					what == "write_hit" || what == "write_miss") {
+				what == "read_mshr_hit" ||
+				m.kind == "l2" && (what == "write_hit" || what == "write_miss") {
 				m.add(m.kind+"_"+what, 1)
 			}
 		case "l1v_tlb", "l2_tlb":
@@ -78,11 +89,24 @@ func (m memTracer) StepTask(task tracing.Task) {
 	}
 }
 
-func (m memTracer) EndTask(tracing.Task) {}
+func (m memTracer) EndTask(task tracing.Task) {
+	if m.kind != "dram" {
+		return
+	}
+	m.t.mu.Lock()
+	defer m.t.mu.Unlock()
+	arrival, ok := m.t.pending[task.ID]
+	if !ok {
+		return
+	}
+	delete(m.t.pending, task.ID)
+	m.addAt(arrival, "dram_reads", 1)
+	m.addAt(arrival, "dram_read_ns", float64(m.t.time.CurrentTime()-arrival)*1e9)
+}
 
 func traceMemory(p *runner.Platform, bucketUS float64) *memTimeline {
 	t := &memTimeline{time: p.Engine, bucket: bucketUS * 1e-6,
-		counts: map[[2]int]map[string]float64{}}
+		counts: map[[2]int]map[string]float64{}, pending: map[string]sim.VTimeInSec{}}
 	for i, gpu := range p.GPUs {
 		attach := func(kind string, comps []runner.TraceableComponent) {
 			for _, c := range comps {
