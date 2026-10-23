@@ -369,6 +369,7 @@ unchanged.
 | 11 | Plan gain split vs CU count and cache state | Done, `8f1e357`: `results/step11_firstround/`. All warm at 16 CUs the plan gains -12.9% = GEMM +5.7% + overlap -18.6% (as at 4 CUs); cold 4 / 8 / 16 CUs: GEMM part +2.3% / +0.3% / -10.5%. The 16-CU GEMM part is the cold first round (round-1 work-groups 1.76x the later ones cold, 1.07x warm): nearly every first-round L2 read misses or merges into an in-flight miss; not DRAM queueing, not TLB. Model with measured round times: s = 1 error 3.9% -> 0.8%, plans 2.5% -> 2.1% |
 | 12 | All-gather of A before the GEMM on the engines, s = 1 | Done: `results/step12_allgather/`. 2 GPUs gather-then-GEMM 649.8 / per-row 401.4 us (model 696.2 / 421.5); 8 GPUs 662.0 / 604.9 (709.4 / 640.2); GEMM alone 361.1 / 362.3 (355.0); mccl all-gather + GEMM 931.9 (2 GPUs). Push at 0.79 of the link (0.76 at 8 GPUs from the push start) |
 | 13 | K-chunk splits of the remote rows in the all-gather (`-allgather-plan`) | Done: `results/step13_allgather_split/`. 8 GPUs 1,4,4,4,4,4,4,4 434.9 us (-28.1% vs s = 1 604.9, floor 362.3), s = 2 504.8, s = 8 474.6; 2 GPUs last row s = 4 367.1 (-8.6% vs 401.4), s = 2 374.5. Model 1-10% high. Partial sum 4.1 us per s = 4 row alone, +5.3 us on the 8-GPU window |
+| 14 | All-gather plan at other f and at 4 GPUs (no new code) | Done: `results/step14_allgather_sweep/`. Plan vs s = 1: 8 GPUs f 0.35 -16.3%, f 0.8 -11.9%, 4 GPUs f 0.5 -14.1% (8 GPUs f 0.5: -28.1%); model within -8.8% to +8.9% |
 | - | MoE all-to-all extension (design note section only) | Not started |
 
 Step requirements, as the user set them:
@@ -514,6 +515,18 @@ Findings from Step 13 (same config as Step 12):
   +5.3 us on the 8-GPU s = 4 window. 224 held launches (28 per GPU), at most 12 dispatchers busy.
 - `scripts/step13_allgather.py` (Step 9 queue model + sum pass) over-predicts by 1-10% (-9.8%
   at s = 4, 8 GPUs); adding the sum moved it +0.5% to +2.6% (s = 8 +9.3%), away from the runs.
+
+Findings from Step 14 (all-gather, model-picked plans, knobs by `step9_allgather.knobs(p, f)`;
+`scripts/step14_allgather_sweep.py` converts the model's by-row plan to arrival order):
+- 8 GPUs f 0.35 (`-link-bw 0.226 -link-latency 1522 -msg-overhead 7329`): push-then-GEMM /
+  s = 1 / plan 501.3 / 478.4 / 400.6 us, plan 1,1,2,4,4,4,4,4, 10.6% above the floor.
+- 8 GPUs f 0.8 (`0.0304 / 11309 / 54443`): 1726.1 / 1706.7 / 1503.2, plan 1,4,4,4,4,4,4,4;
+  link-bound (4.1x the floor).
+- 4 GPUs f 0.5 (`0.2433 / 1414 / 6805`): 653.1 / 458.2 / 393.6, plan (by row) 1,1,1,4,4,2,4,4,
+  floor 362.8; per-row overlap alone already -30% vs push-then-GEMM.
+- The plan's gain over s = 1 is largest at 8 GPUs f 0.5 (-28%) and -12% to -16% elsewhere.
+  Model errors -8.8% to +8.9% (the f 0.35 plan ran 8.9% slower than predicted; only the
+  model's plan was run, so its optimality is untested).
 
 Findings from Step 10 (16 CUs per GPU, 512x512, K/GPU 256, 2.0 waves, knobs `-link-bw 3.1218
 -link-latency 110 -msg-overhead 530`, f 0.489):

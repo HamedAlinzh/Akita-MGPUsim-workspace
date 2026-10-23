@@ -430,6 +430,34 @@ Layout: one subfolder per experiment.
   acquire (at most 117 ns). s = 8 is slower than s = 4: its 57 launches per GPU reach the CP
   at about 82 us, after their first chunks (56 launches late), and its 7 sums (each 1 row + 7
   partials) queue on the engine (tail 17 us). Wall time 22-25 s (2 GPUs), 126-162 s (8).
+- `step14_allgather_sweep/`: do the all-gather results hold at other link speeds and at 4
+  GPUs? No new code (Step 13 binary). Same GEMM as Steps 12-13; knobs from
+  `ratio_model.derive_knobs` as in the design note (bytes per link = one GPU's A shard), plans
+  picked by the Step 13 model (queue model + partial-sum pass, remote rows s in {1, 2, 4})
+  before running; `plans.txt`, `runs.txt` and `summary.txt` from
+  `scripts/step14_allgather_sweep.py`, runs from `scripts/step14_runs.sh`. 8 and 4 GPUs use
+  `-peer-mesh -engine-peer-queues`. Per configuration: push then GEMM (`_bulk`), per row s = 1
+  (`_s1`), per row with the model's plan (`_plan`):
+  1. `g8_f035_*`: 8 GPUs, f 0.35, `-link-bw 0.226 -link-latency 1522 -msg-overhead 7329`; plan
+     (arrival order) 1,1,2,4,4,4,4,4; model 545.8 / 476.6 / 367.7 us.
+  2. `g8_f08_*`: 8 GPUs, f 0.8, `-link-bw 0.0304 -link-latency 11309 -msg-overhead 54443`;
+     plan 1,4,4,4,4,4,4,4; model 1772.6 / 1703.4 / 1546.8 us.
+  3. `g4_f05_*`: 4 GPUs, f 0.5, `-link-bw 0.2433 -link-latency 1414 -msg-overhead 6805`; plan
+     (arrival order) 1,1,1,4,4,4,2,4 (by row 1,1,1,4,4,2,4,4); model 700.6 / 494.4 / 431.4 us.
+  4. `g4_local`: 4 GPUs, A already local (the floor; 8 GPUs reuse Step 12's `g8_local`).
+  5. `defaults_433`: default flags, expect 432.742 us.
+
+  Result (all 11 verify; defaults 432.742 us; `summary.txt`). Push-then-GEMM / s = 1 / plan /
+  floor (us): 8 GPUs f 0.35 501.3 / 478.4 / 400.6 / 362.3 (plan -16.3% vs s = 1, -20.1% vs
+  push-then-GEMM, 10.6% above the floor; model plan 367.7, +8.9%); 8 GPUs f 0.8 1726.1 /
+  1706.7 / 1503.2 / 362.3 (-11.9%, -12.9%; the link dominates, 4.1x the floor; model 1546.8,
+  -2.8%); 4 GPUs f 0.5 653.1 / 458.2 / 393.6 / 362.8 (-14.1%, -39.7%, 8.5% above the floor;
+  model 431.4, -8.8%). Model s = 1 within -7.3% to +0.4%, push-then-GEMM -8.2% to -2.6%.
+  With Step 13's 8-GPU f 0.5 (-28.1%), the plan's gain over s = 1 is largest at 8 GPUs f 0.5
+  and falls to -12% to -16% at f 0.35, f 0.8 and 4 GPUs. Only the model's plan was run, so
+  whether it is the best plan is not tested here. Plan runs: 184 / 224 / 76 held launches,
+  at most 19 / 7 / 7 dispatchers busy; at f 0.35, 40 launches reached the CP after their
+  chunk (by up to 5.4 us). Wall time 69-101 s (4 GPUs), 174-217 s (8).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
