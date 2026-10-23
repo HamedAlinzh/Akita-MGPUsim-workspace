@@ -340,7 +340,8 @@ unchanged.
 | 8 | Realistic software baseline and edge cases (batch 2 of 3) | Done, `aaa48da` + `706d7b1`: `results/step8_edges/`. Event-driven model (mean error 1.5%); splits help software overlap only below ~20 us per call (published RCCL minimum ~20 us); f sweep -14% / -13% / -3% at f 0.35 / 0.65 / 0.9; shapes, K 128/512, 9 rows, reduce-scatter all keep the gain (-6.5% to -20.2%), model within -3.2% to +1.5% |
 | 9 | Fair software baseline, gain split, caches, all-gather design (batch 3 of 3) | Done: `results/step9_baselines/`. FlashOverlap-style (1 comm CU) vs engine, f≈0.5 2 GPUs: s = 1 979 / plan 1009 vs 632 / 525 us; 8 GPUs 3758 / 3919 vs 655 / 575. Plan gain is all overlap (GEMM 1-4% longer). A+C-warm plan -17.1%. L1 invalidate bug fixed. All-gather: design note, worth building |
 | 4 | First timing: baseline (one GEMM + Ring All-Reduce, `-collective-threads 16384`) vs (a) vs (b) | Mostly covered by the capped baseline (`results/step4b_capped/`: mccl ring, engine bulk, engine tile) and Steps 5-8; near-memory (b) not rerun at the cap |
-| 10 | MoE all-to-all extension (design note section only) | Not started |
+| 10 | FlashOverlap-style baseline at a realistic CU share (16 CUs, 1 comm CU) | Stopped after the engine runs (`results/step10_cushare/`): 16-CU runs take 3.8-5.4x the 4-CU wall time. Engine 512x512: s = 1 719.9 us, plan 549.1 us (-23.7%); slow cold first round with 16 CUs (262 vs 172 us per work-group) |
+| 11 | MoE all-to-all extension (design note section only) | Not started |
 
 Step requirements, as the user set them:
 1. **Tracker spike.** One GPU, tracker only. Every output tile reports complete exactly once,

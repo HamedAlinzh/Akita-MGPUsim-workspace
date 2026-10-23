@@ -272,6 +272,28 @@ Layout: one subfolder per experiment.
   since Go 1.24, so A and B differed every run (timing does not depend on them); the
   benchmark now uses its own seeded source. `runs_prefix/` has this step's runs from
   before both fixes (same names).
+- `step10_cushare/`: FlashOverlap-style baseline at a realistic CU share. 16 CUs per GPU
+  (`-cus-per-gpu 16`), 512x512, K/GPU 256 (`-k 512`), cap 8: 256 tiles over 16 x 8 slots =
+  2.0 waves, as 256x256 on 4 CUs. Link knobs re-derived with `ratio_model.derive_knobs`
+  (f 0.555 as the f≈0.5 point, latency/transfer 0.39, the 4-CU capped GEMM time as the
+  estimate): `-link-bw 3.1218 -link-latency 110 -msg-overhead 530` (C is 4x larger, so the
+  link is 4x faster). `-ordered-dispatch -cp-dispatchers 40`, every run verifies; same binary
+  as Step 9 (`8435471`, defaults 432.742 us). `runs/` from `scripts/step10_runs.sh` (run list
+  `runs.txt` from `scripts/step10_model.py`, which predicts each run first):
+  1. `eng_s1`, `eng_plan`: engine tile mode, s = 1 and the model's plan.
+  2. `fo_s1`, `fo_plan`: FlashOverlap-style (`-sw-flash`, `-sw-comm-cus 1` = 1/16 of the
+     GPU, `-sw-signal-cost 0`, `-collective-threads 1024`), s = 1 and a plan; partitions from
+     the model. Only if the engine runs take at most about twice the 4-CU runs' wall time
+     (30-36 s in Step 9).
+
+  Result: stopped after the engine runs (both verify). Wall time 135.4 s (s = 1) and
+  162.7 s (plan) against 35.8 s and 30.3 s for the 4-CU pair in Step 9 (3.8x and 5.4x), so
+  `fo_s1` and `fo_plan` were not run. Windows: s = 1 719.9 us (model 640.2, -11.1%), plan
+  4,2,2,2,2,2,2,1,1,1,1,1,1,2,2,4 549.1 us (model 517.0, -5.8%): -23.7%. Achieved f 0.489.
+  The cold first round is slower with 16 CUs on one L2 (261.7 us per work-group against
+  172 at 4 CUs; later rounds 148.9 against 137), so the s = 1 GEMM takes 462.3 us against
+  360 at 4 CUs, and here the plan's GEMM is shorter (386.5 us): unlike at 4 CUs, part of the
+  gain is the GEMM's own (`model.txt`).
 - `pending_experiments.log`: log of `scripts/run_pending_experiments.sh`.
 - `gemm_tile_tuning/`: **outdated.** Output of `scripts/tune_gemm_tile.py`, taken before
   commit `3be1037` with the one-workgroup-row-per-launch benchmark (tile size also set the
